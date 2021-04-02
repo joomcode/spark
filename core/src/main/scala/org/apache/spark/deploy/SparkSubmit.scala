@@ -952,6 +952,13 @@ private[spark] class SparkSubmit extends Logging {
     } catch {
       case t: Throwable =>
         throw findCause(t)
+    } finally {
+      logInfo("Close SparkContext to allow SparkApplication on K8S to complete. See: https://issues.apache.org/jira/browse/SPARK-34674")
+      try {
+        org.apache.spark.SparkContext.getOrCreate().stop()
+      } catch {
+        case e: Throwable => logError(s"Failed to close SparkContext: ${e.getMessage}")
+      }
     }
   }
 
