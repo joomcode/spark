@@ -73,6 +73,9 @@ case "$1" in
     CMD=(
       "$SPARK_HOME/bin/spark-submit"
       --conf "spark.driver.bindAddress=$SPARK_DRIVER_BIND_ADDRESS"
+      --conf "spark.hadoop.fs.s3a.path.style.access=true"
+      --conf "hadoop.fs.s3a.path.style.access=true"
+      --conf "fs.s3a.path.style.access=true"
       --deploy-mode client
       "$@"
     )
