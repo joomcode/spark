@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.execution.datasources
 
-import java.lang.{Double => JDouble, Long => JLong}
+import java.lang.{Double => JDouble, Long => JLong, Boolean => JBoolean}
 import java.math.{BigDecimal => JBigDecimal}
 import java.time.ZoneId
 import java.util.Locale
@@ -522,6 +522,7 @@ object PartitioningUtils {
       zoneId: ZoneId): Any = desiredType match {
     case _ if value == DEFAULT_PARTITION_NAME => null
     case NullType => null
+    case BooleanType => JBoolean.parseBoolean(value)
     case StringType => UTF8String.fromString(unescapePathName(value))
     case IntegerType => Integer.parseInt(value)
     case LongType => JLong.parseLong(value)
