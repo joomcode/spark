@@ -18,7 +18,6 @@
 package org.apache.spark.sql.execution.datasources.parquet;
 
 import org.apache.parquet.column.Dictionary;
-
 import org.apache.spark.sql.execution.vectorized.WritableColumnVector;
 
 public interface ParquetVectorUpdater {

@@ -31,7 +31,7 @@ import org.apache.spark.unsafe.types.UTF8String;
 public final class OnHeapColumnVector extends WritableColumnVector {
 
   private static final boolean bigEndianPlatform =
-    ByteOrder.nativeOrder().equals(ByteOrder.BIG_ENDIAN);
+          ByteOrder.nativeOrder().equals(ByteOrder.BIG_ENDIAN);
 
   /**
    * Allocates columns to store elements of each field of the schema on heap.
@@ -148,6 +148,18 @@ public final class OnHeapColumnVector extends WritableColumnVector {
   }
 
   @Override
+  public void putBooleans(int rowId, byte src) {
+    byteData[rowId] = (byte)(src & 1);
+    byteData[rowId + 1] = (byte)(src >>> 1 & 1);
+    byteData[rowId + 2] = (byte)(src >>> 2 & 1);
+    byteData[rowId + 3] = (byte)(src >>> 3 & 1);
+    byteData[rowId + 4] = (byte)(src >>> 4 & 1);
+    byteData[rowId + 5] = (byte)(src >>> 5 & 1);
+    byteData[rowId + 6] = (byte)(src >>> 6 & 1);
+    byteData[rowId + 7] = (byte)(src >>> 7 & 1);
+  }
+
+  @Override
   public boolean getBoolean(int rowId) {
     return byteData[rowId] == 1;
   }
@@ -159,7 +171,7 @@ public final class OnHeapColumnVector extends WritableColumnVector {
     for (int i = 0; i < count; ++i) {
       array[i] = (byteData[rowId + i] == 1);
     }
-   return array;
+    return array;
   }
 
   //
@@ -207,6 +219,12 @@ public final class OnHeapColumnVector extends WritableColumnVector {
     return UTF8String.fromBytes(byteData, rowId, count);
   }
 
+  @Override
+  public ByteBuffer getByteBuffer(int rowId, int count) {
+    return ByteBuffer.wrap(byteData, rowId, count);
+  }
+
+
   //
   // APIs dealing with Shorts
   //
@@ -231,7 +249,7 @@ public final class OnHeapColumnVector extends WritableColumnVector {
   @Override
   public void putShorts(int rowId, int count, byte[] src, int srcIndex) {
     Platform.copyMemory(src, Platform.BYTE_ARRAY_OFFSET + srcIndex, shortData,
-      Platform.SHORT_ARRAY_OFFSET + rowId * 2L, count * 2L);
+            Platform.SHORT_ARRAY_OFFSET + rowId * 2L, count * 2L);
   }
 
   @Override
@@ -276,7 +294,7 @@ public final class OnHeapColumnVector extends WritableColumnVector {
   @Override
   public void putInts(int rowId, int count, byte[] src, int srcIndex) {
     Platform.copyMemory(src, Platform.BYTE_ARRAY_OFFSET + srcIndex, intData,
-      Platform.INT_ARRAY_OFFSET + rowId * 4L, count * 4L);
+            Platform.INT_ARRAY_OFFSET + rowId * 4L, count * 4L);
   }
 
   @Override
@@ -342,7 +360,7 @@ public final class OnHeapColumnVector extends WritableColumnVector {
   @Override
   public void putLongs(int rowId, int count, byte[] src, int srcIndex) {
     Platform.copyMemory(src, Platform.BYTE_ARRAY_OFFSET + srcIndex, longData,
-      Platform.LONG_ARRAY_OFFSET + rowId * 8L, count * 8L);
+            Platform.LONG_ARRAY_OFFSET + rowId * 8L, count * 8L);
   }
 
   @Override
@@ -393,7 +411,7 @@ public final class OnHeapColumnVector extends WritableColumnVector {
   @Override
   public void putFloats(int rowId, int count, byte[] src, int srcIndex) {
     Platform.copyMemory(src, Platform.BYTE_ARRAY_OFFSET + srcIndex, floatData,
-        Platform.FLOAT_ARRAY_OFFSET + rowId * 4L, count * 4L);
+            Platform.FLOAT_ARRAY_OFFSET + rowId * 4L, count * 4L);
   }
 
   @Override
@@ -447,7 +465,7 @@ public final class OnHeapColumnVector extends WritableColumnVector {
   @Override
   public void putDoubles(int rowId, int count, byte[] src, int srcIndex) {
     Platform.copyMemory(src, Platform.BYTE_ARRAY_OFFSET + srcIndex, doubleData,
-        Platform.DOUBLE_ARRAY_OFFSET + rowId * 8L, count * 8L);
+            Platform.DOUBLE_ARRAY_OFFSET + rowId * 8L, count * 8L);
   }
 
   @Override
@@ -541,15 +559,15 @@ public final class OnHeapColumnVector extends WritableColumnVector {
         shortData = newData;
       }
     } else if (type instanceof IntegerType || type instanceof DateType ||
-      DecimalType.is32BitDecimalType(type) || type instanceof YearMonthIntervalType) {
+            DecimalType.is32BitDecimalType(type) || type instanceof YearMonthIntervalType) {
       if (intData == null || intData.length < newCapacity) {
         int[] newData = new int[newCapacity];
         if (intData != null) System.arraycopy(intData, 0, newData, 0, capacity);
         intData = newData;
       }
     } else if (type instanceof LongType ||
-        type instanceof TimestampType ||type instanceof TimestampNTZType ||
-        DecimalType.is64BitDecimalType(type) || type instanceof DayTimeIntervalType) {
+            type instanceof TimestampType ||type instanceof TimestampNTZType ||
+            DecimalType.is64BitDecimalType(type) || type instanceof DayTimeIntervalType) {
       if (longData == null || longData.length < newCapacity) {
         long[] newData = new long[newCapacity];
         if (longData != null) System.arraycopy(longData, 0, newData, 0, capacity);

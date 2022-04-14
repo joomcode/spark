@@ -70,10 +70,10 @@ object DataSourceReadBenchmark extends SqlBasedBenchmark {
   }
 
   private def prepareTable(
-      dir: File,
-      df: DataFrame,
-      partition: Option[String] = None,
-      onlyParquetOrc: Boolean = false): Unit = {
+                            dir: File,
+                            df: DataFrame,
+                            partition: Option[String] = None,
+                            onlyParquetOrc: Boolean = false): Unit = {
     val testDf = if (partition.isDefined) {
       df.write.partitionBy(partition.get)
     } else {
@@ -312,14 +312,14 @@ object DataSourceReadBenchmark extends SqlBasedBenchmark {
           }
 
           sqlBenchmark.addCase(s"SQL Parquet Vectorized: DataPage$version " +
-              "(Nested Column Disabled)") { _ =>
+            "(Nested Column Disabled)") { _ =>
             withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_NESTED_COLUMN_ENABLED.key -> "false") {
               spark.sql(s"select sum(col.f) from parquet${version}Table").noop()
             }
           }
 
           sqlBenchmark.addCase(s"SQL Parquet Vectorized: DataPage$version " +
-              "(Nested Column Enabled)") { _ =>
+            "(Nested Column Enabled)") { _ =>
             withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_NESTED_COLUMN_ENABLED.key -> "true") {
               spark.sql(s"select sum(col.f) from parquet${version}Table").noop()
             }
@@ -377,7 +377,7 @@ object DataSourceReadBenchmark extends SqlBasedBenchmark {
           }
 
           benchmark.addCase(s"SQL Parquet Vectorized: DataPage$version " +
-              s"(Nested Column Disabled)") { _ =>
+            s"(Nested Column Disabled)") { _ =>
             withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_NESTED_COLUMN_ENABLED.key -> "false") {
               spark.sql(s"SELECT SUM(SIZE(col1)), SUM(SIZE(col2)) FROM parquet${version}Table")
                 .noop()
@@ -385,10 +385,10 @@ object DataSourceReadBenchmark extends SqlBasedBenchmark {
           }
 
           benchmark.addCase(s"SQL Parquet Vectorized: DataPage$version " +
-              s"(Nested Column Enabled)") { _ =>
+            s"(Nested Column Enabled)") { _ =>
             withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_NESTED_COLUMN_ENABLED.key -> "true") {
               spark.sql(s"SELECT SUM(SIZE(col1)), SUM(SIZE(col2)) FROM parquet${version}Table")
-                  .noop()
+                .noop()
             }
           }
         }
@@ -620,7 +620,7 @@ object DataSourceReadBenchmark extends SqlBasedBenchmark {
           dir,
           spark.sql(
             s"SELECT IF(RAND(1) < $fractionOfNulls, NULL, CAST(id as STRING)) AS c1, " +
-            s"IF(RAND(2) < $fractionOfNulls, NULL, CAST(id as STRING)) AS c2 FROM t1"))
+              s"IF(RAND(2) < $fractionOfNulls, NULL, CAST(id as STRING)) AS c2 FROM t1"))
 
         benchmark.addCase("SQL CSV") { _ =>
           spark.sql("select sum(length(c2)) from csvTable where c1 is " +

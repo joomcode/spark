@@ -16,19 +16,18 @@
  */
 package org.apache.spark.sql.execution.datasources.parquet;
 
+import org.apache.parquet.bytes.ByteBufferInputStream;
+import org.apache.parquet.column.values.ValuesReader;
+import org.apache.parquet.io.ParquetDecodingException;
+import org.apache.parquet.io.api.Binary;
+import org.apache.spark.sql.catalyst.util.RebaseDateTime;
+import org.apache.spark.sql.execution.datasources.DataSourceUtils;
+import org.apache.spark.sql.execution.vectorized.WritableColumnVector;
+
 import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-
-import org.apache.parquet.bytes.ByteBufferInputStream;
-import org.apache.parquet.column.values.ValuesReader;
-import org.apache.parquet.io.api.Binary;
-import org.apache.parquet.io.ParquetDecodingException;
-
-import org.apache.spark.sql.catalyst.util.RebaseDateTime;
-import org.apache.spark.sql.execution.datasources.DataSourceUtils;
-import org.apache.spark.sql.execution.vectorized.WritableColumnVector;
 
 /**
  * An implementation of the Parquet PLAIN decoder that supports the vectorized interface.
@@ -53,19 +52,52 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
     throw new UnsupportedOperationException();
   }
 
+  private void updateCurrentByte() {
+    try {
+      currentByte = (byte) in.read();
+    } catch (IOException e) {
+      throw new ParquetDecodingException("Failed to read a byte", e);
+    }
+  }
+
   @Override
   public final void readBooleans(int total, WritableColumnVector c, int rowId) {
-    // TODO: properly vectorize this
-    for (int i = 0; i < total; i++) {
-      c.putBoolean(rowId + i, readBoolean());
+    int i = 0;
+    if (bitOffset > 0) {
+      i = Math.min(8 - bitOffset, total);
+      c.putBooleans(rowId, i, currentByte, bitOffset);
+      bitOffset = (bitOffset + i) & 7;
+    }
+    for (; i + 7 < total; i += 8) {
+      updateCurrentByte();
+      c.putBooleans(rowId + i, currentByte);
+    }
+    if (i < total) {
+      updateCurrentByte();
+      bitOffset = total - i;
+      c.putBooleans(rowId + i, bitOffset, currentByte, 0);
     }
   }
 
   @Override
   public final void skipBooleans(int total) {
-    // TODO: properly vectorize this
-    for (int i = 0; i < total; i++) {
-      readBoolean();
+    int i = 0;
+    if (bitOffset > 0) {
+      i = Math.min(8 - bitOffset, total);
+      bitOffset = (bitOffset + i) & 7;
+    }
+    if (i + 7 < total) {
+      int numBytesToSkip = (total - i) / 8;
+      try {
+        in.skipFully(numBytesToSkip);
+      } catch (IOException e) {
+        throw new ParquetDecodingException("Failed to skip bytes", e);
+      }
+      i += numBytesToSkip * 8;
+    }
+    if (i < total) {
+      updateCurrentByte();
+      bitOffset = total - i;
     }
   }
 
@@ -282,13 +314,8 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
 
   @Override
   public final boolean readBoolean() {
-    // TODO: vectorize decoding and keep boolean[] instead of currentByte
     if (bitOffset == 0) {
-      try {
-        currentByte = (byte) in.read();
-      } catch (IOException e) {
-        throw new ParquetDecodingException("Failed to read a byte", e);
-      }
+      updateCurrentByte();
     }
 
     boolean v = (currentByte & (1 << bitOffset)) != 0;

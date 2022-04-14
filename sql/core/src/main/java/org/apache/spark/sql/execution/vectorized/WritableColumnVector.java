@@ -18,6 +18,7 @@ package org.apache.spark.sql.execution.vectorized;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.nio.ByteBuffer;
 
 import com.google.common.annotations.VisibleForTesting;
 
@@ -46,6 +47,7 @@ import org.apache.spark.unsafe.types.UTF8String;
  * WritableColumnVector are intended to be reused.
  */
 public abstract class WritableColumnVector extends ColumnVector {
+  private final byte[] byte8 = new byte[8];
 
   /**
    * Resets this column for writing. The currently stored values are no longer accessible.
@@ -54,8 +56,8 @@ public abstract class WritableColumnVector extends ColumnVector {
     if (isConstant || isAllNull) return;
 
     if (childColumns != null) {
-      for (ColumnVector c: childColumns) {
-        ((WritableColumnVector) c).reset();
+      for (WritableColumnVector c: childColumns) {
+        c.reset();
       }
     }
     elementsAppended = 0;
@@ -104,16 +106,16 @@ public abstract class WritableColumnVector extends ColumnVector {
 
   private void throwUnsupportedException(int requiredCapacity, Throwable cause) {
     String message = "Cannot reserve additional contiguous bytes in the vectorized reader (" +
-        (requiredCapacity >= 0 ? "requested " + requiredCapacity + " bytes" : "integer overflow") +
-        "). As a workaround, you can reduce the vectorized reader batch size, or disable the " +
-        "vectorized reader, or disable " + SQLConf.BUCKETING_ENABLED().key() + " if you read " +
-        "from bucket table. For Parquet file format, refer to " +
-        SQLConf.PARQUET_VECTORIZED_READER_BATCH_SIZE().key() +
-        " (default " + SQLConf.PARQUET_VECTORIZED_READER_BATCH_SIZE().defaultValueString() +
-        ") and " + SQLConf.PARQUET_VECTORIZED_READER_ENABLED().key() + "; for ORC file format, " +
-        "refer to " + SQLConf.ORC_VECTORIZED_READER_BATCH_SIZE().key() +
-        " (default " + SQLConf.ORC_VECTORIZED_READER_BATCH_SIZE().defaultValueString() +
-        ") and " + SQLConf.ORC_VECTORIZED_READER_ENABLED().key() + ".";
+            (requiredCapacity >= 0 ? "requested " + requiredCapacity + " bytes" : "integer overflow") +
+            "). As a workaround, you can reduce the vectorized reader batch size, or disable the " +
+            "vectorized reader, or disable " + SQLConf.BUCKETING_ENABLED().key() + " if you read " +
+            "from bucket table. For Parquet file format, refer to " +
+            SQLConf.PARQUET_VECTORIZED_READER_BATCH_SIZE().key() +
+            " (default " + SQLConf.PARQUET_VECTORIZED_READER_BATCH_SIZE().defaultValueString() +
+            ") and " + SQLConf.PARQUET_VECTORIZED_READER_ENABLED().key() + "; for ORC file format, " +
+            "refer to " + SQLConf.ORC_VECTORIZED_READER_BATCH_SIZE().key() +
+            " (default " + SQLConf.ORC_VECTORIZED_READER_BATCH_SIZE().defaultValueString() +
+            ") and " + SQLConf.ORC_VECTORIZED_READER_ENABLED().key() + ".";
     throw new RuntimeException(message, cause);
   }
 
@@ -204,6 +206,29 @@ public abstract class WritableColumnVector extends ColumnVector {
    * Sets value to [rowId, rowId + count).
    */
   public abstract void putBooleans(int rowId, int count, boolean value);
+
+  /**
+   * Sets bits from [src[srcIndex], src[srcIndex + count]) to [rowId, rowId + count)
+   * src must contain bit-packed 8 booleans in the byte.
+   */
+  public void putBooleans(int rowId, int count, byte src, int srcIndex) {
+    assert ((srcIndex + count) <= 8);
+    byte8[0] = (byte)(src & 1);
+    byte8[1] = (byte)(src >>> 1 & 1);
+    byte8[2] = (byte)(src >>> 2 & 1);
+    byte8[3] = (byte)(src >>> 3 & 1);
+    byte8[4] = (byte)(src >>> 4 & 1);
+    byte8[5] = (byte)(src >>> 5 & 1);
+    byte8[6] = (byte)(src >>> 6 & 1);
+    byte8[7] = (byte)(src >>> 7 & 1);
+    putBytes(rowId, count, byte8, srcIndex);
+  }
+
+  /**
+   * Sets bits from [src[0], src[7]] to [rowId, rowId + 7]
+   * src must contain bit-packed 8 booleans in the byte.
+   */
+  public abstract void putBooleans(int rowId, byte src);
 
   /**
    * Sets `value` to the value at rowId.
@@ -424,6 +449,12 @@ public abstract class WritableColumnVector extends ColumnVector {
   }
 
   /**
+   * Gets the values of bytes from [rowId, rowId + count), as a ByteBuffer.
+   * This method is similar to {@link ColumnVector#getBytes(int, int)}, but avoids making a copy.
+   */
+  public abstract ByteBuffer getByteBuffer(int rowId, int count);
+
+  /**
    * Append APIs. These APIs all behave similarly and will append data to the current vector.  It
    * is not valid to mix the put and append APIs. The append APIs are slower and should only be
    * used if the sizes are not known up front.
@@ -470,6 +501,18 @@ public abstract class WritableColumnVector extends ColumnVector {
     reserve(elementsAppended + count);
     int result = elementsAppended;
     putBooleans(elementsAppended, count, v);
+    elementsAppended += count;
+    return result;
+  }
+
+  /**
+   * Append bits from [src[offset], src[offset + count])
+   * src must contain bit-packed 8 booleans in the byte.
+   */
+  public final int appendBooleans(int count, byte src, int offset) {
+    reserve(elementsAppended + count);
+    int result = elementsAppended;
+    putBooleans(elementsAppended, count, src, offset);
     elementsAppended += count;
     return result;
   }
@@ -766,7 +809,7 @@ public abstract class WritableColumnVector extends ColumnVector {
 
   protected boolean isArray() {
     return type instanceof ArrayType || type instanceof BinaryType || type instanceof StringType ||
-      DecimalType.isByteArrayDecimalType(type);
+            DecimalType.isByteArrayDecimalType(type);
   }
 
   /**

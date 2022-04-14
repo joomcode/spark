@@ -16,12 +16,12 @@
  */
 package org.apache.spark.sql.execution.datasources.parquet;
 
+import org.apache.parquet.Log;
+import org.slf4j.bridge.SLF4JBridgeHandler;
+
 import java.io.Serializable;
 import java.util.logging.Handler;
 import java.util.logging.Logger;
-
-import org.apache.parquet.Log;
-import org.slf4j.bridge.SLF4JBridgeHandler;
 
 // Redirects the JUL logging for parquet-mr versions <= 1.8 to SLF4J logging using
 // SLF4JBridgeHandler. Parquet-mr versions >= 1.9 use SLF4J directly

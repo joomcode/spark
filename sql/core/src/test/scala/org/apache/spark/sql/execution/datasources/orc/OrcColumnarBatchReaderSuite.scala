@@ -25,11 +25,11 @@ import org.apache.hadoop.mapreduce.lib.input.FileSplit
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
 import org.apache.orc.TypeDescription
 
+import org.apache.spark.TestUtils
 import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
-import org.apache.spark.sql.execution.datasources.parquet.SpecificParquetRecordReaderBase
 import org.apache.spark.sql.execution.vectorized.{OnHeapColumnVector, WritableColumnVector}
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
@@ -53,9 +53,9 @@ class OrcColumnarBatchReaderSuite extends QueryTest with SharedSparkSession {
     isConstant.setAccessible(true)
 
     def getReader(
-        requestedDataColIds: Array[Int],
-        requestedPartitionColIds: Array[Int],
-        resultFields: Array[StructField]): OrcColumnarBatchReader = {
+                   requestedDataColIds: Array[Int],
+                   requestedPartitionColIds: Array[Int],
+                   resultFields: Array[StructField]): OrcColumnarBatchReader = {
       val reader = new OrcColumnarBatchReader(4096)
       reader.initBatch(
         orcFileSchema,
@@ -117,7 +117,7 @@ class OrcColumnarBatchReaderSuite extends QueryTest with SharedSparkSession {
       dataTypes.zip(constantValues).foreach { case (dt, v) =>
         val schema = StructType(StructField("col1", IntegerType) :: StructField("pcol", dt) :: Nil)
         val partitionValues = new GenericInternalRow(Array(v))
-        val file = new File(SpecificParquetRecordReaderBase.listDirectory(dir).get(0))
+        val file = new File(TestUtils.listDirectory(dir).head)
         val fileSplit = new FileSplit(new Path(file.getCanonicalPath), 0L, file.length, Array.empty)
         val taskConf = sqlContext.sessionState.newHadoopConf()
         val orcFileSchema = TypeDescription.fromString(schema.simpleString)

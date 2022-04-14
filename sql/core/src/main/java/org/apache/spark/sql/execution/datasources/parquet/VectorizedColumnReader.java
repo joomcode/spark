@@ -17,9 +17,6 @@
 
 package org.apache.spark.sql.execution.datasources.parquet;
 
-import java.io.IOException;
-import java.time.ZoneId;
-
 import org.apache.parquet.CorruptDeltaByteArrays;
 import org.apache.parquet.VersionParser.ParsedVersion;
 import org.apache.parquet.bytes.ByteBufferInputStream;
@@ -36,9 +33,11 @@ import org.apache.parquet.schema.LogicalTypeAnnotation.DateLogicalTypeAnnotation
 import org.apache.parquet.schema.LogicalTypeAnnotation.DecimalLogicalTypeAnnotation;
 import org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit;
 import org.apache.parquet.schema.PrimitiveType;
-
 import org.apache.spark.sql.execution.vectorized.WritableColumnVector;
 import org.apache.spark.sql.types.Decimal;
+
+import java.io.IOException;
+import java.time.ZoneId;
 
 import static org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BOOLEAN;
 import static org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT64;

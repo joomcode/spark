@@ -32,7 +32,7 @@ import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Type.Repetition
 import org.scalatest.BeforeAndAfter
 
-import org.apache.spark.SparkContext
+import org.apache.spark.{SparkContext, TestUtils}
 import org.apache.spark.internal.io.FileCommitProtocol.TaskCommitMessage
 import org.apache.spark.internal.io.HadoopMapReduceCommitProtocol
 import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
@@ -42,7 +42,6 @@ import org.apache.spark.sql.catalyst.plans.logical.{AppendData, LogicalPlan, Ove
 import org.apache.spark.sql.execution.QueryExecution
 import org.apache.spark.sql.execution.datasources.{DataSourceUtils, HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.datasources.noop.NoopDataSource
-import org.apache.spark.sql.execution.datasources.parquet.SpecificParquetRecordReaderBase
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types._
@@ -66,37 +65,37 @@ object LastOptions {
 /** Dummy provider. */
 class DefaultSource
   extends RelationProvider
-  with SchemaRelationProvider
-  with CreatableRelationProvider {
+    with SchemaRelationProvider
+    with CreatableRelationProvider {
 
   case class FakeRelation(sqlContext: SQLContext) extends BaseRelation {
     override def schema: StructType = StructType(Seq(StructField("a", StringType)))
   }
 
   override def createRelation(
-      sqlContext: SQLContext,
-      parameters: Map[String, String],
-      schema: StructType
-    ): BaseRelation = {
+                               sqlContext: SQLContext,
+                               parameters: Map[String, String],
+                               schema: StructType
+                             ): BaseRelation = {
     LastOptions.parameters = parameters
     LastOptions.schema = Some(schema)
     FakeRelation(sqlContext)
   }
 
   override def createRelation(
-      sqlContext: SQLContext,
-      parameters: Map[String, String]
-    ): BaseRelation = {
+                               sqlContext: SQLContext,
+                               parameters: Map[String, String]
+                             ): BaseRelation = {
     LastOptions.parameters = parameters
     LastOptions.schema = None
     FakeRelation(sqlContext)
   }
 
   override def createRelation(
-      sqlContext: SQLContext,
-      mode: SaveMode,
-      parameters: Map[String, String],
-      data: DataFrame): BaseRelation = {
+                               sqlContext: SQLContext,
+                               mode: SaveMode,
+                               parameters: Map[String, String],
+                               data: DataFrame): BaseRelation = {
     LastOptions.parameters = parameters
     LastOptions.schema = None
     LastOptions.saveMode = mode
@@ -107,23 +106,23 @@ class DefaultSource
 /** Dummy provider with only RelationProvider and CreatableRelationProvider. */
 class DefaultSourceWithoutUserSpecifiedSchema
   extends RelationProvider
-  with CreatableRelationProvider {
+    with CreatableRelationProvider {
 
   case class FakeRelation(sqlContext: SQLContext) extends BaseRelation {
     override def schema: StructType = StructType(Seq(StructField("a", StringType)))
   }
 
   override def createRelation(
-      sqlContext: SQLContext,
-      parameters: Map[String, String]): BaseRelation = {
+                               sqlContext: SQLContext,
+                               parameters: Map[String, String]): BaseRelation = {
     FakeRelation(sqlContext)
   }
 
   override def createRelation(
-      sqlContext: SQLContext,
-      mode: SaveMode,
-      parameters: Map[String, String],
-      data: DataFrame): BaseRelation = {
+                               sqlContext: SQLContext,
+                               mode: SaveMode,
+                               parameters: Map[String, String],
+                               data: DataFrame): BaseRelation = {
     FakeRelation(sqlContext)
   }
 }
@@ -133,7 +132,7 @@ object MessageCapturingCommitProtocol {
 }
 
 class MessageCapturingCommitProtocol(jobId: String, path: String)
-    extends HadoopMapReduceCommitProtocol(jobId, path) {
+  extends HadoopMapReduceCommitProtocol(jobId, path) {
 
   // captures commit messages for testing
   override def onTaskCommit(msg: TaskCommitMessage): Unit = {
@@ -200,11 +199,11 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSparkSession with 
     map.put("opt3", "3")
 
     val df = spark.read
-        .format("org.apache.spark.sql.test")
-        .option("opt1", "1")
-        .options(Map("opt2" -> "2"))
-        .options(map)
-        .load()
+      .format("org.apache.spark.sql.test")
+      .option("opt1", "1")
+      .options(Map("opt2" -> "2"))
+      .options(map)
+      .load()
 
     assert(LastOptions.parameters("opt1") == "1")
     assert(LastOptions.parameters("opt2") == "2")
@@ -519,8 +518,8 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSparkSession with 
 
   test("write path implements onTaskCommit API correctly") {
     withSQLConf(
-        SQLConf.FILE_COMMIT_PROTOCOL_CLASS.key ->
-          classOf[MessageCapturingCommitProtocol].getCanonicalName) {
+      SQLConf.FILE_COMMIT_PROTOCOL_CLASS.key ->
+        classOf[MessageCapturingCommitProtocol].getCanonicalName) {
       withTempDir { dir =>
         val path = dir.getCanonicalPath
         MessageCapturingCommitProtocol.commitMessages.clear()
@@ -733,8 +732,8 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSparkSession with 
       Seq("json", "orc", "parquet", "csv").foreach { format =>
         val schema = StructType(
           StructField("cl1", IntegerType, nullable = false).withComment("test") ::
-          StructField("cl2", IntegerType, nullable = true) ::
-          StructField("cl3", IntegerType, nullable = true) :: Nil)
+            StructField("cl2", IntegerType, nullable = true) ::
+            StructField("cl3", IntegerType, nullable = true) :: Nil)
         val row = Row(3, null, 4)
         val df = spark.createDataFrame(sparkContext.parallelize(row :: Nil), schema)
 
@@ -757,19 +756,19 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSparkSession with 
   test("parquet - column nullability -- write only") {
     val schema = StructType(
       StructField("cl1", IntegerType, nullable = false) ::
-      StructField("cl2", IntegerType, nullable = true) :: Nil)
+        StructField("cl2", IntegerType, nullable = true) :: Nil)
     val row = Row(3, 4)
     val df = spark.createDataFrame(sparkContext.parallelize(row :: Nil), schema)
 
     withTempPath { dir =>
       val path = dir.getAbsolutePath
       df.write.mode("overwrite").parquet(path)
-      val file = SpecificParquetRecordReaderBase.listDirectory(dir).get(0)
+      val file = TestUtils.listDirectory(dir).head
 
       val hadoopInputFile = HadoopInputFile.fromPath(new Path(file), new Configuration())
       val f = ParquetFileReader.open(hadoopInputFile)
       val parquetSchema = f.getFileMetaData.getSchema.getColumns.asScala
-                          .map(_.getPrimitiveType)
+        .map(_.getPrimitiveType)
       f.close()
 
       // the write keeps nullable info from the schema
@@ -792,9 +791,9 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSparkSession with 
   }
 
   private def testRead(
-      df: => DataFrame,
-      expectedResult: Seq[String],
-      expectedSchema: StructType): Unit = {
+                        df: => DataFrame,
+                        expectedResult: Seq[String],
+                        expectedSchema: StructType): Unit = {
     checkAnswer(df, spark.createDataset(expectedResult).toDF())
     assert(df.schema === expectedSchema)
   }
@@ -881,7 +880,8 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSparkSession with 
       val createArray = udf { (length: Long) =>
         for (i <- 1 to length.toInt) yield i.toString
       }
-      spark.range(4).select(createArray('id + 1) as 'ex, 'id, 'id % 4 as 'part).coalesce(1).write
+      spark.range(4).select(createArray($"id" + 1) as Symbol("ex"),
+        $"id", $"id" % 4 as Symbol("part")).coalesce(1).write
         .partitionBy("part", "id")
         .mode("overwrite")
         .parquet(src.toString)
@@ -977,7 +977,7 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSparkSession with 
 
   test("SPARK-20460 Check name duplication in schema") {
     def checkWriteDataColumnDuplication(
-        format: String, colName0: String, colName1: String, tempDir: File): Unit = {
+                                         format: String, colName0: String, colName1: String, tempDir: File): Unit = {
       val errorMsg = intercept[AnalysisException] {
         Seq((1, 1)).toDF(colName0, colName1).write.format(format).mode("overwrite")
           .save(tempDir.getAbsolutePath)
@@ -986,7 +986,7 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSparkSession with 
     }
 
     def checkReadUserSpecifiedDataColumnDuplication(
-        df: DataFrame, format: String, colName0: String, colName1: String, tempDir: File): Unit = {
+                                                     df: DataFrame, format: String, colName0: String, colName1: String, tempDir: File): Unit = {
       val testDir = Utils.createTempDir(tempDir.getAbsolutePath)
       df.write.format(format).mode("overwrite").save(testDir.getAbsolutePath)
       val errorMsg = intercept[AnalysisException] {
@@ -997,7 +997,7 @@ class DataFrameReaderWriterSuite extends QueryTest with SharedSparkSession with 
     }
 
     def checkReadPartitionColumnDuplication(
-        format: String, colName0: String, colName1: String, tempDir: File): Unit = {
+                                             format: String, colName0: String, colName1: String, tempDir: File): Unit = {
       val testDir = Utils.createTempDir(tempDir.getAbsolutePath)
       Seq(1).toDF("col").write.format(format).mode("overwrite")
         .save(s"${testDir.getAbsolutePath}/$colName0=1/$colName1=1")
