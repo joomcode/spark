@@ -3570,4 +3570,12 @@
       </dependencies>
     </profile>
   </profiles>
+
+  <distributionManagement>
+    <repository>
+      <id>joom-maven</id>
+      <name>JFrog</name>
+      <url>https://jfrog.joom.it/artifactory/joom-maven</url>
+    </repository>
+  </distributionManagement>
 </project>
