@@ -339,7 +339,6 @@ public class VectorizedParquetRecordReader extends SpecificParquetRecordReaderBa
 
   private void logStats() {
     if(startedAssemblingCurrentBlockAt != 0) {
-      log.info("Finished processing block");
       this.totalTimeSpentProcessingRecords += System.currentTimeMillis() - startedAssemblingCurrentBlockAt;
       if (log.isInfoEnabled()) {
         log.info("Assembled and processed " + this.totalCountLoadedSoFar + " records from " + this.columnarBatch.numCols() + " columns in " +
@@ -416,16 +415,13 @@ public class VectorizedParquetRecordReader extends SpecificParquetRecordReaderBa
     if (rowsReturned != totalCountLoadedSoFar) return;
     logStats();
 
-    log.info("Reading batch started");
     long readingBytesStartTime = System.currentTimeMillis();
 
     PageReadStore pages = reader.readNextRowGroup();
 
     long blockReadMs = System.currentTimeMillis() - readingBytesStartTime;
     totalTimeSpentReadingBytes += blockReadMs;
-    log.info("Reading batch finished in {} millis", blockReadMs);
 
-    log.info("Starting processing block");
     startedAssemblingCurrentBlockAt = System.currentTimeMillis();
     if (pages == null) {
       throw new IOException("expecting more rows but reached last block. Read "
