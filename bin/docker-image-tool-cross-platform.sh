@@ -75,9 +75,6 @@ function build {
   local PYDOCKERFILE=${PYDOCKERFILE:-"$IMG_PATH/spark/bindings/python/Dockerfile"}
   local RDOCKERFILE=${RDOCKERFILE:-"$IMG_PATH/spark/bindings/R/Dockerfile"}
 
-  docker buildx rm spark-builder || true
-  docker buildx create --name spark-builder --driver docker-container --bootstrap --platform linux/amd64,linux/arm64 --use
-
   docker buildx build --platform linux/amd64,linux/arm64 $NOCACHEARG "${BUILD_ARGS[@]}" \
     -t $(image_ref spark) \
     -f "$BASEDOCKERFILE" . \
@@ -92,8 +89,6 @@ function build {
     -t $(image_ref spark-r) \
     -f "$RDOCKERFILE" . \
      --push
-
-  docker buildx rm spark-builder
 }
 
 function push {
