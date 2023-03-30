@@ -92,6 +92,7 @@ function build {
 }
 
 function push {
+  echo "Skip"
   # docker push "$(image_ref spark)"
   # docker push "$(image_ref spark-py)"
   # docker push "$(image_ref spark-r)"
