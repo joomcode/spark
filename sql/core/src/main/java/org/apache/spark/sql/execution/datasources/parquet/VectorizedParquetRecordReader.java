@@ -23,6 +23,9 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import scala.collection.JavaConverters;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -141,6 +144,12 @@ public class VectorizedParquetRecordReader extends SpecificParquetRecordReaderBa
    * The memory mode of the columnarBatch
    */
   private final MemoryMode MEMORY_MODE;
+
+  private long startedAssemblingCurrentBlockAt = 0;
+  private long totalTimeSpentReadingBytes;
+  private long totalTimeSpentProcessingRecords;
+
+  private final Logger log = LoggerFactory.getLogger(VectorizedParquetRecordReader.class);
 
   public VectorizedParquetRecordReader(
       ZoneId convertTz,
@@ -317,7 +326,10 @@ public class VectorizedParquetRecordReader extends SpecificParquetRecordReaderBa
       vector.reset();
     }
     columnarBatch.setNumRows(0);
-    if (rowsReturned >= totalRowCount) return false;
+    if (rowsReturned >= totalRowCount) {
+      logStats();
+      return false;
+    }
     checkEndOfRowGroup();
 
     int num = (int) Math.min(capacity, totalCountLoadedSoFar - rowsReturned);
@@ -341,6 +353,24 @@ public class VectorizedParquetRecordReader extends SpecificParquetRecordReaderBa
     numBatched = num;
     batchIdx = 0;
     return true;
+  }
+
+  private void logStats() {
+    if(startedAssemblingCurrentBlockAt != 0) {
+      this.totalTimeSpentProcessingRecords += System.currentTimeMillis() - startedAssemblingCurrentBlockAt;
+      if (log.isInfoEnabled()) {
+        log.info("Assembled and processed " + this.totalCountLoadedSoFar + " records from " + this.columnarBatch.numCols() + " columns in " +
+                this.totalTimeSpentProcessingRecords + " ms: " +
+                (float) this.totalCountLoadedSoFar / (float) this.totalTimeSpentProcessingRecords + " rec/ms, " +
+                (float) this.totalCountLoadedSoFar * (float) this.columnarBatch.numCols() / (float) this.totalTimeSpentProcessingRecords + " cell/ms");
+        long totalTime = this.totalTimeSpentProcessingRecords + this.totalTimeSpentReadingBytes;
+        if (totalTime != 0L) {
+          long percentReading = 100L * this.totalTimeSpentReadingBytes / totalTime;
+          long percentProcessing = 100L * this.totalTimeSpentProcessingRecords / totalTime;
+          log.info("time spent so far " + percentReading + "% reading (" + this.totalTimeSpentReadingBytes + " ms) and " + percentProcessing + "% processing (" + this.totalTimeSpentProcessingRecords + " ms)");
+        }
+      }
+    }
   }
 
   private void initializeInternal() throws IOException, UnsupportedOperationException {
@@ -401,7 +431,17 @@ public class VectorizedParquetRecordReader extends SpecificParquetRecordReaderBa
 
   private void checkEndOfRowGroup() throws IOException {
     if (rowsReturned != totalCountLoadedSoFar) return;
+    logStats();
+
+    long readingBytesStartTime = System.currentTimeMillis();
+
     PageReadStore pages = reader.readNextRowGroup();
+
+    long blockReadMs = System.currentTimeMillis() - readingBytesStartTime;
+    totalTimeSpentReadingBytes += blockReadMs;
+
+    startedAssemblingCurrentBlockAt = System.currentTimeMillis();
+
     if (pages == null) {
       throw new IOException("expecting more rows but reached last block. Read "
           + rowsReturned + " out of " + totalRowCount);
