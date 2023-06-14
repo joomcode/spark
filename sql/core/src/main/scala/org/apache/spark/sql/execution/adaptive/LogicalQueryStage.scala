@@ -35,8 +35,8 @@ import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 // TODO we can potentially include only [[QueryStageExec]] in this class if we make the aggregation
 // planning aware of partitioning.
 case class LogicalQueryStage(
-                              logicalPlan: LogicalPlan,
-                              physicalPlan: SparkPlan) extends LeafNode {
+    logicalPlan: LogicalPlan,
+    physicalPlan: SparkPlan) extends LeafNode {
 
   override def output: Seq[Attribute] = logicalPlan.output
   override val isStreaming: Boolean = logicalPlan.isStreaming
