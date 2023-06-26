@@ -39,3 +39,7 @@ ENTRYPOINT [ "/opt/entrypoint.sh" ]
 # Specify the User that the actual main process will run as
 ARG spark_uid=185
 USER ${spark_uid}
+
+LABEL com.joom.retention.maxCount=3
+LABEL com.joom.retention.maxCountGroup=develop
+LABEL com.joom.retention.pullProtectDays=90
