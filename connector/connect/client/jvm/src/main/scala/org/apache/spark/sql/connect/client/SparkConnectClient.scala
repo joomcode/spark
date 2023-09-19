@@ -452,6 +452,7 @@ object SparkConnectClient {
         channelBuilder.intercept(new MetadataHeaderClientInterceptor(metadata))
       }
       channelBuilder.maxInboundMessageSize(ConnectCommon.CONNECT_GRPC_MAX_MESSAGE_SIZE)
+      channelBuilder.keepAliveTime(1, java.util.concurrent.TimeUnit.MINUTES)
       new SparkConnectClient(userContextBuilder.build(), channelBuilder, _userAgent)
     }
   }
