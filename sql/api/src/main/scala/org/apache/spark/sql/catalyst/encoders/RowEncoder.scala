@@ -59,6 +59,14 @@ import org.apache.spark.sql.types._
  * }}}
  */
 object RowEncoder {
+  def apply(schema: StructType, lenient: Boolean): ExpressionEncoder[Row] = {
+    ExpressionEncoder(schema, lenient)
+  }
+
+  def apply(schema: StructType): ExpressionEncoder[Row] = {
+    ExpressionEncoder(schema)
+  }
+
   def encoderFor(schema: StructType): AgnosticEncoder[Row] = {
     encoderFor(schema, lenient = false)
   }

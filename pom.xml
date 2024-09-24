@@ -320,6 +320,11 @@
   </properties>
   <repositories>
     <repository>
+      <id>joom-maven</id>
+      <name>JFrog</name>
+      <url>https://jfrog.joom.it/artifactory/joom-maven</url>
+    </repository>
+    <repository>
       <id>gcs-maven-central-mirror</id>
       <!--
         Google Mirror of Maven Central, placed first so that it's used instead of flaky Maven Central.
@@ -3894,4 +3899,11 @@
       </build>
     </profile>
   </profiles>
+  <distributionManagement>
+    <repository>
+      <id>joom-maven</id>
+      <name>JFrog</name>
+      <url>https://jfrog.joom.it/artifactory/joom-maven</url>
+    </repository>
+  </distributionManagement>
 </project>
