@@ -49,7 +49,6 @@ object StaticSQLConf {
     .internal()
     .version("2.0.0")
     .stringConf
-    .checkValues(Set("hive", "in-memory"))
     .createWithDefault("in-memory")
 
   val GLOBAL_TEMP_DATABASE = buildStaticConf("spark.sql.globalTempDatabase")
