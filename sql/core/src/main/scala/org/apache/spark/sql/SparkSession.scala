@@ -1289,11 +1289,10 @@ object SparkSession extends Logging {
     "org.apache.spark.sql.hive.HiveSessionStateBuilder"
 
   private def sessionStateClassName(conf: SparkConf): String = {
-    log.warn("!THIS IS CORRECT PACKAGE!")
     conf.get(CATALOG_IMPLEMENTATION) match {
       case "hive" => HIVE_SESSION_STATE_BUILDER_CLASS_NAME
       case "in-memory" => classOf[SessionStateBuilder].getCanonicalName
-      case _ => conf.get(CATALOG_IMPLEMENTATION)
+      case _ => HIVE_SESSION_STATE_BUILDER_CLASS_NAME
     }
   }
 
