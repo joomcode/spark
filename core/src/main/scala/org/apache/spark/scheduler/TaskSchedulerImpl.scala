@@ -801,7 +801,7 @@ private[spark] class TaskSchedulerImpl(
    * overriding in tests, so it can be deterministic.
    */
   protected def shuffleOffers(offers: IndexedSeq[WorkerOffer]): IndexedSeq[WorkerOffer] = {
-    Random.shuffle(offers)
+    offers.sortBy(_.executorId)  // Random.shuffle(offers)
   }
 
   def statusUpdate(tid: Long, state: TaskState, serializedData: ByteBuffer): Unit = {
