@@ -30,7 +30,7 @@ import org.apache.xbean.asm9.Opcodes._
 
 import org.apache.spark.{SparkConf, SparkEnv}
 import org.apache.spark.deploy.SparkHadoopUtil
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, LogKeys}
 import org.apache.spark.util.ParentClassLoader
 
 /**
@@ -58,9 +58,6 @@ class ExecutorClassLoader(
   val directory = uri.getPath
 
   val parentLoader = new ParentClassLoader(parent)
-
-  // Allows HTTP connect and read timeouts to be controlled for testing / debugging purposes
-  private[executor] var httpUrlConnectionTimeoutMillis: Int = -1
 
   private val fetchFn: (String) => InputStream = uri.getScheme() match {
     case "spark" => getClassFileInputStreamFromSparkRPC
@@ -183,7 +180,8 @@ class ExecutorClassLoader(
         None
       case e: Exception =>
         // Something bad happened while checking if the class exists
-        logError(s"Failed to check existence of class $name on REPL class server at $uri", e)
+        logError(log"Failed to check existence of class ${MDC(LogKeys.CLASS_NAME, name)} " +
+          log"on REPL class server at ${MDC(LogKeys.URI, uri)}", e)
         if (userClassPathFirst) {
           // Allow to try to load from "parentLoader"
           None

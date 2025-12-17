@@ -23,19 +23,18 @@ import javax.xml.stream.XMLInputFactory
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.{DataSourceOptions, FileSourceOptions}
-import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, CompressionCodecs, DateFormatter, DateTimeUtils, ParseMode, PermissiveMode, TimestampFormatter}
-import org.apache.spark.sql.catalyst.util.LegacyDateFormats.FAST_DATE_FORMAT
-import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, CompressionCodecs, DateFormatter, DateTimeUtils, ParseMode, PermissiveMode, TimeFormatter}
+import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.internal.{LegacyBehaviorPolicy, SQLConf}
 
 /**
  * Options for the XML data source.
  */
-private[sql] class XmlOptions(
-    @transient val parameters: CaseInsensitiveMap[String],
-    defaultTimeZoneId: String,
-    defaultColumnNameOfCorruptRecord: String,
-    rowTagRequired: Boolean)
+class XmlOptions(
+    val parameters: CaseInsensitiveMap[String],
+    private val defaultTimeZoneId: String,
+    private val defaultColumnNameOfCorruptRecord: String,
+    private val rowTagRequired: Boolean)
   extends FileSourceOptions(parameters) with Logging {
 
   import XmlOptions._
@@ -50,6 +49,25 @@ private[sql] class XmlOptions(
       defaultTimeZoneId,
       defaultColumnNameOfCorruptRecord,
       rowTagRequired)
+  }
+
+
+  override def equals(obj: Any): Boolean = obj match {
+    case other: XmlOptions =>
+      (parameters == null && other.parameters == null ||
+      parameters != null && parameters == other.parameters) &&
+      defaultTimeZoneId == other.defaultTimeZoneId &&
+      defaultColumnNameOfCorruptRecord == other.defaultColumnNameOfCorruptRecord &&
+      rowTagRequired == other.rowTagRequired
+    case _ => false
+  }
+
+  override def hashCode(): Int = {
+    var result = Option(parameters).map(_.hashCode()).getOrElse(0)
+    result = 31 * result + defaultTimeZoneId.hashCode()
+    result = 31 * result + defaultColumnNameOfCorruptRecord.hashCode()
+    result = 31 * result + (if (rowTagRequired) 1 else 0)
+    result
   }
 
   private def getBool(paramName: String, default: Boolean = false): Boolean = {
@@ -67,7 +85,11 @@ private[sql] class XmlOptions(
 
   val compressionCodec = parameters.get(COMPRESSION).map(CompressionCodecs.getCodecClassName)
   val rowTagOpt = parameters.get(XmlOptions.ROW_TAG).map(_.trim)
-  require(!rowTagRequired || rowTagOpt.isDefined, s"'${XmlOptions.ROW_TAG}' option is required.")
+
+  if (rowTagRequired && rowTagOpt.isEmpty) {
+    throw QueryCompilationErrors.xmlRowTagRequiredError(XmlOptions.ROW_TAG)
+  }
+
   val rowTag = rowTagOpt.getOrElse(XmlOptions.DEFAULT_ROW_TAG)
   require(rowTag.nonEmpty, s"'$ROW_TAG' option should not be an empty string.")
   require(!rowTag.startsWith("<") && !rowTag.endsWith(">"),
@@ -83,7 +105,6 @@ private[sql] class XmlOptions(
   val samplingRatio = parameters.get(SAMPLING_RATIO).map(_.toDouble).getOrElse(1.0)
   require(samplingRatio > 0, s"$SAMPLING_RATIO ($samplingRatio) should be greater than 0")
   val excludeAttributeFlag = getBool(EXCLUDE_ATTRIBUTE, false)
-  val treatEmptyValuesAsNulls = getBool(TREAT_EMPTY_VALUE_AS_NULLS, false)
   val attributePrefix =
     parameters.getOrElse(ATTRIBUTE_PREFIX, XmlOptions.DEFAULT_ATTRIBUTE_PREFIX)
   val valueTag = parameters.getOrElse(VALUE_TAG, XmlOptions.DEFAULT_VALUE_TAG)
@@ -93,13 +114,19 @@ private[sql] class XmlOptions(
   val nullValue = parameters.getOrElse(NULL_VALUE, XmlOptions.DEFAULT_NULL_VALUE)
   val columnNameOfCorruptRecord =
     parameters.getOrElse(COLUMN_NAME_OF_CORRUPT_RECORD, defaultColumnNameOfCorruptRecord)
-  val ignoreSurroundingSpaces = getBool(IGNORE_SURROUNDING_SPACES, false)
+  val ignoreSurroundingSpaces = getBool(IGNORE_SURROUNDING_SPACES, true)
   val parseMode = ParseMode.fromString(parameters.getOrElse(MODE, PermissiveMode.name))
   val inferSchema = getBool(INFER_SCHEMA, true)
   val rowValidationXSDPath = parameters.get(ROW_VALIDATION_XSD_PATH).orNull
   val wildcardColName =
     parameters.getOrElse(WILDCARD_COL_NAME, XmlOptions.DEFAULT_WILDCARD_COL_NAME)
   val ignoreNamespace = getBool(IGNORE_NAMESPACE, false)
+  val prefersDecimal =
+    parameters.get(PREFERS_DECIMAL).map(_.toBoolean).getOrElse(false)
+  // setting indent to "" disables indentation in the generated XML.
+  // Each row will be written in a new line.
+  val indent = parameters.getOrElse(INDENT, DEFAULT_INDENT)
+  val validateName = getBool(VALIDATE_NAME, true)
 
   /**
    * Infer columns with all valid date entries as date type (otherwise inferred as string or
@@ -137,12 +164,15 @@ private[sql] class XmlOptions(
     } else {
       parameters.get(TIMESTAMP_FORMAT)
     }
-  val timestampFormatInWrite: String = parameters.getOrElse(TIMESTAMP_FORMAT,
-    if (SQLConf.get.legacyTimeParserPolicy == LegacyBehaviorPolicy.LEGACY) {
-      s"${DateFormatter.defaultPattern}'T'HH:mm:ss.SSSXXX"
-    } else {
-      s"${DateFormatter.defaultPattern}'T'HH:mm:ss[.SSS][XXX]"
-    })
+  val timestampFormatInWrite: String =
+    parameters.getOrElse(TIMESTAMP_FORMAT, commonTimestampFormat)
+
+  val timestampNTZFormatInRead: Option[String] = parameters.get(TIMESTAMP_NTZ_FORMAT)
+  val timestampNTZFormatInWrite: String =
+    parameters.getOrElse(TIMESTAMP_NTZ_FORMAT, s"${DateFormatter.defaultPattern}'T'HH:mm:ss[.SSS]")
+
+  val timeFormatInRead: Option[String] = parameters.get(TIME_FORMAT)
+  val timeFormatInWrite: String = parameters.getOrElse(TIME_FORMAT, TimeFormatter.defaultPattern)
 
   val timezone = parameters.get("timezone")
 
@@ -157,38 +187,23 @@ private[sql] class XmlOptions(
   val charset = parameters.getOrElse(ENCODING,
     parameters.getOrElse(CHARSET, XmlOptions.DEFAULT_CHARSET))
 
+  // This option takes in a column name and specifies that the entire XML record should be stored
+  // as a single VARIANT type column in the table with the given column name.
+  // E.g. spark.read.format("xml").option("singleVariantColumn", "colName")
+  val singleVariantColumn = parameters.get(SINGLE_VARIANT_COLUMN)
+
+  // When set to true, use the legacy XML parser for parsing XML files.
+  // Compared to the default parser, the legacy parser has less stringent validation checks for
+  // malformed content, but it's less memory-efficient
+  val useLegacyXMLParser: Boolean = parameters.get(USE_LEGACY_XML_PARSER).map(_.toBoolean)
+    .getOrElse(SQLConf.get.getConf(SQLConf.LEGACY_XML_PARSER_ENABLED))
+
   def buildXmlFactory(): XMLInputFactory = {
     XMLInputFactory.newInstance()
   }
-
-  val timestampFormatter = TimestampFormatter(
-    timestampFormatInRead,
-    zoneId,
-    locale,
-    legacyFormat = FAST_DATE_FORMAT,
-    isParsing = true)
-
-  val timestampFormatterInWrite = TimestampFormatter(
-    timestampFormatInWrite,
-    zoneId,
-    locale,
-    legacyFormat = FAST_DATE_FORMAT,
-    isParsing = false)
-
-  val dateFormatter = DateFormatter(
-    dateFormatInRead,
-    locale,
-    legacyFormat = FAST_DATE_FORMAT,
-    isParsing = true)
-
-  val dateFormatterInWrite = DateFormatter(
-    dateFormatInWrite,
-    locale,
-    legacyFormat = FAST_DATE_FORMAT,
-    isParsing = false)
 }
 
-private[sql] object XmlOptions extends DataSourceOptions {
+object XmlOptions extends DataSourceOptions {
   val DEFAULT_ATTRIBUTE_PREFIX = "_"
   val DEFAULT_VALUE_TAG = "_VALUE"
   val DEFAULT_ROW_TAG = "ROW"
@@ -198,12 +213,12 @@ private[sql] object XmlOptions extends DataSourceOptions {
   val DEFAULT_CHARSET: String = StandardCharsets.UTF_8.name
   val DEFAULT_NULL_VALUE: String = null
   val DEFAULT_WILDCARD_COL_NAME = "xs_any"
+  val DEFAULT_INDENT = "    "
   val ROW_TAG = newOption("rowTag")
   val ROOT_TAG = newOption("rootTag")
   val DECLARATION = newOption("declaration")
   val ARRAY_ELEMENT_NAME = newOption("arrayElementName")
   val EXCLUDE_ATTRIBUTE = newOption("excludeAttribute")
-  val TREAT_EMPTY_VALUE_AS_NULLS = newOption("treatEmptyValuesAsNulls")
   val ATTRIBUTE_PREFIX = newOption("attributePrefix")
   val VALUE_TAG = newOption("valueTag")
   val NULL_VALUE = newOption("nullValue")
@@ -218,10 +233,17 @@ private[sql] object XmlOptions extends DataSourceOptions {
   val COMPRESSION = newOption("compression")
   val MULTI_LINE = newOption("multiLine")
   val SAMPLING_RATIO = newOption("samplingRatio")
-  val COLUMN_NAME_OF_CORRUPT_RECORD = newOption("columnNameOfCorruptRecord")
+  val COLUMN_NAME_OF_CORRUPT_RECORD = newOption(DataSourceOptions.COLUMN_NAME_OF_CORRUPT_RECORD)
   val DATE_FORMAT = newOption("dateFormat")
   val TIMESTAMP_FORMAT = newOption("timestampFormat")
+  val TIMESTAMP_NTZ_FORMAT = newOption("timestampNTZFormat")
+  val TIME_FORMAT = newOption("timeFormat")
   val TIME_ZONE = newOption("timeZone")
+  val INDENT = newOption("indent")
+  val PREFERS_DECIMAL = newOption("prefersDecimal")
+  val VALIDATE_NAME = newOption("validateName")
+  val SINGLE_VARIANT_COLUMN = newOption("singleVariantColumn")
+  val USE_LEGACY_XML_PARSER = newOption("useLegacyXMLParser")
   // Options with alternative
   val ENCODING = "encoding"
   val CHARSET = "charset"

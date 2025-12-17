@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
+import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateOrdering
@@ -29,7 +30,7 @@ import org.apache.spark.sql.types._
  */
 class BaseOrdering extends Ordering[InternalRow] {
   def compare(a: InternalRow, b: InternalRow): Int = {
-    throw new UnsupportedOperationException
+    throw SparkUnsupportedOperationException()
   }
 }
 
@@ -37,7 +38,15 @@ class BaseOrdering extends Ordering[InternalRow] {
  * An interpreted row ordering comparator.
  */
 class InterpretedOrdering(ordering: Seq[SortOrder]) extends BaseOrdering {
-  private lazy val physicalDataTypes = ordering.map(order => PhysicalDataType(order.dataType))
+  private val leftEvaluators = ordering.map(_.child)
+  private val rightEvaluators = leftEvaluators.map(_.freshCopyIfContainsStatefulExpression())
+  private lazy val physicalDataTypes = ordering.map { order =>
+    val dt = order.dataType match {
+      case udt: UserDefinedType[_] => udt.sqlType
+      case _ => order.dataType
+    }
+    PhysicalDataType(dt)
+  }
 
   def this(ordering: Seq[SortOrder], inputSchema: Seq[Attribute]) =
     this(bindReferences(ordering, inputSchema))
@@ -47,8 +56,8 @@ class InterpretedOrdering(ordering: Seq[SortOrder]) extends BaseOrdering {
     val size = ordering.size
     while (i < size) {
       val order = ordering(i)
-      val left = order.child.eval(a)
-      val right = order.child.eval(b)
+      val left = leftEvaluators(i).eval(a)
+      val right = rightEvaluators(i).eval(b)
 
       if (left == null && right == null) {
         // Both null, continue looking.

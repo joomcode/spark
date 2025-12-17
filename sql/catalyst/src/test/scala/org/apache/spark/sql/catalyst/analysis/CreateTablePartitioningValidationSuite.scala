@@ -26,13 +26,15 @@ import org.apache.spark.sql.connector.catalog.{InMemoryTableCatalog, Table, Tabl
 import org.apache.spark.sql.connector.expressions.Expressions
 import org.apache.spark.sql.types.{DoubleType, LongType, StringType, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.util.ArrayImplicits._
 
 class CreateTablePartitioningValidationSuite extends AnalysisTest {
   val tableSpec =
-    UnresolvedTableSpec(Map.empty, None, OptionList(Seq.empty), None, None, None, false)
+    UnresolvedTableSpec(Map.empty, None, OptionList(Seq.empty), None, None, None, None, false,
+      Seq.empty)
   test("CreateTableAsSelect: fail missing top-level column") {
     val plan = CreateTableAsSelect(
-      UnresolvedIdentifier(Array("table_name")),
+      UnresolvedIdentifier(Array("table_name").toImmutableArraySeq),
       Expressions.bucket(4, "does_not_exist") :: Nil,
       TestRelation2,
       tableSpec,
@@ -40,14 +42,14 @@ class CreateTablePartitioningValidationSuite extends AnalysisTest {
       ignoreIfExists = false)
 
     assert(!plan.resolved)
-    assertAnalysisErrorClass(plan,
-      expectedErrorClass = "UNSUPPORTED_FEATURE.PARTITION_WITH_NESTED_COLUMN_IS_UNSUPPORTED",
+    assertAnalysisErrorCondition(plan,
+      expectedErrorCondition = "UNSUPPORTED_FEATURE.PARTITION_WITH_NESTED_COLUMN_IS_UNSUPPORTED",
       expectedMessageParameters = Map("cols" -> "`does_not_exist`"))
   }
 
   test("CreateTableAsSelect: fail missing top-level column nested reference") {
     val plan = CreateTableAsSelect(
-      UnresolvedIdentifier(Array("table_name")),
+      UnresolvedIdentifier(Array("table_name").toImmutableArraySeq),
       Expressions.bucket(4, "does_not_exist.z") :: Nil,
       TestRelation2,
       tableSpec,
@@ -55,14 +57,14 @@ class CreateTablePartitioningValidationSuite extends AnalysisTest {
       ignoreIfExists = false)
 
     assert(!plan.resolved)
-    assertAnalysisErrorClass(plan,
-      expectedErrorClass = "UNSUPPORTED_FEATURE.PARTITION_WITH_NESTED_COLUMN_IS_UNSUPPORTED",
+    assertAnalysisErrorCondition(plan,
+      expectedErrorCondition = "UNSUPPORTED_FEATURE.PARTITION_WITH_NESTED_COLUMN_IS_UNSUPPORTED",
       expectedMessageParameters = Map("cols" -> "`does_not_exist`.`z`"))
   }
 
   test("CreateTableAsSelect: fail missing nested column") {
     val plan = CreateTableAsSelect(
-      UnresolvedIdentifier(Array("table_name")),
+      UnresolvedIdentifier(Array("table_name").toImmutableArraySeq),
       Expressions.bucket(4, "point.z") :: Nil,
       TestRelation2,
       tableSpec,
@@ -70,14 +72,14 @@ class CreateTablePartitioningValidationSuite extends AnalysisTest {
       ignoreIfExists = false)
 
     assert(!plan.resolved)
-    assertAnalysisErrorClass(plan,
-      expectedErrorClass = "UNSUPPORTED_FEATURE.PARTITION_WITH_NESTED_COLUMN_IS_UNSUPPORTED",
+    assertAnalysisErrorCondition(plan,
+      expectedErrorCondition = "UNSUPPORTED_FEATURE.PARTITION_WITH_NESTED_COLUMN_IS_UNSUPPORTED",
       expectedMessageParameters = Map("cols" -> "`point`.`z`"))
   }
 
   test("CreateTableAsSelect: fail with multiple errors") {
     val plan = CreateTableAsSelect(
-      UnresolvedIdentifier(Array("table_name")),
+      UnresolvedIdentifier(Array("table_name").toImmutableArraySeq),
       Expressions.bucket(4, "does_not_exist", "point.z") :: Nil,
       TestRelation2,
       tableSpec,
@@ -85,14 +87,14 @@ class CreateTablePartitioningValidationSuite extends AnalysisTest {
       ignoreIfExists = false)
 
     assert(!plan.resolved)
-    assertAnalysisErrorClass(plan,
-      expectedErrorClass = "UNSUPPORTED_FEATURE.PARTITION_WITH_NESTED_COLUMN_IS_UNSUPPORTED",
+    assertAnalysisErrorCondition(plan,
+      expectedErrorCondition = "UNSUPPORTED_FEATURE.PARTITION_WITH_NESTED_COLUMN_IS_UNSUPPORTED",
       expectedMessageParameters = Map("cols" -> "`does_not_exist`, `point`.`z`"))
   }
 
   test("CreateTableAsSelect: success with top-level column") {
     val plan = CreateTableAsSelect(
-      UnresolvedIdentifier(Array("table_name")),
+      UnresolvedIdentifier(Array("table_name").toImmutableArraySeq),
       Expressions.bucket(4, "id") :: Nil,
       TestRelation2,
       tableSpec,
@@ -104,7 +106,7 @@ class CreateTablePartitioningValidationSuite extends AnalysisTest {
 
   test("CreateTableAsSelect: success using nested column") {
     val plan = CreateTableAsSelect(
-      UnresolvedIdentifier(Array("table_name")),
+      UnresolvedIdentifier(Array("table_name").toImmutableArraySeq),
       Expressions.bucket(4, "point.x") :: Nil,
       TestRelation2,
       tableSpec,
@@ -116,7 +118,7 @@ class CreateTablePartitioningValidationSuite extends AnalysisTest {
 
   test("CreateTableAsSelect: success using complex column") {
     val plan = CreateTableAsSelect(
-      UnresolvedIdentifier(Array("table_name")),
+      UnresolvedIdentifier(Array("table_name").toImmutableArraySeq),
       Expressions.bucket(4, "point") :: Nil,
       TestRelation2,
       tableSpec,

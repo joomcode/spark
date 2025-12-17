@@ -37,17 +37,19 @@ import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{DataType, StructType}
 import org.apache.spark.sql.util.SchemaUtils
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.SerializableConfiguration
 
 trait FileWrite extends Write {
   def paths: Seq[String]
   def formatName: String
   def supportsDataType: DataType => Boolean
+  def allowDuplicatedColumnNames: Boolean = false
   def info: LogicalWriteInfo
 
   private val schema = info.schema()
   private val queryId = info.queryId()
-  private val options = info.options()
+  val options = info.options()
 
   override def description(): String = formatName
 
@@ -90,9 +92,11 @@ trait FileWrite extends Write {
       throw new IllegalArgumentException("Expected exactly one path to be specified, but " +
         s"got: ${paths.mkString(", ")}")
     }
-    val pathName = paths.head
-    SchemaUtils.checkColumnNameDuplication(schema.fields.map(_.name), caseSensitiveAnalysis)
-    DataSource.validateSchema(schema, sqlConf)
+    if (!allowDuplicatedColumnNames) {
+      SchemaUtils.checkColumnNameDuplication(
+        schema.fields.map(_.name).toImmutableArraySeq, caseSensitiveAnalysis)
+    }
+    DataSource.validateSchema(formatName, schema, sqlConf)
 
     // TODO: [SPARK-36340] Unify check schema filed of DataSource V2 Insert.
     schema.foreach { field =>

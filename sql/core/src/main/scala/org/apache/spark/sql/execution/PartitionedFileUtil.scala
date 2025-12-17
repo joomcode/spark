@@ -17,17 +17,16 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.hadoop.fs.{BlockLocation, FileStatus, LocatedFileStatus}
+import org.apache.hadoop.fs.{BlockLocation, FileStatus, LocatedFileStatus, Path}
 
 import org.apache.spark.paths.SparkPath
-import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.execution.datasources._
 
 object PartitionedFileUtil {
   def splitFiles(
-      sparkSession: SparkSession,
       file: FileStatusWithMetadata,
+      filePath: Path,
       isSplitable: Boolean,
       maxSplitBytes: Long,
       partitionValues: InternalRow): Seq[PartitionedFile] = {
@@ -35,20 +34,21 @@ object PartitionedFileUtil {
       (0L until file.getLen by maxSplitBytes).map { offset =>
         val remaining = file.getLen - offset
         val size = if (remaining > maxSplitBytes) maxSplitBytes else remaining
-        val hosts = getBlockHosts(getBlockLocations(file.fileStatus), offset, size)
-        PartitionedFile(partitionValues, SparkPath.fromPath(file.getPath), offset, size, hosts,
-          file.getModificationTime, file.getLen, file.metadata)
+        getPartitionedFile(file, filePath, partitionValues, offset, size)
       }
     } else {
-      Seq(getPartitionedFile(file, partitionValues))
+      Seq(getPartitionedFile(file, filePath, partitionValues, 0, file.getLen))
     }
   }
 
   def getPartitionedFile(
       file: FileStatusWithMetadata,
-      partitionValues: InternalRow): PartitionedFile = {
-    val hosts = getBlockHosts(getBlockLocations(file.fileStatus), 0, file.getLen)
-    PartitionedFile(partitionValues, SparkPath.fromPath(file.getPath), 0, file.getLen, hosts,
+      filePath: Path,
+      partitionValues: InternalRow,
+      start: Long,
+      length: Long): PartitionedFile = {
+    val hosts = getBlockHosts(getBlockLocations(file.fileStatus), start, length)
+    PartitionedFile(partitionValues, SparkPath.fromPath(filePath), start, length, hosts,
       file.getModificationTime, file.getLen, file.metadata)
   }
 

@@ -20,12 +20,14 @@ package org.apache.spark.sql.execution.window
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Add, AggregateWindowFunction, Ascending, Attribute, BoundReference, CurrentRow, DateAdd, DateAddYMInterval, DecimalAddNoOverflowCheck, Descending, Expression, FrameLessOffsetWindowFunction, FrameType, IdentityProjection, IntegerLiteral, MutableProjection, NamedExpression, OffsetWindowFunction, PythonFuncExpression, RangeFrame, RowFrame, RowOrdering, SortOrder, SpecifiedWindowFrame, TimeAdd, TimestampAddYMInterval, UnaryMinus, UnboundedFollowing, UnboundedPreceding, UnsafeProjection, WindowExpression}
+import org.apache.spark.sql.catalyst.expressions.{Add, AggregateWindowFunction, Ascending, Attribute, BoundReference, CurrentRow, DateAdd, DateAddYMInterval, DecimalAddNoOverflowCheck, Descending, Expression, ExtractANSIIntervalDays, FrameLessOffsetWindowFunction, FrameType, IdentityProjection, IntegerLiteral, MutableProjection, NamedExpression, OffsetWindowFunction, PythonFuncExpression, RangeFrame, RowFrame, RowOrdering, SortOrder, SpecifiedWindowFrame, TimestampAddInterval, TimestampAddYMInterval, UnaryMinus, UnboundedFollowing, UnboundedPreceding, UnsafeProjection, WindowExpression}
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{CalendarIntervalType, DateType, DayTimeIntervalType, DecimalType, IntegerType, TimestampNTZType, TimestampType, YearMonthIntervalType}
+import org.apache.spark.sql.types.DayTimeIntervalType.DAY
 import org.apache.spark.util.collection.Utils
 
 trait WindowEvaluatorFactoryBase {
@@ -76,7 +78,7 @@ trait WindowEvaluatorFactoryBase {
         RowBoundOrdering(offset)
 
       case (RowFrame, _) =>
-        throw new IllegalStateException(s"Unhandled bound in windows expressions: $bound")
+        throw SparkException.internalError(s"Unhandled bound in windows expressions: $bound")
 
       case (RangeFrame, CurrentRow) =>
         val ordering = RowOrdering.create(orderSpec, childOutput)
@@ -100,12 +102,14 @@ trait WindowEvaluatorFactoryBase {
         val boundExpr = (expr.dataType, boundOffset.dataType) match {
           case (DateType, IntegerType) => DateAdd(expr, boundOffset)
           case (DateType, _: YearMonthIntervalType) => DateAddYMInterval(expr, boundOffset)
+          case (DateType, DayTimeIntervalType(DAY, DAY)) =>
+            DateAdd(expr, ExtractANSIIntervalDays(boundOffset))
           case (TimestampType | TimestampNTZType, CalendarIntervalType) =>
-            TimeAdd(expr, boundOffset, Some(timeZone))
+            TimestampAddInterval(expr, boundOffset, Some(timeZone))
           case (TimestampType | TimestampNTZType, _: YearMonthIntervalType) =>
             TimestampAddYMInterval(expr, boundOffset, Some(timeZone))
           case (TimestampType | TimestampNTZType, _: DayTimeIntervalType) =>
-            TimeAdd(expr, boundOffset, Some(timeZone))
+            TimestampAddInterval(expr, boundOffset, Some(timeZone))
           case (d: DecimalType, _: DecimalType) => DecimalAddNoOverflowCheck(expr, boundOffset, d)
           case (a, b) if a == b => Add(expr, boundOffset)
         }
@@ -119,7 +123,7 @@ trait WindowEvaluatorFactoryBase {
         RangeBoundOrdering(ordering, current, bound)
 
       case (RangeFrame, _) =>
-        throw new IllegalStateException("Non-Zero range offsets are not supported for windows " +
+        throw SparkException.internalError("Non-Zero range offsets are not supported for windows " +
           "with multiple order expressions.")
     }
   }
@@ -168,7 +172,7 @@ trait WindowEvaluatorFactoryBase {
                 case _ => collect("AGGREGATE", frame, e, f)
               }
             case f: AggregateWindowFunction => collect("AGGREGATE", frame, e, f)
-            case f => throw new IllegalStateException(s"Unsupported window function: $f")
+            case f => throw SparkException.internalError(s"Unsupported window function: $f")
           }
         case _ =>
       }
@@ -275,7 +279,7 @@ trait WindowEvaluatorFactoryBase {
             }
 
           case _ =>
-            throw new IllegalStateException(s"Unsupported factory: $key")
+            throw SparkException.internalError(s"Unsupported factory: $key")
         }
 
         // Keep track of the number of expressions. This is a side-effect in a map...

@@ -29,17 +29,37 @@ See also :class:`SparkSession`.
     :toctree: api/
 
     SparkSession.active
+
+.. autosummary::
+    :toctree: api/
+    :template: autosummary/accessor_method.rst
+
     SparkSession.builder.appName
     SparkSession.builder.config
     SparkSession.builder.enableHiveSupport
     SparkSession.builder.getOrCreate
     SparkSession.builder.master
     SparkSession.builder.remote
+
+.. autosummary::
+    :toctree: api/
+
+    SparkSession.addArtifact
+    SparkSession.addArtifacts
+    SparkSession.addTag
     SparkSession.catalog
+    SparkSession.clearTags
     SparkSession.conf
     SparkSession.createDataFrame
+    SparkSession.dataSource
     SparkSession.getActiveSession
+    SparkSession.getTags
+    SparkSession.interruptAll
+    SparkSession.interruptOperation
+    SparkSession.interruptTag
     SparkSession.newSession
+    SparkSession.profile
+    SparkSession.removeTag
     SparkSession.range
     SparkSession.read
     SparkSession.readStream
@@ -48,6 +68,7 @@ See also :class:`SparkSession`.
     SparkSession.stop
     SparkSession.streams
     SparkSession.table
+    SparkSession.tvf
     SparkSession.udf
     SparkSession.udtf
     SparkSession.version
@@ -58,16 +79,15 @@ Spark Connect Only
 
 .. autosummary::
     :toctree: api/
+    :template: autosummary/accessor_method.rst
 
     SparkSession.builder.create
-    SparkSession.addArtifact
-    SparkSession.addArtifacts
-    SparkSession.copyFromLocalToFs
+
+.. autosummary::
+    :toctree: api/
+
+    SparkSession.clearProgressHandlers
     SparkSession.client
-    SparkSession.interruptAll
-    SparkSession.interruptTag
-    SparkSession.interruptOperation
-    SparkSession.addTag
-    SparkSession.removeTag
-    SparkSession.getTags
-    SparkSession.clearTags
+    SparkSession.copyFromLocalToFs
+    SparkSession.registerProgressHandler
+    SparkSession.removeProgressHandler

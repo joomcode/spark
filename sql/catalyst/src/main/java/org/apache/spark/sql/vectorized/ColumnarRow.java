@@ -16,6 +16,7 @@
  */
 package org.apache.spark.sql.vectorized;
 
+import org.apache.spark.SparkUnsupportedOperationException;
 import org.apache.spark.annotation.Evolving;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
@@ -23,6 +24,9 @@ import org.apache.spark.sql.catalyst.types.*;
 import org.apache.spark.sql.types.*;
 import org.apache.spark.unsafe.types.CalendarInterval;
 import org.apache.spark.unsafe.types.UTF8String;
+import org.apache.spark.unsafe.types.VariantVal;
+import org.apache.spark.unsafe.types.GeographyVal;
+import org.apache.spark.unsafe.types.GeometryVal;
 
 /**
  * Row abstraction in {@link ColumnVector}.
@@ -75,14 +79,20 @@ public final class ColumnarRow extends InternalRow {
           row.update(i, getUTF8String(i).copy());
         } else if (pdt instanceof PhysicalBinaryType) {
           row.update(i, getBinary(i));
+        } else if (pdt instanceof PhysicalGeographyType) {
+          row.update(i, getGeography(i));
+        } else if (pdt instanceof PhysicalGeometryType) {
+          row.update(i, getGeometry(i));
         } else if (pdt instanceof PhysicalDecimalType t) {
           row.setDecimal(i, getDecimal(i, t.precision(), t.scale()), t.precision());
-        } else if (pdt instanceof PhysicalStructType) {
-          row.update(i, getStruct(i, ((PhysicalStructType) pdt).fields().length).copy());
+        } else if (pdt instanceof PhysicalStructType t) {
+          row.update(i, getStruct(i, t.fields().length).copy());
         } else if (pdt instanceof PhysicalArrayType) {
           row.update(i, getArray(i).copy());
         } else if (pdt instanceof PhysicalMapType) {
           row.update(i, getMap(i).copy());
+        } else if (pdt instanceof PhysicalVariantType) {
+          row.update(i, getVariant(i));
         } else {
           throw new RuntimeException("Not implemented. " + dt);
         }
@@ -93,7 +103,7 @@ public final class ColumnarRow extends InternalRow {
 
   @Override
   public boolean anyNull() {
-    throw new UnsupportedOperationException();
+    throw SparkUnsupportedOperationException.apply();
   }
 
   @Override
@@ -136,8 +146,23 @@ public final class ColumnarRow extends InternalRow {
   }
 
   @Override
+  public GeographyVal getGeography(int ordinal) {
+    return data.getChild(ordinal).getGeography(rowId);
+  }
+
+  @Override
+  public GeometryVal getGeometry(int ordinal) {
+    return data.getChild(ordinal).getGeometry(rowId);
+  }
+
+  @Override
   public CalendarInterval getInterval(int ordinal) {
     return data.getChild(ordinal).getInterval(rowId);
+  }
+
+  @Override
+  public VariantVal getVariant(int ordinal) {
+    return data.getChild(ordinal).getVariant(rowId);
   }
 
   @Override
@@ -157,6 +182,7 @@ public final class ColumnarRow extends InternalRow {
 
   @Override
   public Object get(int ordinal, DataType dataType) {
+    if (isNullAt(ordinal)) return null;
     if (dataType instanceof BooleanType) {
       return getBoolean(ordinal);
     } else if (dataType instanceof ByteType) {
@@ -181,20 +207,28 @@ public final class ColumnarRow extends InternalRow {
       return getInt(ordinal);
     } else if (dataType instanceof TimestampType) {
       return getLong(ordinal);
+    } else if (dataType instanceof TimestampNTZType) {
+      return getLong(ordinal);
     } else if (dataType instanceof ArrayType) {
       return getArray(ordinal);
     } else if (dataType instanceof StructType) {
       return getStruct(ordinal, ((StructType)dataType).fields().length);
     } else if (dataType instanceof MapType) {
       return getMap(ordinal);
+    } else if (dataType instanceof VariantType) {
+      return getVariant(ordinal);
     } else {
-      throw new UnsupportedOperationException("Datatype not supported " + dataType);
+      throw new SparkUnsupportedOperationException("_LEGACY_ERROR_TEMP_3155");
     }
   }
 
   @Override
-  public void update(int ordinal, Object value) { throw new UnsupportedOperationException(); }
+  public void update(int ordinal, Object value) {
+    throw SparkUnsupportedOperationException.apply();
+  }
 
   @Override
-  public void setNullAt(int ordinal) { throw new UnsupportedOperationException(); }
+  public void setNullAt(int ordinal) {
+    throw SparkUnsupportedOperationException.apply();
+  }
 }

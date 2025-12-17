@@ -17,7 +17,6 @@
 package org.apache.spark.sql.internal
 
 import java.util.TimeZone
-import java.util.concurrent.atomic.AtomicReference
 
 import scala.util.Try
 
@@ -26,8 +25,8 @@ import org.apache.spark.util.SparkClassUtils
 
 /**
  * Configuration for all objects that are placed in the `sql/api` project. The normal way of
- * accessing this class is through `SqlApiConf.get`. If this code is being used with sql/core
- * then its values are bound to the currently set SQLConf. With Spark Connect, it will default to
+ * accessing this class is through `SqlApiConf.get`. If this code is being used with sql/core then
+ * its values are bound to the currently set SQLConf. With Spark Connect, it will default to
  * hardcoded values.
  */
 private[sql] trait SqlApiConf {
@@ -38,35 +37,47 @@ private[sql] trait SqlApiConf {
   def exponentLiteralAsDecimalEnabled: Boolean
   def enforceReservedKeywords: Boolean
   def doubleQuotedIdentifiers: Boolean
+  def singleCharacterPipeOperatorEnabled: Boolean
   def timestampType: AtomicType
   def allowNegativeScaleOfDecimalEnabled: Boolean
   def charVarcharAsString: Boolean
+  def preserveCharVarcharTypeInfo: Boolean
   def datetimeJava8ApiEnabled: Boolean
   def sessionLocalTimeZone: String
   def legacyTimeParserPolicy: LegacyBehaviorPolicy.Value
+  def stackTracesInDataFrameContext: Int
+  def dataFrameQueryContextEnabled: Boolean
+  def legacyAllowUntypedScalaUDFs: Boolean
+  def manageParserCaches: Boolean
+  def parserDfaCacheFlushThreshold: Int
+  def parserDfaCacheFlushRatio: Double
+  def legacyParameterSubstitutionConstantsOnly: Boolean
+  def legacyIdentifierClauseOnly: Boolean
 }
 
 private[sql] object SqlApiConf {
   // Shared keys.
-  val ANSI_ENABLED_KEY: String = "spark.sql.ansi.enabled"
-  val LEGACY_TIME_PARSER_POLICY_KEY: String = "spark.sql.legacy.timeParserPolicy"
-  val CASE_SENSITIVE_KEY: String = "spark.sql.caseSensitive"
-  val SESSION_LOCAL_TIMEZONE_KEY: String = "spark.sql.session.timeZone"
-  val LOCAL_RELATION_CACHE_THRESHOLD_KEY: String = "spark.sql.session.localRelationCacheThreshold"
+  val ANSI_ENABLED_KEY: String = SqlApiConfHelper.ANSI_ENABLED_KEY
+  val LEGACY_TIME_PARSER_POLICY_KEY: String = SqlApiConfHelper.LEGACY_TIME_PARSER_POLICY_KEY
+  val CASE_SENSITIVE_KEY: String = SqlApiConfHelper.CASE_SENSITIVE_KEY
+  val SESSION_LOCAL_TIMEZONE_KEY: String = SqlApiConfHelper.SESSION_LOCAL_TIMEZONE_KEY
+  val ARROW_EXECUTION_USE_LARGE_VAR_TYPES: String =
+    SqlApiConfHelper.ARROW_EXECUTION_USE_LARGE_VAR_TYPES
+  val LOCAL_RELATION_CACHE_THRESHOLD_KEY: String =
+    SqlApiConfHelper.LOCAL_RELATION_CACHE_THRESHOLD_KEY
+  val LOCAL_RELATION_CHUNK_SIZE_ROWS_KEY: String =
+    SqlApiConfHelper.LOCAL_RELATION_CHUNK_SIZE_ROWS_KEY
+  val LOCAL_RELATION_CHUNK_SIZE_BYTES_KEY: String =
+    SqlApiConfHelper.LOCAL_RELATION_CHUNK_SIZE_BYTES_KEY
+  val LOCAL_RELATION_BATCH_OF_CHUNKS_SIZE_BYTES_KEY: String =
+    SqlApiConfHelper.LOCAL_RELATION_BATCH_OF_CHUNKS_SIZE_BYTES_KEY
+  val PARSER_DFA_CACHE_FLUSH_THRESHOLD_KEY: String =
+    SqlApiConfHelper.PARSER_DFA_CACHE_FLUSH_THRESHOLD_KEY
+  val PARSER_DFA_CACHE_FLUSH_RATIO_KEY: String =
+    SqlApiConfHelper.PARSER_DFA_CACHE_FLUSH_RATIO_KEY
+  val MANAGE_PARSER_CACHES_KEY: String = SqlApiConfHelper.MANAGE_PARSER_CACHES_KEY
 
-  /**
-   * Defines a getter that returns the [[SqlApiConf]] within scope.
-   */
-  private val confGetter = new AtomicReference[() => SqlApiConf](() => DefaultSqlApiConf)
-
-  /**
-   * Sets the active config getter.
-   */
-  private[sql] def setConfGetter(getter: () => SqlApiConf): Unit = {
-    confGetter.set(getter)
-  }
-
-  def get: SqlApiConf = confGetter.get()()
+  def get: SqlApiConf = SqlApiConfHelper.getConfGetter.get()()
 
   // Force load SQLConf. This will trigger the installation of a confGetter that points to SQLConf.
   Try(SparkClassUtils.classForName("org.apache.spark.sql.internal.SQLConf$"))
@@ -83,10 +94,20 @@ private[sql] object DefaultSqlApiConf extends SqlApiConf {
   override def exponentLiteralAsDecimalEnabled: Boolean = false
   override def enforceReservedKeywords: Boolean = false
   override def doubleQuotedIdentifiers: Boolean = false
+  override def singleCharacterPipeOperatorEnabled: Boolean = true
   override def timestampType: AtomicType = TimestampType
   override def allowNegativeScaleOfDecimalEnabled: Boolean = false
   override def charVarcharAsString: Boolean = false
+  override def preserveCharVarcharTypeInfo: Boolean = false
   override def datetimeJava8ApiEnabled: Boolean = false
   override def sessionLocalTimeZone: String = TimeZone.getDefault.getID
-  override def legacyTimeParserPolicy: LegacyBehaviorPolicy.Value = LegacyBehaviorPolicy.EXCEPTION
+  override def legacyTimeParserPolicy: LegacyBehaviorPolicy.Value = LegacyBehaviorPolicy.CORRECTED
+  override def stackTracesInDataFrameContext: Int = 1
+  override def dataFrameQueryContextEnabled: Boolean = true
+  override def legacyAllowUntypedScalaUDFs: Boolean = false
+  override def manageParserCaches: Boolean = false
+  override def parserDfaCacheFlushThreshold: Int = -1
+  override def parserDfaCacheFlushRatio: Double = -1.0
+  override def legacyParameterSubstitutionConstantsOnly: Boolean = false
+  override def legacyIdentifierClauseOnly: Boolean = false
 }

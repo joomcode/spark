@@ -65,6 +65,11 @@ object DataSourceV2Implicits {
       }
     }
 
+    def supportsPartitions: Boolean = table match {
+      case _: SupportsPartitionManagement => true
+      case _ => false
+    }
+
     def asPartitionable: SupportsPartitionManagement = {
       table match {
         case support: SupportsPartitionManagement =>
@@ -104,7 +109,7 @@ object DataSourceV2Implicits {
           name = metaCol.name,
           dataType = metaCol.dataType,
           nullable = metaCol.isNullable,
-          metadata = MetadataAttribute.metadata(metaCol.name))
+          metadata = MetadataAttribute.metadata(metaCol))
         Option(metaCol.comment).map(field.withComment).getOrElse(field)
       }
       StructType(fields)

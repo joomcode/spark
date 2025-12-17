@@ -17,7 +17,7 @@
 
 package org.apache.spark.mllib.linalg
 
-import java.util.{Arrays, Random}
+import java.util.{Arrays, Objects, Random}
 
 import scala.collection.mutable.{ArrayBuffer, ArrayBuilder => MArrayBuilder, HashSet => MHashSet}
 import scala.language.implicitConversions
@@ -30,6 +30,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeArrayData}
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.array.ByteArrayMethods
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Trait for a local matrix.
@@ -313,7 +314,7 @@ class DenseMatrix @Since("1.3.0") (
   }
 
   override def hashCode: Int = {
-    com.google.common.base.Objects.hashCode(numRows: Integer, numCols: Integer, toArray)
+    Objects.hash(numRows: Integer, numCols: Integer, toArray)
   }
 
   private[mllib] def asBreeze: BM[Double] = {
@@ -1140,7 +1141,7 @@ object Matrices {
               cnt += 1
             }
             startCol += nCols
-            data.toSeq
+            data.toImmutableArraySeq
           case dnMat: DenseMatrix =>
             val data = new ArrayBuffer[(Int, Int, Double)]()
             dnMat.foreachActive { (i, j, v) =>
@@ -1209,7 +1210,7 @@ object Matrices {
               cnt += 1
             }
             startRow += nRows
-            data.toSeq
+            data.toImmutableArraySeq
           case dnMat: DenseMatrix =>
             val data = new ArrayBuffer[(Int, Int, Double)]()
             dnMat.foreachActive { (i, j, v) =>

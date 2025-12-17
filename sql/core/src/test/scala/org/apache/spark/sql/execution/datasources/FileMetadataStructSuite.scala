@@ -31,7 +31,7 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.Trigger
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.sql.types.{IntegerType, LongType, StringType, StructField, StructType}
+import org.apache.spark.sql.types.{IntegerType, LongType, MetadataBuilder, StringType, StructField, StructType}
 
 class FileMetadataStructSuite extends QueryTest with SharedSparkSession {
 
@@ -243,8 +243,10 @@ class FileMetadataStructSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         df.select("name", METADATA_FILE_NAME).collect()
       },
-      errorClass = "FIELD_NOT_FOUND",
-      parameters = Map("fieldName" -> "`file_name`", "fields" -> "`id`, `university`"))
+      condition = "FIELD_NOT_FOUND",
+      parameters = Map("fieldName" -> "`file_name`", "fields" -> "`id`, `university`"),
+      context =
+        ExpectedContext(fragment = "select", callSitePattern = getCurrentClassCallSitePattern))
   }
 
   metadataColumnsTest("SPARK-42683: df metadataColumn - schema conflict",
@@ -307,7 +309,7 @@ class FileMetadataStructSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         df.metadataColumn("foo")
       },
-      errorClass = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
+      condition = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
       parameters = Map("objectName" -> "`foo`", "proposal" -> "`_metadata`"))
 
     // Name exists, but does not reference a metadata column
@@ -315,7 +317,7 @@ class FileMetadataStructSuite extends QueryTest with SharedSparkSession {
       exception = intercept[AnalysisException] {
         df.metadataColumn("name")
       },
-      errorClass = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
+      condition = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
       parameters = Map("objectName" -> "`name`", "proposal" -> "`_metadata`"))
   }
 
@@ -417,14 +419,15 @@ class FileMetadataStructSuite extends QueryTest with SharedSparkSession {
     val filteredDF = df.select("name", "age", METADATA_FILE_NAME)
       .where(Column(METADATA_FILE_NAME) === f0(METADATA_FILE_NAME))
 
-    // check the filtered file
+    // Check the filtered file.
     val partitions = filteredDF.queryExecution.sparkPlan.collectFirst {
-      case p: FileSourceScanExec => p.selectedPartitions
+      case p: FileSourceScanExec => p.selectedPartitions.filePartitionIterator.toSeq
     }.get
 
     assert(partitions.length == 1) // 1 partition
-    assert(partitions.head.files.length == 1) // 1 file in that partition
-    assert(partitions.head.files.head.getPath.toString == f0(METADATA_FILE_PATH)) // the file is f0
+    assert(partitions.head.numFiles == 1) // 1 file in that partition
+    // The file is f0.
+    assert(partitions.head.files.toSeq.head.getPath.toString == f0(METADATA_FILE_PATH))
 
     // check result
     checkAnswer(
@@ -462,14 +465,15 @@ class FileMetadataStructSuite extends QueryTest with SharedSparkSession {
       // only user column
       .where("age == 31")
 
-    // check the filtered file
+    // Check the filtered file.
     val partitions = filteredDF.queryExecution.sparkPlan.collectFirst {
-      case p: FileSourceScanExec => p.selectedPartitions
+      case p: FileSourceScanExec => p.selectedPartitions.filePartitionIterator.toSeq
     }.get
 
     assert(partitions.length == 1) // 1 partition
-    assert(partitions.head.files.length == 1) // 1 file in that partition
-    assert(partitions.head.files.head.getPath.toString == f1(METADATA_FILE_PATH)) // the file is f1
+    assert(partitions.head.numFiles == 1) // 1 file in that partition
+    // The file is f0.
+    assert(partitions.head.files.toSeq.head.getPath.toString == f1(METADATA_FILE_PATH))
 
     // check result
     checkAnswer(
@@ -521,15 +525,21 @@ class FileMetadataStructSuite extends QueryTest with SharedSparkSession {
             exception = intercept[AnalysisException] {
               df.select("name", "_metadata.file_name").collect()
             },
-            errorClass = "FIELD_NOT_FOUND",
-            parameters = Map("fieldName" -> "`file_name`", "fields" -> "`id`, `university`"))
+            condition = "FIELD_NOT_FOUND",
+            parameters = Map("fieldName" -> "`file_name`", "fields" -> "`id`, `university`"),
+            context = ExpectedContext(
+              fragment = "select",
+              callSitePattern = getCurrentClassCallSitePattern))
 
           checkError(
             exception = intercept[AnalysisException] {
               df.select("name", "_METADATA.file_NAME").collect()
             },
-            errorClass = "FIELD_NOT_FOUND",
-            parameters = Map("fieldName" -> "`file_NAME`", "fields" -> "`id`, `university`"))
+            condition = "FIELD_NOT_FOUND",
+            parameters = Map("fieldName" -> "`file_NAME`", "fields" -> "`id`, `university`"),
+            context = ExpectedContext(
+              fragment = "select",
+              callSitePattern = getCurrentClassCallSitePattern))
         }
       }
     }
@@ -959,10 +969,12 @@ class FileMetadataStructSuite extends QueryTest with SharedSparkSession {
           .where("_metadata.File_bLoCk_start > 0 and _metadata.file_block_length > 0 " +
             "and _metadata.file_SizE > 0")
           .select("id", METADATA_FILE_BLOCK_START, METADATA_FILE_BLOCK_LENGTH)
-        val fileSourceScan2 = df2.queryExecution.sparkPlan.find(_.isInstanceOf[FileSourceScanExec])
-        assert(fileSourceScan2.isDefined)
-        val files2 = fileSourceScan2.get.asInstanceOf[FileSourceScanExec].selectedPartitions
-        assert(files2.length == 1 && files2.head.files.length == 1)
+        val fileSourceScan2 = df2.queryExecution.sparkPlan.collectFirst {
+          case p: FileSourceScanExec => p
+        }.get
+        // Assert that there's 1 selected partition with 1 file.
+        assert(fileSourceScan2.selectedPartitions.partitionCount == 1)
+        assert(fileSourceScan2.selectedPartitions.totalNumberOfFiles == 1)
         val res2 = df2.collect()
         assert(res2.length == 1)
         assert(res2.head.getLong(0) == 1L) // id
@@ -973,10 +985,12 @@ class FileMetadataStructSuite extends QueryTest with SharedSparkSession {
         val df3 = spark.read.json(path.getCanonicalPath)
           .where("_metadata.File_bLoCk_start > 0 and _metadata.file_SizE > 1000000")
           .select("id", METADATA_FILE_BLOCK_START, METADATA_FILE_BLOCK_LENGTH)
-        val fileSourceScan3 = df3.queryExecution.sparkPlan.find(_.isInstanceOf[FileSourceScanExec])
-        assert(fileSourceScan3.isDefined)
-        val files3 = fileSourceScan3.get.asInstanceOf[FileSourceScanExec].selectedPartitions
-        assert(files3.length == 1 && files3.head.files.isEmpty)
+        val fileSourceScan3 = df3.queryExecution.sparkPlan.collectFirst {
+          case p: FileSourceScanExec => p
+        }.get
+        // Assert that there's 1 selected partition with no files.
+        assert(fileSourceScan3.selectedPartitions.partitionCount == 1)
+        assert(fileSourceScan3.selectedPartitions.totalNumberOfFiles == 0)
         assert(df3.collect().isEmpty)
       }
     }
@@ -1075,7 +1089,8 @@ class FileMetadataStructSuite extends QueryTest with SharedSparkSession {
       // Transform the result into a literal that can be used in an expression.
       val metadataColumnFields = metadataColumnRow.schema.fields
         .map(field => lit(metadataColumnRow.getAs[Any](field.name)).as(field.name))
-      val metadataColumnStruct = struct(metadataColumnFields: _*)
+      import org.apache.spark.util.ArrayImplicits._
+      val metadataColumnStruct = struct(metadataColumnFields.toImmutableArraySeq: _*)
 
       val selectSingleRowDf = spark.read.load(dir.getAbsolutePath)
         .where(col("_metadata").equalTo(lit(metadataColumnStruct)))
@@ -1116,6 +1131,100 @@ class FileMetadataStructSuite extends QueryTest with SharedSparkSession {
         .where(col("renamed_row_index").equalTo(lit(0)))
 
       assert(selectSingleRowDf.count() === 1)
+    }
+  }
+
+  Seq("true", "false").foreach { sideCharPadding =>
+    test(s"SPARK-53625: file metadata in streaming with char type, " +
+      s"sideCharPadding=$sideCharPadding") {
+      withSQLConf(SQLConf.READ_SIDE_CHAR_PADDING.key -> sideCharPadding) {
+        withTempDir { dir =>
+          import scala.jdk.CollectionConverters._
+
+          val metadata = new MetadataBuilder()
+            .putString("__CHAR_VARCHAR_TYPE_STRING", "char(1)")
+            .build()
+          val charSchemaStruct = new StructType()
+            .add(StructField("char_col", StringType, metadata = metadata))
+
+          val data = Seq(Row("A"), Row("B"))
+          val df = spark.createDataFrame(data.asJava, charSchemaStruct)
+          df.coalesce(1).write.format("json")
+            .save(dir.getCanonicalPath + "/source/new-streaming-data")
+
+          val streamDf = spark.readStream.format("json")
+            .schema(charSchemaStruct)
+            .load(dir.getCanonicalPath + "/source/new-streaming-data")
+            .select("*", "_metadata")
+
+          val streamQuery0 = streamDf
+            .writeStream.format("json")
+            .option("checkpointLocation", dir.getCanonicalPath + "/target/checkpoint")
+            .trigger(Trigger.AvailableNow())
+            .start(dir.getCanonicalPath + "/target/new-streaming-data")
+
+          streamQuery0.awaitTermination()
+          assert(streamQuery0.lastProgress.numInputRows == 2L)
+
+          val newDF = spark.read.format("json")
+            .load(dir.getCanonicalPath + "/target/new-streaming-data")
+
+          val sourceFile = new File(dir, "/source/new-streaming-data").listFiles()
+            .filter(_.getName.endsWith(".json")).head
+          val sourceFileMetadata = Map(
+            METADATA_FILE_PATH -> sourceFile.toURI.toString,
+            METADATA_FILE_NAME -> sourceFile.getName,
+            METADATA_FILE_SIZE -> sourceFile.length(),
+            METADATA_FILE_BLOCK_START -> 0,
+            METADATA_FILE_BLOCK_LENGTH -> sourceFile.length(),
+            METADATA_FILE_MODIFICATION_TIME -> new Timestamp(sourceFile.lastModified())
+          )
+
+          // SELECT * will have: char_col, _metadata of /source/new-streaming-data
+          assert(newDF.select("*").columns.toSet == Set("char_col", "_metadata"))
+          // Verify the data is expected
+          checkAnswer(
+            newDF.select(col("char_col"),
+              col(METADATA_FILE_PATH), col(METADATA_FILE_NAME),
+              col(METADATA_FILE_SIZE), col(METADATA_FILE_BLOCK_START),
+              col(METADATA_FILE_BLOCK_LENGTH),
+              // since we are writing _metadata to a json file,
+              // we should explicitly cast the column to timestamp type
+              to_timestamp(col(METADATA_FILE_MODIFICATION_TIME))),
+            Seq(
+              Row(
+                "A",
+                sourceFileMetadata(METADATA_FILE_PATH),
+                sourceFileMetadata(METADATA_FILE_NAME),
+                sourceFileMetadata(METADATA_FILE_SIZE),
+                sourceFileMetadata(METADATA_FILE_BLOCK_START),
+                sourceFileMetadata(METADATA_FILE_BLOCK_LENGTH),
+                sourceFileMetadata(METADATA_FILE_MODIFICATION_TIME)),
+              Row(
+                "B",
+                sourceFileMetadata(METADATA_FILE_PATH),
+                sourceFileMetadata(METADATA_FILE_NAME),
+                sourceFileMetadata(METADATA_FILE_SIZE),
+                sourceFileMetadata(METADATA_FILE_BLOCK_START),
+                sourceFileMetadata(METADATA_FILE_BLOCK_LENGTH),
+                sourceFileMetadata(METADATA_FILE_MODIFICATION_TIME))
+            )
+          )
+
+          checkAnswer(
+            newDF.where(s"$METADATA_FILE_SIZE > 0").select(METADATA_FILE_SIZE),
+            Seq(
+              Row(sourceFileMetadata(METADATA_FILE_SIZE)),
+              Row(sourceFileMetadata(METADATA_FILE_SIZE)))
+          )
+          checkAnswer(
+            newDF.where(s"$METADATA_FILE_SIZE > 0").select(METADATA_FILE_PATH),
+            Seq(
+              Row(sourceFileMetadata(METADATA_FILE_PATH)),
+              Row(sourceFileMetadata(METADATA_FILE_PATH)))
+          )
+        }
+      }
     }
   }
 }

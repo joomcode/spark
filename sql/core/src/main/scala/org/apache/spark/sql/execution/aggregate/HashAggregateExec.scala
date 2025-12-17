@@ -22,6 +22,7 @@ import java.util.concurrent.TimeUnit._
 import scala.collection.mutable
 
 import org.apache.spark.TaskContext
+import org.apache.spark.internal.LogKeys.CONFIG
 import org.apache.spark.memory.SparkOutOfMemoryError
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
@@ -41,6 +42,7 @@ import org.apache.spark.sql.execution.vectorized.MutableColumnarRow
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{CalendarIntervalType, DecimalType, StringType}
 import org.apache.spark.unsafe.KVIterator
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 /**
@@ -58,9 +60,9 @@ case class HashAggregateExec(
     child: SparkPlan)
   extends AggregateCodegenSupport {
 
-  require(Aggregate.supportsHashAggregate(aggregateBufferAttributes))
+  require(Aggregate.supportsHashAggregate(aggregateBufferAttributes, groupingExpressions))
 
-  override lazy val allAttributes: AttributeSeq =
+  override def allAttributes: AttributeSeq =
     child.output ++ aggregateBufferAttributes ++ aggregateAttributes ++
       aggregateExpressions.flatMap(_.aggregateFunction.inputAggBufferAttributes)
 
@@ -409,8 +411,8 @@ case class HashAggregateExec(
   private def enableTwoLevelHashMap(): Unit = {
     if (!checkIfFastHashMapSupported()) {
       if (!Utils.isTesting) {
-        logInfo(s"${SQLConf.ENABLE_TWOLEVEL_AGG_MAP.key} is set to true, but"
-          + " current version of codegened fast hashmap does not support this aggregate.")
+        logInfo(log"${MDC(CONFIG, SQLConf.ENABLE_TWOLEVEL_AGG_MAP.key)} is set to true, but" +
+          log" current version of codegened fast hashmap does not support this aggregate.")
       }
     } else {
       isFastHashMapEnabled = true
@@ -679,7 +681,7 @@ case class HashAggregateExec(
          |    $unsafeRowKeys, $unsafeRowKeyHash);
          |  if ($unsafeRowBuffer == null) {
          |    // failed to allocate the first page
-         |    throw new $oomeClassName("No enough memory for aggregation");
+         |    throw new $oomeClassName("AGGREGATE_OUT_OF_MEMORY", new java.util.HashMap());
          |  }
          |}
        """.stripMargin
@@ -708,7 +710,8 @@ case class HashAggregateExec(
     // Here we set `currentVars(0)` to `currentVars(numBufferSlots)` to null, so that when
     // generating code for buffer columns, we use `INPUT_ROW`(will be the buffer row), while
     // generating input columns, we use `currentVars`.
-    ctx.currentVars = new Array[ExprCode](aggregateBufferAttributes.length) ++ input
+    ctx.currentVars = (new Array[ExprCode](aggregateBufferAttributes.length) ++ input)
+      .toImmutableArraySeq
 
     val aggNames = aggregateExpressions.map(_.aggregateFunction.prettyName)
     // Computes start offsets for each aggregation function code

@@ -65,10 +65,11 @@ class UpdatingSessionsIteratorSuite extends SharedSparkSession {
   // just copying default values to avoid bothering with SQLContext
   val inMemoryThreshold = 4096
   val spillThreshold = Int.MaxValue
+  val spillSizeThreshold = Long.MaxValue
 
   test("no row") {
     val iterator = new UpdatingSessionsIterator(None.iterator, keysWithSessionAttributes,
-      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold)
+      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold, spillSizeThreshold)
 
     assert(!iterator.hasNext)
   }
@@ -77,7 +78,7 @@ class UpdatingSessionsIteratorSuite extends SharedSparkSession {
     val rows = List(createRow("a", 1, 100, 110, 10, 1.1))
 
     val iterator = new UpdatingSessionsIterator(rows.iterator, keysWithSessionAttributes,
-      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold)
+      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold, spillSizeThreshold)
 
     assert(iterator.hasNext)
 
@@ -95,7 +96,7 @@ class UpdatingSessionsIteratorSuite extends SharedSparkSession {
     val rows = List(row1, row2, row3, row4)
 
     val iterator = new UpdatingSessionsIterator(rows.iterator, keysWithSessionAttributes,
-      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold)
+      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold, spillSizeThreshold)
 
     val retRows = rows.indices.map { _ =>
       assert(iterator.hasNext)
@@ -126,7 +127,7 @@ class UpdatingSessionsIteratorSuite extends SharedSparkSession {
     val rowsAll = rows1 ++ rows2
 
     val iterator = new UpdatingSessionsIterator(rowsAll.iterator, keysWithSessionAttributes,
-      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold)
+      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold, spillSizeThreshold)
 
     val retRows1 = rows1.indices.map { _ =>
       assert(iterator.hasNext)
@@ -162,7 +163,7 @@ class UpdatingSessionsIteratorSuite extends SharedSparkSession {
     val rowsAll = rows1 ++ rows2
 
     val iterator = new UpdatingSessionsIterator(rowsAll.iterator, keysWithSessionAttributes,
-      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold)
+      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold, spillSizeThreshold)
 
     val retRows1 = rows1.indices.map { _ =>
       assert(iterator.hasNext)
@@ -207,7 +208,7 @@ class UpdatingSessionsIteratorSuite extends SharedSparkSession {
     val rowsAll = rows1 ++ rows2 ++ rows3 ++ rows4
 
     val iterator = new UpdatingSessionsIterator(rowsAll.iterator, keysWithSessionAttributes,
-      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold)
+      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold, spillSizeThreshold)
 
     val retRows1 = rows1.indices.map { _ =>
       assert(iterator.hasNext)
@@ -260,24 +261,33 @@ class UpdatingSessionsIteratorSuite extends SharedSparkSession {
     val rows = List(row1, row2, row3, row4)
 
     val iterator = new UpdatingSessionsIterator(rows.iterator, keysWithSessionAttributes,
-      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold)
+      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold, spillSizeThreshold)
 
     // UpdatingSessionIterator can't detect error on hasNext
     assert(iterator.hasNext)
 
     // when calling next() it can detect error and throws IllegalStateException
-    intercept[IllegalStateException] {
-      iterator.next()
-    }
+    checkError(
+      exception = intercept[SparkException] {
+        iterator.next()
+      },
+      condition = "INTERNAL_ERROR",
+      parameters = Map("message" -> "The iterator must be sorted by key and session start!"))
 
     // afterwards, calling either hasNext() or next() will throw IllegalStateException
-    intercept[IllegalStateException] {
-      iterator.hasNext
-    }
+    checkError(
+      exception = intercept[SparkException] {
+        iterator.hasNext
+      },
+      condition = "INTERNAL_ERROR",
+      parameters = Map("message" -> "The iterator is already corrupted."))
 
-    intercept[IllegalStateException] {
-      iterator.next()
-    }
+    checkError(
+      exception = intercept[SparkException] {
+        iterator.next()
+      },
+      condition = "INTERNAL_ERROR",
+      parameters = Map("message" -> "The iterator is already corrupted."))
   }
 
   test("throws exception if data is not sorted by key") {
@@ -287,7 +297,7 @@ class UpdatingSessionsIteratorSuite extends SharedSparkSession {
     val rows = List(row1, row2, row3)
 
     val iterator = new UpdatingSessionsIterator(rows.iterator, keysWithSessionAttributes,
-      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold)
+      sessionAttribute, rowAttributes, inMemoryThreshold, spillThreshold, spillSizeThreshold)
 
     // UpdatingSessionIterator can't detect error on hasNext
     assert(iterator.hasNext)
@@ -299,18 +309,27 @@ class UpdatingSessionsIteratorSuite extends SharedSparkSession {
     // second row itself is OK but while finding end of session it reads third row, and finds
     // its key is already finished processing, hence precondition for sorting is broken, and
     // it throws IllegalStateException
-    intercept[IllegalStateException] {
-      iterator.next()
-    }
+    checkError(
+      exception = intercept[SparkException] {
+        iterator.next()
+      },
+      condition = "INTERNAL_ERROR",
+      parameters = Map("message" -> "The iterator must be sorted by key and session start!"))
 
     // afterwards, calling either hasNext() or next() will throw IllegalStateException
-    intercept[IllegalStateException] {
-      iterator.hasNext
-    }
+    checkError(
+      exception = intercept[SparkException] {
+        iterator.hasNext
+      },
+      condition = "INTERNAL_ERROR",
+      parameters = Map("message" -> "The iterator is already corrupted."))
 
-    intercept[IllegalStateException] {
-      iterator.next()
-    }
+    checkError(
+      exception = intercept[SparkException] {
+        iterator.next()
+      },
+      condition = "INTERNAL_ERROR",
+      parameters = Map("message" -> "The iterator is already corrupted."))
   }
 
   test("no key") {
@@ -321,7 +340,8 @@ class UpdatingSessionsIteratorSuite extends SharedSparkSession {
     val rows = List(row1, row2, row3, row4)
 
     val iterator = new UpdatingSessionsIterator(rows.iterator, Seq(noKeySessionAttribute),
-      noKeySessionAttribute, noKeyRowAttributes, inMemoryThreshold, spillThreshold)
+      noKeySessionAttribute, noKeyRowAttributes, inMemoryThreshold, spillThreshold,
+      spillSizeThreshold)
 
     val retRows = rows.indices.map { _ =>
       assert(iterator.hasNext)

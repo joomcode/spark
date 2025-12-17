@@ -17,13 +17,17 @@
 
 package org.apache.spark.sql.catalyst.expressions.aggregate
 
+import org.apache.datasketches.common.SketchesArgumentException
 import org.apache.datasketches.hll.{HllSketch, TgtHllType, Union}
 import org.apache.datasketches.memory.Memory
 
+import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{ExpectsInputTypes, Expression, ExpressionDescription, Literal}
 import org.apache.spark.sql.catalyst.trees.BinaryLike
+import org.apache.spark.sql.catalyst.util.CollationFactory
 import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.internal.types.StringTypeWithCollation
 import org.apache.spark.sql.types.{AbstractDataType, BinaryType, BooleanType, DataType, IntegerType, LongType, StringType, TypeCollection}
 import org.apache.spark.unsafe.types.UTF8String
 
@@ -62,6 +66,9 @@ case class HllSketchAgg(
   // Hllsketch config - mark as lazy so that they're not evaluated during tree transformation.
 
   lazy val lgConfigK: Int = {
+    if (!right.foldable) {
+      throw QueryExecutionErrors.hllKMustBeConstantError(prettyName)
+    }
     val lgConfigK = right.eval().asInstanceOf[Int]
     HllSketchAgg.checkLgK(lgConfigK)
     lgConfigK
@@ -101,7 +108,13 @@ case class HllSketchAgg(
   override def prettyName: String = "hll_sketch_agg"
 
   override def inputTypes: Seq[AbstractDataType] =
-    Seq(TypeCollection(IntegerType, LongType, StringType, BinaryType), IntegerType)
+    Seq(
+      TypeCollection(
+        IntegerType,
+        LongType,
+        StringTypeWithCollation(supportsTrimCollation = true),
+        BinaryType),
+      IntegerType)
 
   override def dataType: DataType = BinaryType
 
@@ -120,6 +133,10 @@ case class HllSketchAgg(
    * Evaluate the input row and update the HllSketch instance with the row's value. The update
    * function only supports a subset of Spark SQL types, and an exception will be thrown for
    * unsupported types.
+   * Notes:
+   *   - Null values are ignored.
+   *   - Empty byte arrays are ignored.
+   *   - Strings that are collation-equal to the empty string are ignored.
    *
    * @param sketch The HllSketch instance.
    * @param input  an input row
@@ -135,10 +152,16 @@ case class HllSketchAgg(
         // TODO: implement support for decimal/datetime/interval types
         case IntegerType => sketch.update(v.asInstanceOf[Int])
         case LongType => sketch.update(v.asInstanceOf[Long])
-        case StringType => sketch.update(v.asInstanceOf[UTF8String].toString)
+        case st: StringType =>
+          val collation = CollationFactory.fetchCollation(st.collationId)
+          val str = v.asInstanceOf[UTF8String]
+          if (!collation.equalsFunction(str, UTF8String.EMPTY_UTF8)) {
+            sketch.update(collation.sortKeyFunction.apply(str))
+          }
         case BinaryType => sketch.update(v.asInstanceOf[Array[Byte]])
-        case dataType => throw new UnsupportedOperationException(
-          s"A HllSketch instance cannot be updates with a Spark ${dataType.toString} type")
+        case dataType => throw new SparkUnsupportedOperationException(
+          errorClass = "_LEGACY_ERROR_TEMP_3121",
+          messageParameters = Map("dataType" -> dataType.toString))
       }
     }
     sketch
@@ -193,7 +216,7 @@ object HllSketchAgg {
   def checkLgK(lgConfigK: Int): Unit = {
     if (lgConfigK < minLgConfigK || lgConfigK > maxLgConfigK) {
       throw QueryExecutionErrors.hllInvalidLgK(function = "hll_sketch_agg",
-        min = minLgConfigK, max = maxLgConfigK, value = lgConfigK.toString)
+        min = minLgConfigK, max = maxLgConfigK, value = lgConfigK)
     }
   }
 }
@@ -315,7 +338,7 @@ case class HllUnionAgg(
             union.update(sketch)
             Some(union)
           } catch {
-            case _: java.lang.Error =>
+            case _: SketchesArgumentException | _: java.lang.Error =>
               throw QueryExecutionErrors.hllInvalidInputSketchBuffer(prettyName)
           }
         case _ =>

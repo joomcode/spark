@@ -27,7 +27,6 @@ from pyspark.pandas.typedef.typehints import (
     extension_float_dtypes_available,
     extension_object_dtypes_available,
 )
-from pyspark.testing.pandasutils import ComparisonTestBase
 
 if extension_dtypes_available:
     from pandas import Int8Dtype, Int16Dtype, Int32Dtype, Int64Dtype
@@ -39,8 +38,14 @@ if extension_object_dtypes_available:
     from pandas import BooleanDtype, StringDtype
 
 
-class OpsTestBase(ComparisonTestBase):
+class OpsTestBase:
     """The test base for arithmetic operations of different data types."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Some nanosecond->microsecond conversions throw loss of precision errors
+        cls.spark.conf.set("spark.sql.execution.pandas.convertToArrowArraySafely", "false")
 
     @property
     def numeric_pdf(self):
@@ -100,6 +105,10 @@ class OpsTestBase(ComparisonTestBase):
     @property
     def pdf(self):
         return pd.concat([self.numeric_pdf, self.non_numeric_pdf], axis=1)
+
+    @property
+    def psdf(self):
+        return ps.from_pandas(self.pdf)
 
     @property
     def df_cols(self):

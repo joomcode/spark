@@ -30,8 +30,9 @@ import org.apache.spark.sql.catalyst.expressions.objects.AssertNotNull
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.connector.catalog.{CatalogManager, CatalogNotFoundException, CatalogV2Util, Column, ColumnDefaultValue, Identifier, SupportsRowLevelOperations, TableCapability, TableCatalog}
+import org.apache.spark.sql.connector.catalog.{CatalogManager, CatalogV2Util, Column, ColumnDefaultValue, Identifier, SupportsRowLevelOperations, TableCapability, TableCatalog, TableWritePrivilege}
 import org.apache.spark.sql.connector.expressions.{LiteralValue, Transform}
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.datasources.v2.V2SessionCatalog
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{BooleanType, IntegerType, StructType}
@@ -160,6 +161,8 @@ abstract class AlignAssignmentsSuiteBase extends AnalysisTest {
         case name => throw new NoSuchTableException(Seq(name))
       }
     })
+    when(newCatalog.loadTable(any(), any[java.util.Set[TableWritePrivilege]]()))
+      .thenCallRealMethod()
     when(newCatalog.name()).thenReturn("cat")
     newCatalog
   }
@@ -177,7 +180,7 @@ abstract class AlignAssignmentsSuiteBase extends AnalysisTest {
       invocation.getArguments()(0).asInstanceOf[String] match {
         case "testcat" => v2Catalog
         case CatalogManager.SESSION_CATALOG_NAME => v2SessionCatalog
-        case name => throw new CatalogNotFoundException(s"No such catalog: $name")
+        case name => throw QueryExecutionErrors.catalogNotFoundError(name)
       }
     })
     when(manager.currentCatalog).thenReturn(v2Catalog)
@@ -191,7 +194,7 @@ abstract class AlignAssignmentsSuiteBase extends AnalysisTest {
   protected def parseAndResolve(query: String): LogicalPlan = {
     val analyzer = new CustomAnalyzer(catalogManager) {
       override val extendedResolutionRules: Seq[Rule[LogicalPlan]] = Seq(
-        new ResolveSessionCatalog(catalogManager))
+        new ResolveSessionCatalog(this.catalogManager))
     }
     val analyzed = analyzer.execute(CatalystSqlParser.parsePlan(query))
     analyzer.checkAnalysis(analyzed)
@@ -213,6 +216,13 @@ abstract class AlignAssignmentsSuiteBase extends AnalysisTest {
         Batch(batch.name, batch.strategy, filteredRules: _*)
       }
     }
+  }
+
+  protected def assertNoNullCheckExists(plan: LogicalPlan): Unit = {
+    val asserts = plan.expressions.flatMap(e => e.collect {
+      case assert: AssertNotNull => assert
+    })
+    assert(asserts.isEmpty, s"Must not have NOT NULL checks")
   }
 
   protected def assertNullCheckExists(plan: LogicalPlan, colPath: Seq[String]): Unit = {

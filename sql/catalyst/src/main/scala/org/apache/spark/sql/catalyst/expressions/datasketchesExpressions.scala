@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
+import org.apache.datasketches.common.SketchesArgumentException
 import org.apache.datasketches.hll.{HllSketch, TgtHllType, Union}
 import org.apache.datasketches.memory.Memory
 
@@ -38,8 +39,8 @@ import org.apache.spark.sql.types.{AbstractDataType, BinaryType, BooleanType, Da
 case class HllSketchEstimate(child: Expression)
   extends UnaryExpression
     with CodegenFallback
-    with ExpectsInputTypes
-    with NullIntolerant {
+    with ExpectsInputTypes {
+  override def nullIntolerant: Boolean = true
 
   override protected def withNewChildInternal(newChild: Expression): HllSketchEstimate =
     copy(child = newChild)
@@ -55,7 +56,7 @@ case class HllSketchEstimate(child: Expression)
     try {
       Math.round(HllSketch.heapify(Memory.wrap(buffer)).getEstimate)
     } catch {
-      case _: java.lang.Error =>
+      case _: SketchesArgumentException | _: java.lang.Error =>
         throw QueryExecutionErrors.hllInvalidInputSketchBuffer(prettyName)
     }
   }
@@ -79,8 +80,8 @@ case class HllSketchEstimate(child: Expression)
 case class HllUnion(first: Expression, second: Expression, third: Expression)
   extends TernaryExpression
     with CodegenFallback
-    with ExpectsInputTypes
-    with NullIntolerant {
+    with ExpectsInputTypes {
+  override def nullIntolerant: Boolean = true
 
   // The default target type (register size) to use.
   private val targetType = TgtHllType.HLL_8
@@ -107,13 +108,13 @@ case class HllUnion(first: Expression, second: Expression, third: Expression)
     val sketch1 = try {
       HllSketch.heapify(Memory.wrap(value1.asInstanceOf[Array[Byte]]))
     } catch {
-      case _: java.lang.Error =>
+      case _: SketchesArgumentException | _: java.lang.Error =>
         throw QueryExecutionErrors.hllInvalidInputSketchBuffer(prettyName)
     }
     val sketch2 = try {
       HllSketch.heapify(Memory.wrap(value2.asInstanceOf[Array[Byte]]))
     } catch {
-      case _: java.lang.Error =>
+      case _: SketchesArgumentException | _: java.lang.Error =>
         throw QueryExecutionErrors.hllInvalidInputSketchBuffer(prettyName)
     }
     val allowDifferentLgConfigK = value3.asInstanceOf[Boolean]

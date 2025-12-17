@@ -31,6 +31,7 @@ import pandas as pd
 from pandas.api.types import CategoricalDtype, pandas_dtype  # type: ignore[attr-defined]
 from pandas.api.extensions import ExtensionDtype
 
+
 extension_dtypes: Tuple[type, ...]
 try:
     from pandas import Int8Dtype, Int16Dtype, Int32Dtype, Int64Dtype
@@ -147,19 +148,19 @@ def as_spark_type(
     - dictionaries of field_name -> type
     - Python3's typing system
     """
-    # For NumPy typing, NumPy version should be 1.21+ and Python version should be 3.8+
-    if sys.version_info >= (3, 8):
+    from pyspark.loose_version import LooseVersion
+
+    # For NumPy typing, NumPy version should be 1.21+
+    if LooseVersion(np.__version__) >= LooseVersion("1.21"):
         if (
             hasattr(tpe, "__origin__")
-            and tpe.__origin__ is np.ndarray  # type: ignore[union-attr]
+            and tpe.__origin__ is np.ndarray
             and hasattr(tpe, "__args__")
-            and len(tpe.__args__) > 1  # type: ignore[union-attr]
+            and len(tpe.__args__) > 1
         ):
             # numpy.typing.NDArray
             return types.ArrayType(
-                as_spark_type(
-                    tpe.__args__[1].__args__[0], raise_error=raise_error  # type: ignore[union-attr]
-                )
+                as_spark_type(tpe.__args__[1].__args__[0], raise_error=raise_error)
             )
 
     if isinstance(tpe, np.dtype) and tpe == np.dtype("object"):
@@ -167,9 +168,7 @@ def as_spark_type(
     # ArrayType
     elif tpe in (np.ndarray,):
         return types.ArrayType(types.StringType())
-    elif hasattr(tpe, "__origin__") and issubclass(
-        tpe.__origin__, list  # type: ignore[union-attr]
-    ):
+    elif hasattr(tpe, "__origin__") and issubclass(tpe.__origin__, list):
         element_type = as_spark_type(
             tpe.__args__[0], raise_error=raise_error  # type: ignore[union-attr]
         )
@@ -177,7 +176,7 @@ def as_spark_type(
             return None
         return types.ArrayType(element_type)
     # BinaryType
-    elif tpe in (bytes, np.character, np.bytes_, np.string_):
+    elif tpe in (bytes, np.character, np.bytes_):
         return types.BinaryType()
     # BooleanType
     elif tpe in (bool, np.bool_, "bool", "?"):
@@ -191,7 +190,7 @@ def as_spark_type(
     elif tpe in (decimal.Decimal,):
         # TODO: considering the precision & scale for decimal type.
         return types.DecimalType(38, 18)
-    elif tpe in (float, np.float_, np.float64, "float", "float64", "double"):
+    elif tpe in (float, np.double, np.float64, "float", "float64", "double"):
         return types.DoubleType()
     elif tpe in (np.float32, "float32", "f"):
         return types.FloatType()
@@ -202,7 +201,7 @@ def as_spark_type(
     elif tpe in (np.int16, "int16", "short"):
         return types.ShortType()
     # StringType
-    elif tpe in (str, np.unicode_, "str", "U"):
+    elif tpe in (str, np.str_, "str", "U"):
         return types.StringType()
     # TimestampType or TimestampNTZType if timezone is not specified.
     elif tpe in (datetime.datetime, np.datetime64, "datetime64[ns]", "M", pd.Timestamp):
@@ -297,7 +296,15 @@ def spark_type_to_pandas_dtype(
     elif isinstance(spark_type, (types.TimestampType, types.TimestampNTZType)):
         return np.dtype("datetime64[ns]")
     else:
-        return np.dtype(to_arrow_type(spark_type).to_pandas_dtype())
+        from pyspark.pandas.utils import default_session
+
+        prefers_large_var_types = (
+            default_session()
+            .conf.get("spark.sql.execution.arrow.useLargeVarTypes", "false")
+            .lower()
+            == "true"
+        )
+        return np.dtype(to_arrow_type(spark_type, prefers_large_var_types).to_pandas_dtype())
 
 
 def pandas_on_spark_type(tpe: Union[str, type, Dtype]) -> Tuple[Dtype, types.DataType]:
@@ -355,8 +362,9 @@ def infer_pd_series_spark_type(
     if dtype == np.dtype("object"):
         if len(pser) == 0 or pser.isnull().all():
             return types.NullType()
-        elif hasattr(pser.iloc[0], "__UDT__"):
-            return pser.iloc[0].__UDT__
+        notnull = pser[pser.notnull()]
+        if hasattr(notnull.iloc[0], "__UDT__"):
+            return notnull.iloc[0].__UDT__
         else:
             return from_arrow_type(pa.Array.from_pandas(pser).type, prefer_timestamp_ntz)
     elif isinstance(dtype, CategoricalDtype):
@@ -780,7 +788,7 @@ def _new_type_holders(
 ) -> Tuple:
     if isinstance(params, zip):
         #   DataFrame[zip(names, types)]
-        params = tuple(slice(name, tpe) for name, tpe in params)  # type: ignore[misc, has-type]
+        params = tuple(slice(name, tpe) for name, tpe in params)
 
     if isinstance(params, Iterable):
         #   DataFrame[type, type, ...]
@@ -796,9 +804,21 @@ def _new_type_holders(
         isinstance(param, slice) and param.step is None and param.stop is not None
         for param in params
     )
-    is_unnamed_params = all(
-        not isinstance(param, slice) and not isinstance(param, Iterable) for param in params
-    )
+    if sys.version_info < (3, 11):
+        is_unnamed_params = all(
+            not isinstance(param, slice) and not isinstance(param, Iterable) for param in params
+        )
+    else:
+        # PEP 646 changes `GenericAlias` instances into iterable ones at Python 3.11
+        is_unnamed_params = all(
+            not isinstance(param, slice)
+            and (
+                not isinstance(param, Iterable)
+                or isinstance(param, typing.GenericAlias)  # type: ignore[attr-defined]
+                or isinstance(param, typing._GenericAlias)  # type: ignore[attr-defined]
+            )
+            for param in params
+        )
 
     if is_named_params:
         # DataFrame["id": int, "A": int]

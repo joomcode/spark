@@ -29,7 +29,7 @@ Examples
 --------
 The serializer is chosen when creating :class:`SparkContext`:
 
->>> from pyspark.context import SparkContext
+>>> from pyspark.core.context import SparkContext
 >>> from pyspark.serializers import MarshalSerializer
 >>> sc = SparkContext('local', 'test', serializer=MarshalSerializer())
 >>> sc.parallelize(list(range(1000))).map(lambda x: 2 * x).take(10)
@@ -67,7 +67,6 @@ import pickle
 pickle_protocol = pickle.HIGHEST_PROTOCOL
 
 from pyspark import cloudpickle
-from pyspark.util import print_exec
 
 
 __all__ = [
@@ -204,22 +203,10 @@ class BatchedSerializer(Serializer):
     def _batched(self, iterator):
         if self.batchSize == self.UNLIMITED_BATCH_SIZE:
             yield list(iterator)
-        elif hasattr(iterator, "__len__") and hasattr(iterator, "__getslice__"):
-            n = len(iterator)
-            for i in range(0, n, self.batchSize):
-                yield iterator[i : i + self.batchSize]
         else:
-            items = []
-            count = 0
-            for item in iterator:
-                items.append(item)
-                count += 1
-                if count == self.batchSize:
-                    yield items
-                    items = []
-                    count = 0
-            if items:
-                yield items
+            it = iter(iterator)
+            while batch := list(itertools.islice(it, self.batchSize)):
+                yield batch
 
     def dump_stream(self, iterator, stream):
         self.serializer.dump_stream(self._batched(iterator), stream)
@@ -455,6 +442,8 @@ class PickleSerializer(FramedSerializer):
 
 class CloudPickleSerializer(FramedSerializer):
     def dumps(self, obj):
+        from pyspark.util import print_exec
+
         try:
             return cloudpickle.dumps(obj, pickle_protocol)
         except pickle.PickleError:

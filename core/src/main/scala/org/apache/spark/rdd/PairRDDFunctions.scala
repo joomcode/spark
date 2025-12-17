@@ -36,11 +36,13 @@ import org.apache.spark._
 import org.apache.spark.Partitioner.defaultPartitioner
 import org.apache.spark.errors.SparkCoreErrors
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config.SPECULATION_ENABLED
 import org.apache.spark.internal.io._
 import org.apache.spark.partial.{BoundedDouble, PartialResult}
 import org.apache.spark.serializer.Serializer
 import org.apache.spark.util.{SerializableConfiguration, SerializableJobConf, Utils}
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.collection.CompactBuffer
 import org.apache.spark.util.random.StratifiedSamplingUtils
 
@@ -937,10 +939,10 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
           }
           buf.toSeq
         } : Seq[V]
-        val res = self.context.runJob(self, process, Array(index))
+        val res = self.context.runJob(self, process, Array(index).toImmutableArraySeq)
         res(0)
       case None =>
-        self.filter(_._1 == key).map(_._2).collect()
+        self.filter(_._1 == key).map(_._2).collect().toImmutableArraySeq
     }
   }
 
@@ -1050,10 +1052,11 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
     val outputCommitterClass = hadoopConf.get("mapred.output.committer.class", "")
     if (speculationEnabled && outputCommitterClass.contains("Direct")) {
       val warningMessage =
-        s"$outputCommitterClass may be an output committer that writes data directly to " +
-          "the final location. Because speculation is enabled, this output committer may " +
-          "cause data loss (see the case in SPARK-10063). If possible, please use an output " +
-          "committer that does not have this behavior (e.g. FileOutputCommitter)."
+        log"${MDC(CLASS_NAME, outputCommitterClass)} " +
+          log"may be an output committer that writes data directly to " +
+          log"the final location. Because speculation is enabled, this output committer may " +
+          log"cause data loss (see the case in SPARK-10063). If possible, please use an output " +
+          log"committer that does not have this behavior (e.g. FileOutputCommitter)."
       logWarning(warningMessage)
     }
 

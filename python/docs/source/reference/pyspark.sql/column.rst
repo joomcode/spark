@@ -46,15 +46,19 @@ Column
     Column.getField
     Column.getItem
     Column.ilike
+    Column.isNaN
     Column.isNotNull
     Column.isNull
     Column.isin
     Column.like
     Column.name
     Column.otherwise
+    Column.outer
     Column.over
     Column.rlike
     Column.startswith
     Column.substr
+    Column.transform
+    Column.try_cast
     Column.when
     Column.withField

@@ -17,9 +17,9 @@
 
 package org.apache.spark.deploy.master.ui
 
-import javax.servlet.http.HttpServletRequest
-
 import scala.xml.Node
+
+import jakarta.servlet.http.HttpServletRequest
 
 import org.apache.spark.deploy.DeployMessages.{MasterStateResponse, RequestMasterState}
 import org.apache.spark.deploy.ExecutorState
@@ -94,9 +94,18 @@ private[ui] class ApplicationPage(parent: MasterWebUI) extends WebUIPage("app") 
             <li><strong>State:</strong> {app.state}</li>
             {
               if (!app.isFinished) {
+                if (app.desc.appUiUrl.isBlank()) {
+                  <li><strong>Application UI:</strong> Disabled</li>
+                } else {
+                  <li><strong>
+                      <a href={UIUtils.makeHref(parent.master.reverseProxy,
+                        app.id, app.desc.appUiUrl)}>Application Detail UI</a>
+                  </strong></li>
+                }
+              } else if (parent.master.historyServerUrl.nonEmpty) {
                 <li><strong>
-                    <a href={UIUtils.makeHref(parent.master.reverseProxy,
-                      app.id, app.desc.appUiUrl)}>Application Detail UI</a>
+                    <a href={s"${parent.master.historyServerUrl.get}/history/${app.id}"}>
+                      Application History UI</a>
                 </strong></li>
               }
             }

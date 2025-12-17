@@ -26,12 +26,11 @@ import scala.util.control.NonFatal
 import org.apache.kafka.clients.consumer.{Consumer, ConsumerConfig, OffsetAndTimestamp}
 import org.apache.kafka.common.TopicPartition
 
-import org.apache.spark.SparkEnv
-import org.apache.spark.internal.Logging
-import org.apache.spark.scheduler.ExecutorCacheTaskLocation
+import org.apache.spark.internal.LogKeys.{NUM_RETRY, OFFSETS}
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.kafka010.KafkaSourceProvider.StrategyOnNoMatchStartingOffset
 import org.apache.spark.util.{UninterruptibleThread, UninterruptibleThreadRunner}
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * This class uses Kafka's own [[org.apache.kafka.clients.consumer.KafkaConsumer]] API to
@@ -50,7 +49,7 @@ private[kafka010] class KafkaOffsetReaderConsumer(
     consumerStrategy: ConsumerStrategy,
     override val driverKafkaParams: ju.Map[String, Object],
     readerOptions: CaseInsensitiveMap[String],
-    driverGroupIdPrefix: String) extends KafkaOffsetReader with Logging {
+    driverGroupIdPrefix: String) extends KafkaOffsetReaderBase {
 
   /**
    * [[UninterruptibleThreadRunner]] ensures that all
@@ -96,8 +95,11 @@ private[kafka010] class KafkaOffsetReaderConsumer(
    */
   private val minPartitions =
     readerOptions.get(KafkaSourceProvider.MIN_PARTITIONS_OPTION_KEY).map(_.toInt)
+  private val maxRecordsPerPartition =
+    readerOptions.get(KafkaSourceProvider.MAX_RECORDS_PER_PARTITION_OPTION_KEY).map(_.toLong)
 
-  private val rangeCalculator = new KafkaOffsetRangeCalculator(minPartitions)
+  override protected val rangeCalculator =
+    new KafkaOffsetRangeCalculator(minPartitions, maxRecordsPerPartition)
 
   private[kafka010] val offsetFetchAttemptIntervalMs =
     readerOptions.getOrElse(KafkaSourceProvider.FETCH_OFFSET_RETRY_INTERVAL_MS, "1000").toLong
@@ -105,8 +107,9 @@ private[kafka010] class KafkaOffsetReaderConsumer(
   /**
    * Whether we should divide Kafka TopicPartitions with a lot of data into smaller Spark tasks.
    */
-  private def shouldDivvyUpLargePartitions(numTopicPartitions: Int): Boolean = {
-    minPartitions.map(_ > numTopicPartitions).getOrElse(false)
+  private def shouldDivvyUpLargePartitions(offsetRanges: Seq[KafkaOffsetRange]): Boolean = {
+    minPartitions.map(_ > offsetRanges.size).getOrElse(false) ||
+    offsetRanges.exists(_.size > maxRecordsPerPartition.getOrElse(Long.MaxValue))
   }
 
   private def nextGroupId(): String = {
@@ -140,10 +143,9 @@ private[kafka010] class KafkaOffsetReaderConsumer(
       isStartingOffsets: Boolean): Map[TopicPartition, Long] = {
     def validateTopicPartitions(partitions: Set[TopicPartition],
       partitionOffsets: Map[TopicPartition, Long]): Map[TopicPartition, Long] = {
-      assert(partitions == partitionOffsets.keySet,
-        "If startingOffsets contains specific offsets, you must specify all TopicPartitions.\n" +
-          "Use -1 for latest, -2 for earliest.\n" +
-          s"Specified: ${partitionOffsets.keySet} Assigned: ${partitions}")
+      if (partitions != partitionOffsets.keySet) {
+        throw KafkaExceptions.startOffsetDoesNotMatchAssigned(partitionOffsets.keySet, partitions)
+      }
       logDebug(s"Partitions assigned to consumer: $partitions. Seeking to $partitionOffsets")
       partitionOffsets
     }
@@ -169,7 +171,7 @@ private[kafka010] class KafkaOffsetReaderConsumer(
 
   override def fetchSpecificOffsets(
       partitionOffsets: Map[TopicPartition, Long],
-      reportDataLoss: String => Unit): KafkaSourceOffset = {
+      reportDataLoss: (String, () => Throwable) => Unit): KafkaSourceOffset = {
     val fnAssertParametersWithPartitions: ju.Set[TopicPartition] => Unit = { partitions =>
       assert(partitions.asScala == partitionOffsets.keySet,
         "If startingOffsets contains specific offsets, you must specify all TopicPartitions.\n" +
@@ -188,7 +190,9 @@ private[kafka010] class KafkaOffsetReaderConsumer(
           off != KafkaOffsetRangeLimit.EARLIEST =>
           if (fetched(tp) != off) {
             reportDataLoss(
-              s"startingOffsets for $tp was $off but consumer reset to ${fetched(tp)}")
+              s"startingOffsets for $tp was $off but consumer reset to ${fetched(tp)}",
+              () =>
+                KafkaExceptions.startOffsetReset(tp, off, fetched(tp)))
           }
         case _ =>
         // no real way to check that beginning or end is reasonable
@@ -206,9 +210,12 @@ private[kafka010] class KafkaOffsetReaderConsumer(
     : KafkaSourceOffset = {
 
     val fnAssertParametersWithPartitions: ju.Set[TopicPartition] => Unit = { partitions =>
-      assert(partitions.asScala == partitionTimestamps.keySet,
-        "If starting/endingOffsetsByTimestamp contains specific offsets, you must specify all " +
-          s"topics. Specified: ${partitionTimestamps.keySet} Assigned: ${partitions.asScala}")
+      val specifiedPartitions = partitionTimestamps.keySet
+      val assignedPartitions = partitions.asScala.toSet
+      if (specifiedPartitions != assignedPartitions) {
+        throw KafkaExceptions.timestampOffsetDoesNotMatchAssigned(
+          isStartingOffsets, specifiedPartitions, assignedPartitions)
+      }
       logDebug(s"Partitions assigned to consumer: $partitions. Seeking to $partitionTimestamps")
     }
 
@@ -382,8 +389,8 @@ private[kafka010] class KafkaOffsetReaderConsumer(
 
           incorrectOffsets = findIncorrectOffsets()
           if (incorrectOffsets.nonEmpty) {
-            logWarning("Found incorrect offsets in some partitions " +
-              s"(partition, previous offset, fetched offset): $incorrectOffsets")
+            logWarning(log"Found incorrect offsets in some partitions " +
+              log"(partition, previous offset, fetched offset): ${MDC(OFFSETS, incorrectOffsets)}")
             if (attempt < maxOffsetFetchAttempts) {
               logWarning("Retrying to fetch latest offsets because of incorrect offsets")
               Thread.sleep(offsetFetchAttemptIntervalMs)
@@ -440,18 +447,28 @@ private[kafka010] class KafkaOffsetReaderConsumer(
         // fromPartitionOffsets
         throw new IllegalStateException(s"$tp doesn't have a from offset"))
       val untilOffset = untilPartitionOffsets(tp)
+
+      KafkaSourceProvider.checkStartOffsetNotGreaterThanEndOffset(
+        fromOffset,
+        untilOffset,
+        tp,
+        KafkaExceptions.resolvedStartOffsetGreaterThanEndOffset
+      )
+
       KafkaOffsetRange(tp, fromOffset, untilOffset, None)
     }.toSeq
 
-    if (shouldDivvyUpLargePartitions(offsetRangesBase.size)) {
+    if (shouldDivvyUpLargePartitions(offsetRangesBase)) {
       val fromOffsetsMap =
         offsetRangesBase.map(range => (range.topicPartition, range.fromOffset)).toMap
       val untilOffsetsMap =
         offsetRangesBase.map(range => (range.topicPartition, range.untilOffset)).toMap
 
       // No need to report data loss here
-      val resolvedFromOffsets = fetchSpecificOffsets(fromOffsetsMap, _ => ()).partitionToOffsets
-      val resolvedUntilOffsets = fetchSpecificOffsets(untilOffsetsMap, _ => ()).partitionToOffsets
+      val resolvedFromOffsets =
+        fetchSpecificOffsets(fromOffsetsMap, (_, _) => ()).partitionToOffsets
+      val resolvedUntilOffsets =
+        fetchSpecificOffsets(untilOffsetsMap, (_, _) => ()).partitionToOffsets
       val ranges = offsetRangesBase.map(_.topicPartition).map { tp =>
         KafkaOffsetRange(tp, resolvedFromOffsets(tp), resolvedUntilOffsets(tp), preferredLoc = None)
       }
@@ -465,77 +482,10 @@ private[kafka010] class KafkaOffsetReaderConsumer(
           val end = splitOffsetRanges.last.copy(untilOffset = untilOffsetsMap(tp))
           Seq(first) ++ splitOffsetRanges.drop(1).dropRight(1) :+ end
         }
-      }.toArray.toSeq
+      }.toArray.toImmutableArraySeq
     } else {
       offsetRangesBase
     }
-  }
-
-  private def getSortedExecutorList(): Array[String] = {
-    def compare(a: ExecutorCacheTaskLocation, b: ExecutorCacheTaskLocation): Boolean = {
-      if (a.host == b.host) {
-        a.executorId > b.executorId
-      } else {
-        a.host > b.host
-      }
-    }
-
-    val bm = SparkEnv.get.blockManager
-    bm.master.getPeers(bm.blockManagerId).toArray
-      .map(x => ExecutorCacheTaskLocation(x.host, x.executorId))
-      .sortWith(compare)
-      .map(_.toString)
-  }
-
-  override def getOffsetRangesFromResolvedOffsets(
-      fromPartitionOffsets: PartitionOffsetMap,
-      untilPartitionOffsets: PartitionOffsetMap,
-      reportDataLoss: String => Unit): Seq[KafkaOffsetRange] = {
-    // Find the new partitions, and get their earliest offsets
-    val newPartitions = untilPartitionOffsets.keySet.diff(fromPartitionOffsets.keySet)
-    val newPartitionInitialOffsets = fetchEarliestOffsets(newPartitions.toSeq)
-    if (newPartitionInitialOffsets.keySet != newPartitions) {
-      // We cannot get from offsets for some partitions. It means they got deleted.
-      val deletedPartitions = newPartitions.diff(newPartitionInitialOffsets.keySet)
-      reportDataLoss(
-        s"Cannot find earliest offsets of ${deletedPartitions}. Some data may have been missed")
-    }
-    logInfo(s"Partitions added: $newPartitionInitialOffsets")
-    newPartitionInitialOffsets.filter(_._2 != 0).foreach { case (p, o) =>
-      reportDataLoss(
-        s"Added partition $p starts from $o instead of 0. Some data may have been missed")
-    }
-
-    val deletedPartitions = fromPartitionOffsets.keySet.diff(untilPartitionOffsets.keySet)
-    if (deletedPartitions.nonEmpty) {
-      val message = if (driverKafkaParams.containsKey(ConsumerConfig.GROUP_ID_CONFIG)) {
-        s"$deletedPartitions are gone. ${KafkaSourceProvider.CUSTOM_GROUP_ID_ERROR_MESSAGE}"
-      } else {
-        s"$deletedPartitions are gone. Some data may have been missed."
-      }
-      reportDataLoss(message)
-    }
-
-    // Use the until partitions to calculate offset ranges to ignore partitions that have
-    // been deleted
-    val topicPartitions = untilPartitionOffsets.keySet.filter { tp =>
-      // Ignore partitions that we don't know the from offsets.
-      newPartitionInitialOffsets.contains(tp) || fromPartitionOffsets.contains(tp)
-    }.toSeq
-    logDebug("TopicPartitions: " + topicPartitions.mkString(", "))
-
-    val fromOffsets = fromPartitionOffsets ++ newPartitionInitialOffsets
-    val untilOffsets = untilPartitionOffsets
-    val ranges = topicPartitions.map { tp =>
-      val fromOffset = fromOffsets(tp)
-      val untilOffset = untilOffsets(tp)
-      if (untilOffset < fromOffset) {
-        reportDataLoss(s"Partition $tp's offset was changed from " +
-          s"$fromOffset to $untilOffset, some data may have been missed")
-      }
-      KafkaOffsetRange(tp, fromOffset, untilOffset, preferredLoc = None)
-    }
-    rangeCalculator.getRanges(ranges, getSortedExecutorList())
   }
 
   private def partitionsAssignedToConsumer(
@@ -594,7 +544,8 @@ private[kafka010] class KafkaOffsetReaderConsumer(
               } catch {
                 case NonFatal(e) =>
                   lastException = e
-                  logWarning(s"Error in attempt $attempt getting Kafka offsets: ", e)
+                  logWarning(
+                    log"Error in attempt ${MDC(NUM_RETRY, attempt)} getting Kafka offsets: ", e)
                   attempt += 1
                   Thread.sleep(offsetFetchAttemptIntervalMs)
                   resetConsumer()

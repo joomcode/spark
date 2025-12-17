@@ -20,6 +20,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.security.KeyStoreException;
@@ -41,21 +42,18 @@ import javax.net.ssl.TrustManager;
 import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
 
-import com.google.common.io.Files;
-
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.handler.ssl.OpenSsl;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslProvider;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
 import org.apache.spark.network.util.JavaUtils;
 
 public class SSLFactory {
-  private static final Logger logger = LoggerFactory.getLogger(SSLFactory.class);
+  private static final SparkLogger logger = SparkLoggerFactory.getLogger(SSLFactory.class);
 
   /**
    * For a configuration specifying keystore/truststore files
@@ -89,7 +87,7 @@ public class SSLFactory {
 
   private void initJdkSslContext(final Builder b)
           throws IOException, GeneralSecurityException {
-    this.keyManagers = keyManagers(b.keyStore, b.keyStorePassword);
+    this.keyManagers = keyManagers(b.keyStore, b.keyPassword, b.keyStorePassword);
     this.trustManagers = trustStoreManagers(
       b.trustStore, b.trustStorePassword,
       b.trustStoreReloadingEnabled, b.trustStoreReloadIntervalMs
@@ -106,7 +104,7 @@ public class SSLFactory {
       .build();
 
     nettyServerSslContext = SslContextBuilder
-      .forServer(b.certChain, b.privateKey, b.keyPassword)
+      .forServer(b.certChain, b.privateKey, b.privateKeyPassword)
       .sslProvider(getSslProvider(b))
       .build();
   }
@@ -132,11 +130,11 @@ public class SSLFactory {
   public void destroy() {
     if (trustManagers != null) {
       for (int i = 0; i < trustManagers.length; i++) {
-        if (trustManagers[i] instanceof ReloadingX509TrustManager) {
+        if (trustManagers[i] instanceof ReloadingX509TrustManager manager) {
           try {
-            ((ReloadingX509TrustManager) trustManagers[i]).destroy();
+            manager.destroy();
           } catch (InterruptedException ex) {
-            logger.info("Interrupted while destroying trust manager: " + ex.toString(), ex);
+            logger.info("Interrupted while destroying trust manager: ", ex);
           }
         }
       }
@@ -160,6 +158,7 @@ public class SSLFactory {
     private File keyStore;
     private String keyStorePassword;
     private File privateKey;
+    private String privateKeyPassword;
     private String keyPassword;
     private File certChain;
     private File trustStore;
@@ -175,7 +174,7 @@ public class SSLFactory {
      * @return The builder object
      */
     public Builder requestedProtocol(String requestedProtocol) {
-      this.requestedProtocol = requestedProtocol == null ? "TLSv1.2" : requestedProtocol;
+      this.requestedProtocol = requestedProtocol == null ? "TLSv1.3" : requestedProtocol;
       return this;
     }
 
@@ -215,13 +214,24 @@ public class SSLFactory {
     }
 
     /**
-     * Sets the Key password
+     * Sets the key password
      *
-     * @param keyPassword The password for the private key
+     * @param keyPassword The password for the private key in the key store
      * @return The builder object
      */
     public Builder keyPassword(String keyPassword) {
       this.keyPassword = keyPassword;
+      return this;
+    }
+
+    /**
+     * Sets the private key password
+     *
+     * @param privateKeyPassword The password for the private key
+     * @return The builder object
+     */
+    public Builder privateKeyPassword(String privateKeyPassword) {
+      this.privateKeyPassword = privateKeyPassword;
       return this;
     }
 
@@ -367,7 +377,7 @@ public class SSLFactory {
 
   private static TrustManager[] defaultTrustManagers(File trustStore, String trustStorePassword)
       throws IOException, KeyStoreException, CertificateException, NoSuchAlgorithmException {
-    try (InputStream input = Files.asByteSource(trustStore).openStream()) {
+    try (InputStream input = Files.newInputStream(trustStore.toPath())) {
       KeyStore ks = KeyStore.getInstance(KeyStore.getDefaultType());
       char[] passwordCharacters = trustStorePassword != null?
         trustStorePassword.toCharArray() : null;
@@ -379,13 +389,16 @@ public class SSLFactory {
     }
   }
 
-  private static KeyManager[] keyManagers(File keyStore, String keyStorePassword)
+  private static KeyManager[] keyManagers(
+    File keyStore, String keyPassword, String keyStorePassword)
       throws NoSuchAlgorithmException, CertificateException,
           KeyStoreException, IOException, UnrecoverableKeyException {
     KeyManagerFactory factory = KeyManagerFactory.getInstance(
       KeyManagerFactory.getDefaultAlgorithm());
-    char[] passwordCharacters = keyStorePassword != null? keyStorePassword.toCharArray() : null;
-    factory.init(loadKeyStore(keyStore, passwordCharacters), passwordCharacters);
+    char[] keyStorePasswordChars = keyStorePassword != null? keyStorePassword.toCharArray() : null;
+    char[] keyPasswordChars = keyPassword != null?
+      keyPassword.toCharArray() : keyStorePasswordChars;
+    factory.init(loadKeyStore(keyStore, keyStorePasswordChars), keyPasswordChars);
     return factory.getKeyManagers();
   }
 

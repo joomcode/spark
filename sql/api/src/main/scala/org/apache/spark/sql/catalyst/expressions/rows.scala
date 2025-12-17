@@ -18,13 +18,15 @@ package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.ArrayImplicits._
 
 /**
- * A row implementation that uses an array of objects as the underlying storage.  Note that, while
+ * A row implementation that uses an array of objects as the underlying storage. Note that, while
  * the array is not copied, and thus could technically be mutated after creation, this is not
  * allowed.
  */
 class GenericRow(protected[sql] val values: Array[Any]) extends Row {
+
   /** No-arg constructor for serialization. */
   protected def this() = this(null)
 
@@ -34,13 +36,13 @@ class GenericRow(protected[sql] val values: Array[Any]) extends Row {
 
   override def get(i: Int): Any = values(i)
 
-  override def toSeq: Seq[Any] = values.clone()
+  override def toSeq: Seq[Any] = values.clone().toImmutableArraySeq
 
   override def copy(): GenericRow = this
 }
 
 class GenericRowWithSchema(values: Array[Any], override val schema: StructType)
-  extends GenericRow(values) {
+    extends GenericRow(values) {
 
   /** No-arg constructor for serialization. */
   protected def this() = this(null, null)

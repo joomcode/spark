@@ -18,6 +18,7 @@
 package org.apache.spark.sql.catalyst.analysis
 
 import java.io.File
+import java.util
 
 import scala.jdk.CollectionConverters._
 
@@ -29,7 +30,9 @@ import org.scalatest.matchers.must.Matchers
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.{CatalogDatabase, CatalogStorageFormat, CatalogTable, CatalogTableType, ExternalCatalog, InMemoryCatalog, SessionCatalog}
 import org.apache.spark.sql.catalyst.dsl.plans._
-import org.apache.spark.sql.connector.catalog.{CatalogManager, CatalogNotFoundException, Identifier, InMemoryTable, InMemoryTableCatalog, Table}
+import org.apache.spark.sql.connector.catalog.{CatalogManager, Identifier, InMemoryTable, InMemoryTableCatalog, Table}
+import org.apache.spark.sql.connector.catalog.TableWritePrivilege
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types._
 
 class TableLookupCacheSuite extends AnalysisTest with Matchers {
@@ -54,14 +57,18 @@ class TableLookupCacheSuite extends AnalysisTest with Matchers {
           Array.empty,
           Map.empty[String, String].asJava)
       }
+      override def loadTable(
+          ident: Identifier,
+          writePrivileges: util.Set[TableWritePrivilege]): Table = {
+        loadTable(ident)
+      }
       override def name: String = CatalogManager.SESSION_CATALOG_NAME
     }
     val catalogManager = mock(classOf[CatalogManager])
     when(catalogManager.catalog(any())).thenAnswer((invocation: InvocationOnMock) => {
       invocation.getArgument[String](0) match {
         case CatalogManager.SESSION_CATALOG_NAME => v2Catalog
-        case name =>
-          throw new CatalogNotFoundException(s"No such catalog: $name")
+        case name => throw QueryExecutionErrors.catalogNotFoundError(name)
       }
     })
     when(catalogManager.v1SessionCatalog).thenReturn(v1Catalog)

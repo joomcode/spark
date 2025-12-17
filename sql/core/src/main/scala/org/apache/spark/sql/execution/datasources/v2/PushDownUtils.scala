@@ -27,8 +27,10 @@ import org.apache.spark.sql.connector.expressions.filter.Predicate
 import org.apache.spark.sql.connector.read.{Scan, ScanBuilder, SupportsPushDownFilters, SupportsPushDownLimit, SupportsPushDownOffset, SupportsPushDownRequiredColumns, SupportsPushDownTableSample, SupportsPushDownTopN, SupportsPushDownV2Filters}
 import org.apache.spark.sql.execution.datasources.DataSourceStrategy
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.connector.SupportsPushDownCatalystFilters
 import org.apache.spark.sql.sources
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.collection.Utils
 
 object PushDownUtils {
@@ -70,7 +72,8 @@ object PushDownUtils {
         // Normally translated filters (postScanFilters) are simple filters that can be evaluated
         // faster, while the untranslated filters are complicated filters that take more time to
         // evaluate, so we want to evaluate the postScanFilters filters first.
-        (Left(r.pushedFilters()), (postScanFilters ++ untranslatableExprs).toSeq)
+        (Left(r.pushedFilters().toImmutableArraySeq),
+          (postScanFilters ++ untranslatableExprs).toImmutableArraySeq)
 
       case r: SupportsPushDownV2Filters =>
         // A map from translated data source leaf node filters to original catalyst filter
@@ -102,11 +105,12 @@ object PushDownUtils {
         // Normally translated filters (postScanFilters) are simple filters that can be evaluated
         // faster, while the untranslated filters are complicated filters that take more time to
         // evaluate, so we want to evaluate the postScanFilters filters first.
-        (Right(r.pushedPredicates), (postScanFilters ++ untranslatableExprs).toSeq)
+        (Right(r.pushedPredicates.toImmutableArraySeq),
+          (postScanFilters ++ untranslatableExprs).toImmutableArraySeq)
 
-      case f: FileScanBuilder =>
-        val postScanFilters = f.pushFilters(filters)
-        (Right(f.pushedFilters), postScanFilters)
+      case r: SupportsPushDownCatalystFilters =>
+        val postScanFilters = r.pushFilters(filters)
+        (Right(r.pushedFilters.toImmutableArraySeq), postScanFilters)
       case _ => (Left(Nil), filters)
     }
   }

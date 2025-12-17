@@ -124,7 +124,7 @@ class HiveSchemaInferenceSuite
     // properties out).
     assert(!externalCatalog.getTable(DATABASE, TEST_TABLE_NAME).schemaPreservesCase)
     val rawTable = client.getTable(DATABASE, TEST_TABLE_NAME)
-    assert(rawTable.properties.view.filterKeys(_.startsWith(DATASOURCE_SCHEMA_PREFIX)).isEmpty)
+    assert(!rawTable.properties.exists { case (k, _) => k.startsWith(DATASOURCE_SCHEMA_PREFIX) })
 
     // Add partition records (if specified)
     if (!partitionCols.isEmpty) {
@@ -157,8 +157,6 @@ class HiveSchemaInferenceSuite
       HiveUtils.CONVERT_METASTORE_ORC.key -> "true",
       SQLConf.HIVE_CASE_SENSITIVE_INFERENCE.key -> mode.toString)(f)
   }
-
-  private val inferenceKey = SQLConf.HIVE_CASE_SENSITIVE_INFERENCE.key
 
   private def testFieldQuery(fields: Seq[String]): Unit = {
     if (!fields.isEmpty) {

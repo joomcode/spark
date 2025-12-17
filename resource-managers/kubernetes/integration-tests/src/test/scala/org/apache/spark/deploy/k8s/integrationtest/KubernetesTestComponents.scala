@@ -45,11 +45,12 @@ private[spark] class KubernetesTestComponents(val kubernetesClient: KubernetesCl
   val clientConfig = kubernetesClient.getConfiguration
 
   def createNamespace(): Unit = {
-    kubernetesClient.namespaces.create(new NamespaceBuilder()
+    kubernetesClient.namespaces.resource(new NamespaceBuilder()
       .withNewMetadata()
       .withName(namespace)
       .endMetadata()
       .build())
+      .create()
   }
 
   def deleteNamespace(): Unit = {
@@ -75,6 +76,8 @@ private[spark] class KubernetesTestComponents(val kubernetesClient: KubernetesCl
       .set(UI_ENABLED.key, "true")
       .set("spark.kubernetes.submission.waitAppCompletion", "false")
       .set("spark.kubernetes.authenticate.driver.serviceAccountName", serviceAccountName)
+      .set("spark.kubernetes.driver.request.cores", "0.2")
+      .set("spark.kubernetes.executor.request.cores", "0.2")
   }
 }
 

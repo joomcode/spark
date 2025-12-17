@@ -20,6 +20,7 @@ package org.apache.spark.sql.sources
 import scala.util.Random
 
 import org.apache.spark.sql._
+import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
 import org.apache.spark.sql.catalyst.catalog.BucketSpec
 import org.apache.spark.sql.catalyst.expressions
 import org.apache.spark.sql.catalyst.expressions._
@@ -52,7 +53,7 @@ abstract class BucketedReadSuite extends QueryTest with SQLTestUtils with Adapti
 
   protected override def beforeAll(): Unit = {
     super.beforeAll()
-    spark.conf.set(SQLConf.LEGACY_BUCKETED_TABLE_SCAN_OUTPUT_ORDERING, true)
+    spark.conf.set(SQLConf.LEGACY_BUCKETED_TABLE_SCAN_OUTPUT_ORDERING.key, true)
   }
 
   protected override def afterAll(): Unit = {
@@ -221,7 +222,8 @@ abstract class BucketedReadSuite extends QueryTest with SQLTestUtils with Adapti
         df)
 
       // Case 4: InSet
-      val inSetExpr = expressions.InSet($"j".expr,
+      val inSetExpr = expressions.InSet(
+        UnresolvedAttribute("j"),
         Set(bucketValue, bucketValue + 1, bucketValue + 2, bucketValue + 3))
       checkPrunedAnswers(
         bucketSpec,
@@ -449,7 +451,7 @@ abstract class BucketedReadSuite extends QueryTest with SQLTestUtils with Adapti
           joined.sort("bucketed_table1.k", "bucketed_table2.k"),
           df1.join(df2, joinCondition(df1, df2), joinType).sort("df1.k", "df2.k"))
 
-        val joinOperator = if (joined.sqlContext.conf.adaptiveExecutionEnabled) {
+        val joinOperator = if (joined.sparkSession.sessionState.conf.adaptiveExecutionEnabled) {
           val executedPlan =
             joined.queryExecution.executedPlan.asInstanceOf[AdaptiveSparkPlanExec].executedPlan
           assert(executedPlan.isInstanceOf[SortMergeJoinExec])
@@ -688,7 +690,7 @@ abstract class BucketedReadSuite extends QueryTest with SQLTestUtils with Adapti
         val t1 = spark.table("t")
         val t2 = t1.selectExpr("i as ii")
         val plan = t1.join(t2, t1("i") === t2("ii")).queryExecution.executedPlan
-        assert(plan.collect { case sort: SortExec => sort }.isEmpty)
+        assert(plan.collectFirst { case sort: SortExec => sort }.isEmpty)
       }
     }
   }
@@ -701,7 +703,7 @@ abstract class BucketedReadSuite extends QueryTest with SQLTestUtils with Adapti
           sql("CREATE VIEW v AS SELECT * FROM t").collect()
 
           val plan = sql("SELECT * FROM t a JOIN v b ON a.i = b.i").queryExecution.executedPlan
-          assert(plan.collect { case exchange: ShuffleExchangeExec => exchange }.isEmpty)
+          assert(plan.collectFirst { case exchange: ShuffleExchangeExec => exchange }.isEmpty)
         }
       }
     }
@@ -1077,6 +1079,14 @@ abstract class BucketedReadSuite extends QueryTest with SQLTestUtils with Adapti
             |        FROM   t1 LEFT JOIN t3 ON t1.i = t3.i AND t1.j = t3.j) t
             |       LEFT JOIN t2 ON t.i = t2.i AND t.j = t2.j
             |""".stripMargin, 2, None)
+        // join keys also match PartitioningCollection
+        verify(
+          """
+            |SELECT *
+            |FROM   (SELECT /*+ BROADCAST(t3) */ t1.i AS t1i, t1.j AS t1j, t3.*
+            |        FROM   t1 JOIN t3 ON t1.i = t3.i AND t1.j = t3.j) t
+            |       JOIN t2 ON t.t1i = t2.i AND t.t1j = t2.j
+            |""".stripMargin, 0, Some(4))
       }
     }
   }

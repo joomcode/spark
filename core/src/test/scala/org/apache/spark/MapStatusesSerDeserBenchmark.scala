@@ -21,6 +21,7 @@ import org.apache.spark.benchmark.Benchmark
 import org.apache.spark.benchmark.BenchmarkBase
 import org.apache.spark.scheduler.{CompressedMapStatus, MergeStatus}
 import org.apache.spark.storage.BlockManagerId
+import org.apache.spark.util.Utils
 
 /**
  * Benchmark for MapStatuses serialization & deserialization performance.
@@ -58,7 +59,7 @@ object MapStatusesSerDeserBenchmark extends BenchmarkBase {
           Array.fill(blockSize) {
             // Creating block size ranging from 0byte to 1GB
             (r.nextDouble() * 1024 * 1024 * 1024).toLong
-          }, i))
+          }, i, i * 100))
     }
 
     val shuffleStatus = tracker.shuffleStatuses.get(shuffleId).head
@@ -85,12 +86,11 @@ object MapStatusesSerDeserBenchmark extends BenchmarkBase {
     }
 
     benchmark.run()
-    // scalastyle:off
-    import org.apache.commons.io.FileUtils
+    // scalastyle:off println
     benchmark.out.println("Compressed Serialized MapStatus sizes: " +
-      FileUtils.byteCountToDisplaySize(serializedMapStatusSizes))
+      Utils.bytesToString(serializedMapStatusSizes))
     benchmark.out.println("Compressed Serialized Broadcast MapStatus sizes: " +
-      FileUtils.byteCountToDisplaySize(serializedBroadcastSizes) + "\n\n")
+      Utils.bytesToString(serializedBroadcastSizes) + "\n\n")
     // scalastyle:on
 
     tracker.unregisterShuffle(shuffleId)
@@ -123,7 +123,6 @@ object MapStatusesSerDeserBenchmark extends BenchmarkBase {
   }
 
   override def afterAll(): Unit = {
-    tracker.stop()
     if (sc != null) {
       sc.stop()
     }

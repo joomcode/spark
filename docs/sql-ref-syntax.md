@@ -87,7 +87,22 @@ ability to generate logical and physical plan for a given query using
    * [LATERAL VIEW Clause](sql-ref-syntax-qry-select-lateral-view.html)
    * [LATERAL SUBQUERY](sql-ref-syntax-qry-select-lateral-subquery.html)
    * [TRANSFORM Clause](sql-ref-syntax-qry-select-transform.html)
+   * [star (*) Clause](sql-ref-syntax-qry-star.html)
  * [EXPLAIN](sql-ref-syntax-qry-explain.html)
+
+### SQL Scripting Statements
+
+You use SQL scripting to execute procedural logic in SQL.
+
+* [CASE](control-flow/case-stmt.html)
+* [compound statement](control-flow/compound-stmt.html)
+* [FOR](control-flow/for-stmt.html)
+* [IF](control-flow/if-stmt.html)
+* [ITERATE](control-flow/iterate-stmt.html)
+* [LEAVE](control-flow/leave-stmt.html)
+* [LOOP](control-flow/loop-stmt.html)
+* [REPEAT](control-flow/repeat-stmt.html)
+* [WHILE](control-flow/while-stmt.html)
 
 ### Auxiliary Statements
 
@@ -100,6 +115,7 @@ ability to generate logical and physical plan for a given query using
  * [DESCRIBE FUNCTION](sql-ref-syntax-aux-describe-function.html)
  * [DESCRIBE QUERY](sql-ref-syntax-aux-describe-query.html)
  * [DESCRIBE TABLE](sql-ref-syntax-aux-describe-table.html)
+ * [EXECUTE IMMEDIATE](sql-ref-syntax-aux-exec-imm.html)
  * [LIST FILE](sql-ref-syntax-aux-resource-mgmt-list-file.html)
  * [LIST JAR](sql-ref-syntax-aux-resource-mgmt-list-jar.html)
  * [REFRESH](sql-ref-syntax-aux-cache-refresh.html)

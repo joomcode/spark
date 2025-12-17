@@ -50,13 +50,14 @@ case class ShowCreateTableExec(
     showTableDataColumns(table, builder)
     showTableUsing(table, builder)
 
-    val tableOptions = table.properties.asScala.view
-      .filterKeys(_.startsWith(TableCatalog.OPTION_PREFIX)).map {
-      case (k, v) => k.drop(TableCatalog.OPTION_PREFIX.length) -> v
-    }.toMap
+    val tableOptions = table.properties.asScala
+      .filter { case (k, _) => k.startsWith(TableCatalog.OPTION_PREFIX) }.map {
+        case (k, v) => k.drop(TableCatalog.OPTION_PREFIX.length) -> v
+      }.toMap
     showTableOptions(builder, tableOptions)
     showTablePartitioning(table, builder)
     showTableComment(table, builder)
+    showTableCollation(table, builder)
     showTableLocation(table, builder)
     showTableProperties(table, builder, tableOptions)
   }
@@ -64,7 +65,8 @@ case class ShowCreateTableExec(
   private def showTableDataColumns(table: Table, builder: StringBuilder): Unit = {
     import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
     val columns = CharVarcharUtils.getRawSchema(table.columns.asSchema, conf).fields.map(_.toDDL)
-    builder ++= concatByMultiLines(columns)
+    val constraints = table.constraints().map(_.toDDL)
+    builder ++= concatByMultiLines(columns ++ constraints)
   }
 
   private def showTableUsing(table: Table, builder: StringBuilder): Unit = {
@@ -120,7 +122,7 @@ case class ShowCreateTableExec(
   private def showTableLocation(table: Table, builder: StringBuilder): Unit = {
     val isManagedOption = Option(table.properties.get(TableCatalog.PROP_IS_MANAGED_LOCATION))
     // Only generate LOCATION clause if it's not managed.
-    if (isManagedOption.forall(_.equalsIgnoreCase("false"))) {
+    if (isManagedOption.isEmpty || !isManagedOption.get.equalsIgnoreCase("true")) {
       Option(table.properties.get(TableCatalog.PROP_LOCATION))
         .map("LOCATION '" + escapeSingleQuotedString(_) + "'\n")
         .foreach(builder.append)
@@ -132,10 +134,12 @@ case class ShowCreateTableExec(
       builder: StringBuilder,
       tableOptions: Map[String, String]): Unit = {
 
-    val showProps = table.properties.asScala.view
-      .filterKeys(key => !CatalogV2Util.TABLE_RESERVED_PROPERTIES.contains(key)
-        && !key.startsWith(TableCatalog.OPTION_PREFIX)
-        && !tableOptions.contains(key))
+    val showProps = table.properties.asScala
+      .filter { case (key, _) =>
+        !CatalogV2Util.TABLE_RESERVED_PROPERTIES.contains(key) &&
+        !key.startsWith(TableCatalog.OPTION_PREFIX) &&
+        !tableOptions.contains(key)
+      }
     if (showProps.nonEmpty) {
       val props = conf.redactOptions(showProps.toMap).toSeq.sortBy(_._1).map {
         case (key, value) =>
@@ -150,6 +154,12 @@ case class ShowCreateTableExec(
   private def showTableComment(table: Table, builder: StringBuilder): Unit = {
     Option(table.properties.get(TableCatalog.PROP_COMMENT))
       .map("COMMENT '" + escapeSingleQuotedString(_) + "'\n")
+      .foreach(builder.append)
+  }
+
+  private def showTableCollation(table: Table, builder: StringBuilder): Unit = {
+    Option(table.properties.get(TableCatalog.PROP_COLLATION))
+      .map("COLLATION '" + escapeSingleQuotedString(_) + "'\n")
       .foreach(builder.append)
   }
 

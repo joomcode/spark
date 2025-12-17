@@ -17,16 +17,17 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
-import org.apache.spark.{SPARK_REVISION, SPARK_VERSION_SHORT}
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.analysis.UnresolvedSeed
+import org.apache.spark.sql.catalyst.analysis.{ExpressionBuilder, FunctionRegistry, UnresolvedSeed}
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
 import org.apache.spark.sql.catalyst.trees.TreePattern.{CURRENT_LIKE, TreePattern}
-import org.apache.spark.sql.catalyst.util.{MapData, RandomUUIDGenerator}
+import org.apache.spark.sql.catalyst.util.{toPrettySQL, MapData, RandomUUIDGenerator}
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.errors.QueryExecutionErrors.raiseError
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.types.{AbstractMapType, StringTypeWithCollation}
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
@@ -61,21 +62,9 @@ case class PrintToStderr(child: Expression) extends UnaryExpression {
 
 /**
  * Throw with the result of an expression (used for debugging).
+ * Caller can specify the errorClass to be thrown and parameters to be passed to this error class.
+ * Default is to throw USER_RAISED_EXCEPTION with provided string literal.
  */
-// scalastyle:off line.size.limit
-@ExpressionDescription(
-  usage = "_FUNC_( expr [, errorParams ]) - Throws a USER_RAISED_EXCEPTION with `expr` as message, or a defined error class in `expr` with a parameter map. A `null` errorParms is equivalent to an empty map.",
-  examples = """
-    Examples:
-      > SELECT _FUNC_('custom error message');
-       [USER_RAISED_EXCEPTION] custom error message
-
-      > SELECT _FUNC_('VIEW_NOT_FOUND', Map('relationName' -> '`V1`'));
-       [VIEW_NOT_FOUND] The view `V1` cannot be found. ...
-  """,
-  since = "3.1.0",
-  group = "misc_funcs")
-// scalastyle:on line.size.limit
 case class RaiseError(errorClass: Expression, errorParms: Expression, dataType: DataType)
   extends BinaryExpression with ImplicitCastInputTypes {
 
@@ -96,7 +85,12 @@ case class RaiseError(errorClass: Expression, errorParms: Expression, dataType: 
   override def foldable: Boolean = false
   override def nullable: Boolean = true
   override def inputTypes: Seq[AbstractDataType] =
-    Seq(StringType, MapType(StringType, StringType))
+    Seq(
+      StringTypeWithCollation(supportsTrimCollation = true),
+      AbstractMapType(
+        StringTypeWithCollation(supportsTrimCollation = true),
+        StringTypeWithCollation(supportsTrimCollation = true)
+      ))
 
   override def left: Expression = errorClass
   override def right: Expression = errorParms
@@ -140,6 +134,30 @@ object RaiseError {
 }
 
 /**
+ * Throw with the result of an expression (used for debugging).
+ */
+// scalastyle:off line.size.limit
+@ExpressionDescription(
+  usage = "_FUNC_( expr ) - Throws a USER_RAISED_EXCEPTION with `expr` as message.",
+  examples = """
+    Examples:
+      > SELECT _FUNC_('custom error message');
+       [USER_RAISED_EXCEPTION] custom error message
+  """,
+  since = "3.1.0",
+  group = "misc_funcs")
+// scalastyle:on line.size.limit
+object RaiseErrorExpressionBuilder extends ExpressionBuilder {
+  override def build(funcName: String, expressions: Seq[Expression]): Expression = {
+    if (expressions.length != 1) {
+      throw QueryCompilationErrors.wrongNumArgsError(funcName, Seq(1), expressions.length)
+    } else {
+      RaiseError(expressions.head)
+    }
+  }
+}
+
+/**
  * A function that throws an exception if 'condition' is not true.
  */
 @ExpressionDescription(
@@ -161,7 +179,7 @@ case class AssertTrue(left: Expression, right: Expression, replacement: Expressi
   }
 
   def this(left: Expression) = {
-    this(left, Literal(s"'${left.simpleString(SQLConf.get.maxToStringFields)}' is not true!"))
+    this(left, Literal(s"'${toPrettySQL(left)}' is not true!"))
   }
 
   override def parameters: Seq[Expression] = Seq(left, right)
@@ -186,8 +204,10 @@ object AssertTrue {
   """,
   since = "1.6.0",
   group = "misc_funcs")
-case class CurrentDatabase() extends LeafExpression with Unevaluable {
-  override def dataType: DataType = StringType
+case class CurrentDatabase()
+  extends LeafExpression
+  with DefaultStringProducingExpression
+  with Unevaluable {
   override def nullable: Boolean = false
   override def prettyName: String = "current_schema"
   final override val nodePatterns: Seq[TreePattern] = Seq(CURRENT_LIKE)
@@ -205,8 +225,10 @@ case class CurrentDatabase() extends LeafExpression with Unevaluable {
   """,
   since = "3.1.0",
   group = "misc_funcs")
-case class CurrentCatalog() extends LeafExpression with Unevaluable {
-  override def dataType: DataType = StringType
+case class CurrentCatalog()
+  extends LeafExpression
+  with DefaultStringProducingExpression
+  with Unevaluable {
   override def nullable: Boolean = false
   override def prettyName: String = "current_catalog"
   final override val nodePatterns: Seq[TreePattern] = Seq(CURRENT_LIKE)
@@ -227,19 +249,22 @@ case class CurrentCatalog() extends LeafExpression with Unevaluable {
   group = "misc_funcs")
 // scalastyle:on line.size.limit
 case class Uuid(randomSeed: Option[Long] = None) extends LeafExpression with Nondeterministic
-    with ExpressionWithRandomSeed {
+  with DefaultStringProducingExpression
+  with ExpressionWithRandomSeed {
 
   def this() = this(None)
+
+  def this(seed: Expression) = this(ExpressionWithRandomSeed.expressionToSeed(seed, "UUID"))
 
   override def seedExpression: Expression = randomSeed.map(Literal.apply).getOrElse(UnresolvedSeed)
 
   override def withNewSeed(seed: Long): Uuid = Uuid(Some(seed))
 
+  override def withShiftedSeed(shift: Long): Uuid = Uuid(randomSeed.map(_ + shift))
+
   override lazy val resolved: Boolean = randomSeed.isDefined
 
   override def nullable: Boolean = false
-
-  override def dataType: DataType = StringType
 
   override def stateful: Boolean = true
 
@@ -275,14 +300,17 @@ case class Uuid(randomSeed: Option[Long] = None) extends LeafExpression with Non
   since = "3.0.0",
   group = "misc_funcs")
 // scalastyle:on line.size.limit
-case class SparkVersion() extends LeafExpression with CodegenFallback {
-  override def nullable: Boolean = false
-  override def foldable: Boolean = true
-  override def dataType: DataType = StringType
+case class SparkVersion()
+  extends LeafExpression
+  with RuntimeReplaceable
+  with DefaultStringProducingExpression {
   override def prettyName: String = "version"
-  override def eval(input: InternalRow): Any = {
-    UTF8String.fromString(SPARK_VERSION_SHORT + " " + SPARK_REVISION)
-  }
+
+  override lazy val replacement: Expression = StaticInvoke(
+    classOf[ExpressionImplUtils],
+    dataType,
+    "getSparkVersion",
+    returnNullable = false)
 }
 
 @ExpressionDescription(
@@ -296,10 +324,10 @@ case class SparkVersion() extends LeafExpression with CodegenFallback {
   """,
   since = "3.0.0",
   group = "misc_funcs")
-case class TypeOf(child: Expression) extends UnaryExpression {
+case class TypeOf(child: Expression) extends UnaryExpression with DefaultStringProducingExpression {
   override def nullable: Boolean = false
   override def foldable: Boolean = true
-  override def dataType: DataType = StringType
+  override def contextIndependentFoldable: Boolean = true
   override def eval(input: InternalRow): Any = UTF8String.fromString(child.dataType.catalogString)
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
@@ -320,10 +348,13 @@ case class TypeOf(child: Expression) extends UnaryExpression {
   since = "3.2.0",
   group = "misc_funcs")
 // scalastyle:on line.size.limit
-case class CurrentUser() extends LeafExpression with Unevaluable {
+case class CurrentUser()
+  extends LeafExpression
+  with DefaultStringProducingExpression
+  with Unevaluable {
   override def nullable: Boolean = false
-  override def dataType: DataType = StringType
-  override def prettyName: String = "current_user"
+  override def prettyName: String =
+    getTagValue(FunctionRegistry.FUNC_ALIAS).getOrElse("current_user")
   final override val nodePatterns: Seq[TreePattern] = Seq(CURRENT_LIKE)
 }
 
@@ -399,7 +430,10 @@ case class AesEncrypt(
   override def prettyName: String = "aes_encrypt"
 
   override def inputTypes: Seq[AbstractDataType] =
-    Seq(BinaryType, BinaryType, StringType, StringType, BinaryType, BinaryType)
+    Seq(BinaryType, BinaryType,
+      StringTypeWithCollation(supportsTrimCollation = true),
+      StringTypeWithCollation(supportsTrimCollation = true),
+      BinaryType, BinaryType)
 
   override def children: Seq[Expression] = Seq(input, key, mode, padding, iv, aad)
 
@@ -472,7 +506,10 @@ case class AesDecrypt(
     this(input, key, Literal("GCM"))
 
   override def inputTypes: Seq[AbstractDataType] = {
-    Seq(BinaryType, BinaryType, StringType, StringType, BinaryType)
+    Seq(BinaryType,
+      BinaryType,
+      StringTypeWithCollation(supportsTrimCollation = true),
+      StringTypeWithCollation(supportsTrimCollation = true), BinaryType)
   }
 
   override def prettyName: String = "aes_decrypt"

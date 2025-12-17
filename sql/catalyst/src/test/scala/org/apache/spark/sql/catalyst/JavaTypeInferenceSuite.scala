@@ -18,13 +18,13 @@
 package org.apache.spark.sql.catalyst
 
 import java.math.BigInteger
-import java.util.{LinkedList, List => JList, Map => JMap}
+import java.util.{HashSet, LinkedList, List => JList, Map => JMap, Set => JSet}
 
 import scala.beans.{BeanProperty, BooleanBeanProperty}
 import scala.reflect.{classTag, ClassTag}
 
 import org.apache.spark.SparkFunSuite
-import org.apache.spark.sql.catalyst.JavaTypeInferenceBeans.{JavaBeanWithGenericBase, JavaBeanWithGenericHierarchy, JavaBeanWithGenericsABC}
+import org.apache.spark.sql.catalyst.JavaTypeInferenceBeans.{Bar, Foo, JavaBeanWithGenericBase, JavaBeanWithGenericHierarchy, JavaBeanWithGenericsABC, StringBarWrapper, StringFooWrapper}
 import org.apache.spark.sql.catalyst.encoders.{AgnosticEncoder, UDTCaseClass, UDTForCaseClass}
 import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders._
 import org.apache.spark.sql.types.{DecimalType, MapType, Metadata, StringType, StructField, StructType}
@@ -37,6 +37,8 @@ class GenericCollectionBean {
   @BeanProperty var listOfListOfStrings: JList[JList[String]] = _
   @BeanProperty var mapOfDummyBeans: JMap[String, DummyBean] = _
   @BeanProperty var linkedListOfStrings: LinkedList[String] = _
+  @BeanProperty var hashSetOfString: HashSet[String] = _
+  @BeanProperty var setOfSetOfStrings: JSet[JSet[String]] = _
 }
 
 class LeafBean {
@@ -139,9 +141,16 @@ class JavaTypeInferenceSuite extends SparkFunSuite {
     assert(schema === expected)
   }
 
-  test("resolve type parameters for map and list") {
+  test("resolve type parameters for map, list and set") {
     val encoder = JavaTypeInference.encoderFor(classOf[GenericCollectionBean])
     val expected = JavaBeanEncoder(ClassTag(classOf[GenericCollectionBean]), Seq(
+      encoderField(
+        "hashSetOfString",
+        IterableEncoder(
+          ClassTag(classOf[HashSet[_]]),
+          StringEncoder,
+          containsNull = true,
+          lenientSerialization = false)),
       encoderField(
         "linkedListOfStrings",
         IterableEncoder(
@@ -166,7 +175,18 @@ class JavaTypeInferenceSuite extends SparkFunSuite {
           ClassTag(classOf[JMap[_, _]]),
           StringEncoder,
           expectedDummyBeanEncoder,
-          valueContainsNull = true))))
+          valueContainsNull = true)),
+      encoderField(
+        "setOfSetOfStrings",
+        IterableEncoder(
+          ClassTag(classOf[JSet[_]]),
+          IterableEncoder(
+            ClassTag(classOf[JSet[_]]),
+            StringEncoder,
+            containsNull = true,
+            lenientSerialization = false),
+          containsNull = true,
+          lenientSerialization = false))))
     assert(encoder === expected)
   }
 
@@ -257,6 +277,28 @@ class JavaTypeInferenceSuite extends SparkFunSuite {
         encoderField("propertyB", BoxedLongEncoder),
         encoderField("propertyC", BoxedIntEncoder)
       ))
+    assert(encoder === expected)
+  }
+
+  test("SPARK-46679: resolve generics with multi-level inheritance") {
+    val encoder = JavaTypeInference.encoderFor(classOf[StringFooWrapper])
+    val expected = JavaBeanEncoder(ClassTag(classOf[StringFooWrapper]), Seq(
+      encoderField("foo", JavaBeanEncoder(
+        ClassTag(classOf[Foo[String]]),
+        Seq(encoderField("t", StringEncoder))
+      ))
+    ))
+    assert(encoder === expected)
+  }
+
+  test("SPARK-46679: resolve generics with multi-level inheritance same type names") {
+    val encoder = JavaTypeInference.encoderFor(classOf[StringBarWrapper])
+    val expected = JavaBeanEncoder(ClassTag(classOf[StringBarWrapper]), Seq(
+      encoderField("bar", JavaBeanEncoder(
+        ClassTag(classOf[Bar[String]]),
+        Seq(encoderField("t", StringEncoder))
+      ))
+    ))
     assert(encoder === expected)
   }
 }

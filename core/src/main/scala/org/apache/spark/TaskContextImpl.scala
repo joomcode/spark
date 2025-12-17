@@ -17,6 +17,7 @@
 
 package org.apache.spark
 
+import java.io.Closeable
 import java.util.{Properties, Stack}
 import javax.annotation.concurrent.GuardedBy
 
@@ -25,6 +26,7 @@ import scala.jdk.CollectionConverters._
 
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.internal.{config, Logging}
+import org.apache.spark.internal.LogKeys.LISTENER
 import org.apache.spark.memory.TaskMemoryManager
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.metrics.source.Source
@@ -81,6 +83,13 @@ private[spark] class TaskContextImpl(
   // If defined, the corresponding task has been killed and this option contains the reason.
   @volatile private var reasonIfKilled: Option[String] = None
 
+  // The pending interruption request, which is blocked by uninterruptible resource creation.
+  // Should be protected by `TaskContext.synchronized`.
+  private var pendingInterruptRequest: Option[(Option[Thread], String)] = None
+
+  // Whether this task is able to be interrupted. Should be protected by `TaskContext.synchronized`.
+  private var _interruptible = true
+
   // Whether the task has completed.
   private var completed: Boolean = false
 
@@ -135,6 +144,10 @@ private[spark] class TaskContextImpl(
       completed = true
     }
     invokeTaskCompletionListeners(error)
+  }
+
+  private[spark] override def getTaskFailure: Option[Throwable] = {
+    failureCauseOpt
   }
 
   private def invokeTaskCompletionListeners(error: Option[Throwable]): Unit = {
@@ -246,7 +259,7 @@ private[spark] class TaskContextImpl(
             }
           }
           listenerExceptions += e
-          logError(s"Error in $name", e)
+          logError(log"Error in ${MDC(LISTENER, name)}", e)
       }
     }
     if (listenerExceptions.nonEmpty) {
@@ -275,6 +288,8 @@ private[spark] class TaskContextImpl(
   @GuardedBy("this")
   override def isCompleted(): Boolean = synchronized(completed)
 
+  override def isFailed(): Boolean = synchronized(failureCauseOpt.isDefined)
+
   override def isInterrupted(): Boolean = reasonIfKilled.isDefined
 
   override def getLocalProperty(key: String): String = localProperties.getProperty(key)
@@ -293,4 +308,39 @@ private[spark] class TaskContextImpl(
   private[spark] override def fetchFailed: Option[FetchFailedException] = _fetchFailedException
 
   private[spark] override def getLocalProperties: Properties = localProperties
+
+
+  override def interruptible(): Boolean = TaskContext.synchronized(_interruptible)
+
+  override def pendingInterrupt(threadToInterrupt: Option[Thread], reason: String): Unit = {
+    TaskContext.synchronized {
+      pendingInterruptRequest = Some((threadToInterrupt, reason))
+    }
+  }
+
+  def createResourceUninterruptibly[T <: Closeable](resourceBuilder: => T): T = {
+
+    @inline def interruptIfRequired(): Unit = {
+      pendingInterruptRequest.foreach { case (threadToInterrupt, reason) =>
+        markInterrupted(reason)
+        threadToInterrupt.foreach(_.interrupt())
+      }
+      killTaskIfInterrupted()
+    }
+
+    TaskContext.synchronized {
+      interruptIfRequired()
+      _interruptible = false
+    }
+    try {
+      val resource = resourceBuilder
+      addTaskCompletionListener[Unit](_ => resource.close())
+      resource
+    } finally {
+      TaskContext.synchronized {
+        _interruptible = true
+        interruptIfRequired()
+      }
+    }
+  }
 }

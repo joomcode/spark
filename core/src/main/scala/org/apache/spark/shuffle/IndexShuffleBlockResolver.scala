@@ -21,12 +21,16 @@ import java.io._
 import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import java.nio.file.Files
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentMap}
 
 import scala.collection.mutable.ArrayBuffer
 
+import com.google.common.cache.CacheBuilder
+
 import org.apache.spark.{SecurityManager, SparkConf, SparkEnv, SparkException}
 import org.apache.spark.errors.SparkCoreErrors
-import org.apache.spark.internal.{config, Logging}
+import org.apache.spark.internal.{config, Logging, LogKeys}
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.io.NioBufferedFileInputStream
 import org.apache.spark.network.buffer.{FileSegmentManagedBuffer, ManagedBuffer}
 import org.apache.spark.network.client.StreamCallbackWithID
@@ -37,6 +41,7 @@ import org.apache.spark.serializer.SerializerManager
 import org.apache.spark.shuffle.IndexShuffleBlockResolver.NOOP_REDUCE_ID
 import org.apache.spark.storage._
 import org.apache.spark.util.Utils
+import org.apache.spark.util.collection.OpenHashSet
 
 /**
  * Create and maintain the shuffle blocks' mapping between logic block and physical file location.
@@ -52,9 +57,22 @@ import org.apache.spark.util.Utils
 private[spark] class IndexShuffleBlockResolver(
     conf: SparkConf,
     // var for testing
-    var _blockManager: BlockManager = null)
+    var _blockManager: BlockManager,
+    val taskIdMapsForShuffle: ConcurrentMap[Int, OpenHashSet[Long]])
   extends ShuffleBlockResolver
   with Logging with MigratableResolver {
+
+  def this(conf: SparkConf) = {
+    this(conf, null, new ConcurrentHashMap[Int, OpenHashSet[Long]]())
+  }
+
+  def this(conf: SparkConf, _blockManager: BlockManager) = {
+    this(conf, _blockManager, new ConcurrentHashMap[Int, OpenHashSet[Long]]())
+  }
+
+  def this(conf: SparkConf, taskIdMapsForShuffle: ConcurrentHashMap[Int, OpenHashSet[Long]]) = {
+    this(conf, null, taskIdMapsForShuffle)
+  }
 
   private lazy val blockManager = Option(_blockManager).getOrElse(SparkEnv.get.blockManager)
 
@@ -67,6 +85,9 @@ private[spark] class IndexShuffleBlockResolver(
   private val remoteShuffleMaxDisk: Option[Long] =
     conf.get(config.STORAGE_DECOMMISSION_SHUFFLE_MAX_DISK_SIZE)
 
+  private val checksumEnabled = conf.get(config.SHUFFLE_CHECKSUM_ENABLED)
+  private lazy val algorithm = conf.get(config.SHUFFLE_CHECKSUM_ALGORITHM)
+
   def getDataFile(shuffleId: Int, mapId: Long): File = getDataFile(shuffleId, mapId, None)
 
   /**
@@ -75,11 +96,19 @@ private[spark] class IndexShuffleBlockResolver(
   override def getStoredShuffles(): Seq[ShuffleBlockInfo] = {
     val allBlocks = blockManager.diskBlockManager.getAllBlocks()
     allBlocks.flatMap {
-      case ShuffleIndexBlockId(shuffleId, mapId, _) =>
+      case ShuffleIndexBlockId(shuffleId, mapId, _)
+        if Option(shuffleIdsToSkip.getIfPresent(shuffleId)).isEmpty =>
         Some(ShuffleBlockInfo(shuffleId, mapId))
       case _ =>
         None
     }
+  }
+
+  private val shuffleIdsToSkip =
+    CacheBuilder.newBuilder().maximumSize(1000).build[java.lang.Integer, java.lang.Boolean]()
+
+  override def addShuffleToSkip(shuffleId: ShuffleId): Unit = {
+    shuffleIdsToSkip.put(shuffleId, true)
   }
 
   private def getShuffleBytesStored(): Long = {
@@ -161,17 +190,19 @@ private[spark] class IndexShuffleBlockResolver(
   def removeDataByMap(shuffleId: Int, mapId: Long): Unit = {
     var file = getDataFile(shuffleId, mapId)
     if (file.exists() && !file.delete()) {
-      logWarning(s"Error deleting data ${file.getPath()}")
+      logWarning(log"Error deleting data ${MDC(PATH, file.getPath())}")
     }
 
     file = getIndexFile(shuffleId, mapId)
     if (file.exists() && !file.delete()) {
-      logWarning(s"Error deleting index ${file.getPath()}")
+      logWarning(log"Error deleting index ${MDC(PATH, file.getPath())}")
     }
 
-    file = getChecksumFile(shuffleId, mapId, conf.get(config.SHUFFLE_CHECKSUM_ALGORITHM))
-    if (file.exists() && !file.delete()) {
-      logWarning(s"Error deleting checksum ${file.getPath()}")
+    if (checksumEnabled) {
+      file = getChecksumFile(shuffleId, mapId, algorithm)
+      if (file.exists() && !file.delete()) {
+        logWarning(log"Error deleting checksum ${MDC(PATH, file.getPath())}")
+      }
     }
   }
 
@@ -274,12 +305,27 @@ private[spark] class IndexShuffleBlockResolver(
             throw SparkCoreErrors.failedRenameTempFileError(fileTmp, file)
           }
         }
+        blockId match {
+          case ShuffleIndexBlockId(shuffleId, mapId, _) =>
+            val mapTaskIds = taskIdMapsForShuffle.computeIfAbsent(
+              shuffleId, _ => new OpenHashSet[Long](8)
+            )
+            mapTaskIds.synchronized { mapTaskIds.add(mapId) }
+
+          case ShuffleDataBlockId(shuffleId, mapId, _) =>
+            val mapTaskIds = taskIdMapsForShuffle.computeIfAbsent(
+              shuffleId, _ => new OpenHashSet[Long](8)
+            )
+            mapTaskIds.synchronized { mapTaskIds.add(mapId) }
+
+          case _ => // Unreachable
+        }
         blockManager.reportBlockStatus(blockId, BlockStatus(StorageLevel.DISK_ONLY, 0, diskSize))
       }
 
       override def onFailure(streamId: String, cause: Throwable): Unit = {
         // the framework handles the connection itself, we just need to do local cleanup
-        logWarning(s"Error while uploading $blockId", cause)
+        logWarning(log"Error while uploading ${MDC(BLOCK_ID, blockId)}", cause)
         channel.close()
         fileTmp.delete()
       }
@@ -317,8 +363,9 @@ private[spark] class IndexShuffleBlockResolver(
       }
     } catch {
       case _: Exception => // If we can't load the blocks ignore them.
-        logWarning(s"Failed to resolve shuffle block ${shuffleBlockInfo}. " +
-          "This is expected to occur if a block is removed after decommissioning has started.")
+        logWarning(log"Failed to resolve shuffle block " +
+          log"${MDC(SHUFFLE_BLOCK_INFO, shuffleBlockInfo)}. " +
+          log"This is expected to occur if a block is removed after decommissioning has started.")
         List.empty[(BlockId, ManagedBuffer)]
     }
   }
@@ -354,8 +401,7 @@ private[spark] class IndexShuffleBlockResolver(
     val (checksumFileOpt, checksumTmpOpt) = if (checksumEnabled) {
       assert(lengths.length == checksums.length,
         "The size of partition lengths and checksums should be equal")
-      val checksumFile =
-        getChecksumFile(shuffleId, mapId, conf.get(config.SHUFFLE_CHECKSUM_ALGORITHM))
+      val checksumFile = getChecksumFile(shuffleId, mapId, algorithm)
       (Some(checksumFile), Some(createTempFile(checksumFile)))
     } else {
       (None, None)
@@ -417,21 +463,22 @@ private[spark] class IndexShuffleBlockResolver(
     } finally {
       logDebug(s"Shuffle index for mapId $mapId: ${lengths.mkString("[", ",", "]")}")
       if (indexTmp.exists() && !indexTmp.delete()) {
-        logError(s"Failed to delete temporary index file at ${indexTmp.getAbsolutePath}")
+        logError(log"Failed to delete temporary index file at " +
+          log"${MDC(PATH, indexTmp.getAbsolutePath)}")
       }
       checksumTmpOpt.foreach { checksumTmp =>
         if (checksumTmp.exists()) {
           try {
             if (!checksumTmp.delete()) {
-              logError(s"Failed to delete temporary checksum file " +
-                s"at ${checksumTmp.getAbsolutePath}")
+              logError(log"Failed to delete temporary checksum file at " +
+                log"${MDC(LogKeys.PATH, checksumTmp.getAbsolutePath)}")
             }
           } catch {
             case e: Exception =>
               // Unlike index deletion, we won't propagate the error for the checksum file since
               // checksum is only a best-effort.
-              logError(s"Failed to delete temporary checksum file " +
-                s"at ${checksumTmp.getAbsolutePath}", e)
+              logError(log"Failed to delete temporary checksum file " +
+                log"at ${MDC(PATH, checksumTmp.getAbsolutePath)}", e)
           }
         }
       }
@@ -473,7 +520,8 @@ private[spark] class IndexShuffleBlockResolver(
       if (propagateError) {
         throw SparkCoreErrors.failedRenameTempFileError(tmpFile, targetFile)
       } else {
-        logWarning(s"fail to rename file $tmpFile to $targetFile")
+        logWarning(log"fail to rename file ${MDC(TEMP_FILE, tmpFile)} " +
+          log"to ${MDC(TARGET_PATH, targetFile)}")
       }
     }
   }

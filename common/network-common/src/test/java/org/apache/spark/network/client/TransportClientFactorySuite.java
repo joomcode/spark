@@ -44,10 +44,10 @@ import org.apache.spark.network.util.TransportConf;
 import static org.junit.jupiter.api.Assertions.*;
 
 public class TransportClientFactorySuite {
-  private TransportConf conf;
-  private TransportContext context;
-  private TransportServer server1;
-  private TransportServer server2;
+  protected TransportConf conf;
+  protected TransportContext context;
+  protected TransportServer server1;
+  protected TransportServer server2;
 
   @BeforeEach
   public void setUp() {
@@ -225,11 +225,12 @@ public class TransportClientFactorySuite {
   }
 
   @Test
-  public void fastFailConnectionInTimeWindow() {
+  public void fastFailConnectionInTimeWindow() throws IOException, InterruptedException {
     TransportClientFactory factory = context.createClientFactory();
     TransportServer server = context.createServer();
     int unreachablePort = server.getPort();
     server.close();
+    Thread.sleep(1000);
     Assertions.assertThrows(IOException.class,
       () -> factory.createClient(TestUtils.getLocalHost(), unreachablePort, true));
     Assertions.assertThrows(IOException.class,
@@ -258,6 +259,7 @@ public class TransportClientFactorySuite {
       TransportServer server = ctx.createServer();
       int unreachablePort = server.getPort();
       JavaUtils.closeQuietly(server);
+      Thread.sleep(1000);
       IOException exception = Assertions.assertThrows(IOException.class,
           () -> factory.createClient(TestUtils.getLocalHost(), unreachablePort, true));
       assertNotEquals(exception.getCause(), null);

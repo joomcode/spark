@@ -22,12 +22,14 @@ import numpy as np
 import pandas as pd
 
 from pyspark import pandas as ps
-from pyspark.testing.pandasutils import (
+from pyspark.testing.pandasutils import PandasOnSparkTestCase
+from pyspark.testing.sqlutils import SQLTestUtils
+from pyspark.testing.utils import (
+    have_jinja2,
+    jinja2_requirement_message,
     have_tabulate,
-    ComparisonTestBase,
     tabulate_requirement_message,
 )
-from pyspark.testing.sqlutils import SQLTestUtils
 
 
 # This file contains test cases for 'Serialization / IO / Conversion'
@@ -94,6 +96,7 @@ class FrameIOMixin:
         psdf = ps.DataFrame.from_dict(data, orient="index", columns=["A", "B", "C", "D"])
         self.assert_eq(pdf, psdf)
 
+    @unittest.skipIf(not have_jinja2, jinja2_requirement_message)
     def test_style(self):
         # Currently, the `style` function returns a pandas object `Styler` as it is,
         # processing only the number of rows declared in `compute.max_rows`.
@@ -145,7 +148,11 @@ class FrameIOMixin:
         self.assert_eq(pdf_io.getvalue().split("\n")[1:], psdf_io.getvalue().split("\n")[1:])
 
 
-class FrameIOTests(FrameIOMixin, ComparisonTestBase, SQLTestUtils):
+class FrameIOTests(
+    FrameIOMixin,
+    PandasOnSparkTestCase,
+    SQLTestUtils,
+):
     pass
 
 

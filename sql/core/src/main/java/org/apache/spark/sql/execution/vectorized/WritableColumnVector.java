@@ -59,7 +59,7 @@ public abstract class WritableColumnVector extends ColumnVector {
    * Resets this column for writing. The currently stored values are no longer accessible.
    */
   public void reset() {
-    if (isConstant || isAllNull) return;
+    if (isConstant || isAllNull()) return;
 
     if (childColumns != null) {
       for (WritableColumnVector c: childColumns) {
@@ -72,7 +72,7 @@ public abstract class WritableColumnVector extends ColumnVector {
       numNulls = 0;
     }
 
-    if (hugeVectorThreshold > 0 && capacity > hugeVectorThreshold) {
+    if (hugeVectorThreshold > -1 && capacity > hugeVectorThreshold) {
       capacity = defaultCapacity;
       releaseMemory();
       reserveInternal(capacity);
@@ -94,6 +94,11 @@ public abstract class WritableColumnVector extends ColumnVector {
     }
     dictionary = null;
     releaseMemory();
+  }
+
+  @Override
+  public void closeIfFreeable() {
+    // no-op
   }
 
   public void reserveAdditional(int additionalCapacity) {
@@ -137,7 +142,7 @@ public abstract class WritableColumnVector extends ColumnVector {
 
   @Override
   public boolean hasNull() {
-    return isAllNull || numNulls > 0;
+    return isAllNull() || numNulls > 0;
   }
 
   @Override
@@ -694,7 +699,7 @@ public abstract class WritableColumnVector extends ColumnVector {
       putNull(elementsAppended);
       elementsAppended++;
       for (WritableColumnVector c: childColumns) {
-        if (c.type instanceof StructType) {
+        if (c.type instanceof StructType || c.type instanceof VariantType) {
           c.appendStruct(true);
         } else {
           c.appendNull();
@@ -723,10 +728,18 @@ public abstract class WritableColumnVector extends ColumnVector {
     }
     if (value instanceof Decimal decimal) {
       long unscaled = decimal.toUnscaledLong();
-      if (decimal.precision() < 10) {
+      if (decimal.precision() <= Decimal.MAX_INT_DIGITS()) {
         return Optional.of(appendInts(length, (int) unscaled));
-      } else {
+      } else if (decimal.precision() <= Decimal.MAX_LONG_DIGITS()) {
         return Optional.of(appendLongs(length, unscaled));
+      } else {
+        BigInteger integer = decimal.toJavaBigDecimal().unscaledValue();
+        byte[] bytes = integer.toByteArray();
+        int result = 0;
+        for (int i = 0; i < length; ++i) {
+          result += appendByteArray(bytes, 0, bytes.length);
+        }
+        return Optional.of(result);
       }
     }
     if (value instanceof Double) {
@@ -757,7 +770,7 @@ public abstract class WritableColumnVector extends ColumnVector {
       for (int i = 0; i < length; ++i) {
         appendArray(arrayData.numElements());
         for (Object element : arrayData.array()) {
-          if (!arrayData().appendObjects(1, element).isPresent()) {
+          if (arrayData().appendObjects(1, element).isEmpty()) {
             return Optional.empty();
           }
         }
@@ -771,7 +784,7 @@ public abstract class WritableColumnVector extends ColumnVector {
         appendStruct(false);
         for (int j = 0; j < row.values().length; ++j) {
           Object element = row.values()[j];
-          if (!childColumns[j].appendObjects(1, element).isPresent()) {
+          if (childColumns[j].appendObjects(1, element).isEmpty()) {
             return Optional.empty();
           }
         }
@@ -784,12 +797,12 @@ public abstract class WritableColumnVector extends ColumnVector {
       int result = 0;
       for (int i = 0; i < length; ++i) {
         for (Object key : data.keyArray().array()) {
-          if (!childColumns[0].appendObjects(1, key).isPresent()) {
+          if (childColumns[0].appendObjects(1, key).isEmpty()) {
             return Optional.empty();
           }
         }
         for (Object val: data.valueArray().array()) {
-          if (!childColumns[1].appendObjects(1, val).isPresent()) {
+          if (childColumns[1].appendObjects(1, val).isEmpty()) {
             return Optional.empty();
           }
         }
@@ -863,17 +876,24 @@ public abstract class WritableColumnVector extends ColumnVector {
   }
 
   /**
-   * Marks this column only contains null values.
+   * Marks this column missing from the file.
    */
-  public final void setAllNull() {
-    isAllNull = true;
+  public final void setMissing() {
+    isMissing = true;
+  }
+
+  /**
+   * Whether this column is missing from the file.
+   */
+  public final boolean isMissing() {
+    return isMissing;
   }
 
   /**
    * Whether this column only contains null values.
    */
   public final boolean isAllNull() {
-    return isAllNull;
+    return isMissing || type instanceof NullType;
   }
 
   /**
@@ -908,10 +928,10 @@ public abstract class WritableColumnVector extends ColumnVector {
   protected boolean isConstant;
 
   /**
-   * True if this column only contains nulls. This means the column values never change, even
-   * across resets. Comparing to 'isConstant' above, this doesn't require any allocation of space.
+   * True if this column is missing from the file. This means the column values never change and are
+   * nulls, even across resets. This doesn't require any allocation of space.
    */
-  protected boolean isAllNull;
+  protected boolean isMissing;
 
   /**
    * Default size of each array length value. This grows as necessary.
@@ -931,7 +951,7 @@ public abstract class WritableColumnVector extends ColumnVector {
   /**
    * Reserve a new column.
    */
-  protected abstract WritableColumnVector reserveNewColumn(int capacity, DataType type);
+  public abstract WritableColumnVector reserveNewColumn(int capacity, DataType type);
 
   protected boolean isArray() {
     return type instanceof ArrayType || type instanceof BinaryType || type instanceof StringType ||
@@ -975,6 +995,10 @@ public abstract class WritableColumnVector extends ColumnVector {
       this.childColumns[0] = reserveNewColumn(capacity, DataTypes.IntegerType);
       this.childColumns[1] = reserveNewColumn(capacity, DataTypes.IntegerType);
       this.childColumns[2] = reserveNewColumn(capacity, DataTypes.LongType);
+    } else if (type instanceof VariantType) {
+      this.childColumns = new WritableColumnVector[2];
+      this.childColumns[0] = reserveNewColumn(capacity, DataTypes.BinaryType);
+      this.childColumns[1] = reserveNewColumn(capacity, DataTypes.BinaryType);
     } else {
       this.childColumns = null;
     }

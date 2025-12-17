@@ -31,10 +31,10 @@ from pyspark.install import (
 class SparkInstallationTestCase(unittest.TestCase):
     def test_install_spark(self):
         # Test only one case. Testing this is expensive because it needs to download
-        # the Spark distribution.
-        spark_version, hadoop_version, hive_version = checked_versions("3.0.1", "3", "2.3")
+        # the Spark distribution, ensure it is available at https://dlcdn.apache.org/spark/
+        spark_version, hadoop_version, hive_version = checked_versions("3.5.7", "3", "2.3")
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
+        with tempfile.TemporaryDirectory(prefix="test_install_spark") as tmp_dir:
             install_spark(
                 dest=tmp_dir,
                 spark_version=spark_version,

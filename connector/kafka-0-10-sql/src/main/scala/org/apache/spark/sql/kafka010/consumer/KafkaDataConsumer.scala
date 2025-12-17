@@ -30,8 +30,11 @@ import org.apache.kafka.common.TopicPartition
 
 import org.apache.spark.{SparkEnv, TaskContext}
 import org.apache.spark.deploy.security.HadoopDelegationTokenManager
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MessageWithContext}
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.kafka010.{KafkaConfigUpdater, KafkaTokenUtil}
+import org.apache.spark.sql.catalyst.util.DateTimeConstants.NANOS_PER_MILLIS
+import org.apache.spark.sql.kafka010.KafkaExceptions
 import org.apache.spark.sql.kafka010.KafkaSourceProvider._
 import org.apache.spark.sql.kafka010.consumer.KafkaDataConsumer.{AvailableOffsetRange, UNKNOWN_OFFSET}
 import org.apache.spark.util.{ShutdownHookManager, UninterruptibleThread}
@@ -59,6 +62,13 @@ private[kafka010] class InternalKafkaConsumer(
   // Exposed for testing
   private[consumer] var kafkaParamsWithSecurity: ju.Map[String, Object] = _
   private val consumer = createConsumer()
+
+  def poll(pollTimeoutMs: Long): ju.List[ConsumerRecord[Array[Byte], Array[Byte]]] = {
+    val p = consumer.poll(Duration.ofMillis(pollTimeoutMs))
+    val r = p.records(topicPartition)
+    logDebug(s"Polled $groupId ${p.partitions()}  ${r.size}")
+    r
+  }
 
   /**
    * Poll messages from Kafka starting from `offset` and returns a pair of "list of consumer record"
@@ -128,7 +138,7 @@ private[kafka010] class InternalKafkaConsumer(
     c
   }
 
-  private def seek(offset: Long): Unit = {
+  def seek(offset: Long): Unit = {
     logDebug(s"Seeking to $groupId $topicPartition $offset")
     consumer.seek(topicPartition, offset)
   }
@@ -226,6 +236,19 @@ private[consumer] case class FetchedRecord(
 }
 
 /**
+ * This class keeps returning the next records. If no new record is available, it will keep
+ * polling until timeout. It is used by KafkaBatchPartitionReader.nextWithTimeout(), to reduce
+ * seeking overhead in real time mode.
+ */
+private[sql] trait KafkaDataConsumerIterator {
+  /**
+   * Return the next record
+   * @return None if no new record is available after `timeoutMs`.
+   */
+  def nextWithTimeout(timeoutMs: Long): Option[ConsumerRecord[Array[Byte], Array[Byte]]]
+}
+
+/**
  * This class helps caller to read from Kafka leveraging consumer pool as well as fetched data pool.
  * This class throws error when data loss is detected while reading from Kafka.
  *
@@ -268,6 +291,82 @@ private[kafka010] class KafkaDataConsumer(
   private var totalRecordsRead: Long = 0
   // Starting timestamp when the consumer is created.
   private var startTimestampNano: Long = System.nanoTime()
+
+  /**
+   * Get an iterator that can return the next entry. It is used exclusively for real-time
+   * mode.
+   *
+   * It is called by KafkaBatchPartitionReader.nextWithTimeout(). Unlike get(), there is no
+   * out-of-bound check in this function. Since there is no endOffset given, we assume anything
+   * record is valid to return as long as it is at or after `offset`.
+   *
+   * @param startOffset, the starting positions to read from, inclusive.
+   */
+  def getIterator(startOffset: Long): KafkaDataConsumerIterator = {
+    new KafkaDataConsumerIterator {
+      private var fetchedRecordList
+          : Option[ju.ListIterator[ConsumerRecord[Array[Byte], Array[Byte]]]] = None
+      private val consumer = getOrRetrieveConsumer()
+      private var firstRecord = true
+      private var _currentOffset: Long = startOffset - 1
+
+      private def fetchedRecordListHasNext(): Boolean = {
+        fetchedRecordList.map(_.hasNext).getOrElse(false)
+      }
+
+      override def nextWithTimeout(
+          timeoutMs: Long): Option[ConsumerRecord[Array[Byte], Array[Byte]]] = {
+        var timeLeftMs = timeoutMs
+
+        def timeAndDeductFromTimeLeftMs[T](body: => T): Unit = {
+          // To reduce timing the same operator twice, we reuse the timing results for
+          // totalTimeReadNanos and for timeoutMs.
+          val prevTime = totalTimeReadNanos
+          timeNanos {
+            body
+          }
+          timeLeftMs -= (totalTimeReadNanos - prevTime) / 1000000
+        }
+
+        if (firstRecord) {
+          timeAndDeductFromTimeLeftMs {
+            consumer.seek(startOffset)
+            firstRecord = false
+          }
+        }
+        while (!fetchedRecordListHasNext() && timeLeftMs > 0) {
+          timeAndDeductFromTimeLeftMs {
+            try {
+              val records = consumer.poll(timeLeftMs)
+              numPolls += 1
+              if (!records.isEmpty) {
+                numRecordsPolled += records.size
+                fetchedRecordList = Some(records.listIterator)
+              }
+            } catch {
+              case ex: OffsetOutOfRangeException =>
+                if (_currentOffset != -1) {
+                  throw ex
+                } else {
+                  Thread.sleep(10) // retry until the source partition is populated
+                  assert(startOffset == 0)
+                  consumer.seek(startOffset)
+                }
+            }
+          }
+        }
+        if (fetchedRecordListHasNext()) {
+          totalRecordsRead += 1
+          val nextRecord = fetchedRecordList.get.next()
+          assert(nextRecord.offset > _currentOffset, "Kafka offset should be incremental.")
+          _currentOffset = nextRecord.offset
+          Some(nextRecord)
+        } else {
+          None
+        }
+      }
+    }
+  }
 
   /**
    * Get the record for the given offset if available.
@@ -340,8 +439,11 @@ private[kafka010] class KafkaDataConsumer(
           releaseConsumer()
           fetchedData.reset()
 
-          reportDataLoss(topicPartition, groupId, failOnDataLoss,
-            s"Cannot fetch offset $toFetchOffset", e)
+          if (failOnDataLoss) {
+            throwOnDataLoss(toFetchOffset, untilOffset, topicPartition, groupId, e)
+          } else {
+            logOnDataLoss(topicPartition, groupId, s"Cannot fetch offset $toFetchOffset", e)
+          }
 
           val oldToFetchOffsetd = toFetchOffset
           toFetchOffset = getEarliestAvailableOffsetBetween(consumer, toFetchOffset, untilOffset)
@@ -386,10 +488,22 @@ private[kafka010] class KafkaDataConsumer(
       .getOrElse("")
     val walTime = System.nanoTime() - startTimestampNano
 
-    logInfo(
-      s"From Kafka $kafkaMeta read $totalRecordsRead records through $numPolls polls (polled " +
-      s" out $numRecordsPolled records), taking $totalTimeReadNanos nanos, during time span of " +
-      s"$walTime nanos."
+    // Get task context information for correlation with executor logs
+    val taskCtx = TaskContext.get()
+    val taskContextInfo = if (taskCtx != null) {
+      log" for taskId=${MDC(TASK_ATTEMPT_ID, taskCtx.taskAttemptId())} " +
+        log"partitionId=${MDC(PARTITION_ID, taskCtx.partitionId())}."
+    } else {
+      log"."
+    }
+
+    logInfo(log"From Kafka ${MDC(CONSUMER, kafkaMeta)} read " +
+      log"${MDC(NUM_RECORDS_READ, totalRecordsRead)} records through " +
+      log"${MDC(NUM_KAFKA_PULLS, numPolls)} polls " +
+      log"(polled out ${MDC(NUM_KAFKA_RECORDS_PULLED, numRecordsPolled)} records), " +
+      log"taking ${MDC(TOTAL_TIME_READ, totalTimeReadNanos / NANOS_PER_MILLIS.toDouble)} ms, " +
+      log"during time span of ${MDC(TIME, walTime / NANOS_PER_MILLIS.toDouble)} ms" +
+      taskContextInfo
     )
 
     releaseConsumer()
@@ -422,7 +536,8 @@ private[kafka010] class KafkaDataConsumer(
     val range = timeNanos {
       consumer.getAvailableOffsetRange()
     }
-    logWarning(s"Some data may be lost. Recovering from the earliest offset: ${range.earliest}")
+    logWarning(log"Some data may be lost. Recovering from the earliest offset: " +
+      log"${MDC(OFFSET, range.earliest)}")
 
     val topicPartition = consumer.topicPartition
     val groupId = consumer.groupId
@@ -440,11 +555,12 @@ private[kafka010] class KafkaDataConsumer(
       //      |          |              |                |
       //   offset   untilOffset   earliestOffset   latestOffset
       val warningMessage =
-      s"""
-         |The current available offset range is $range.
-         | Offset $offset is out of range, and records in [$offset, $untilOffset) will be
-         | skipped ${additionalMessage(topicPartition, groupId, failOnDataLoss = false)}
-        """.stripMargin
+      log"""
+         |The current available offset range is ${MDC(RANGE, range)}.
+         | Offset ${MDC(OFFSET, offset)} is out of range, and records in
+         | [${MDC(OFFSET, offset)}, ${MDC(UNTIL_OFFSET, untilOffset)}] will be
+         | skipped""".stripMargin +
+        additionalWarningMessage(topicPartition, groupId)
       logWarning(warningMessage)
       UNKNOWN_OFFSET
     } else if (offset >= range.earliest) {
@@ -456,8 +572,8 @@ private[kafka010] class KafkaDataConsumer(
       // This will happen when a topic is deleted and recreated, and new data are pushed very fast,
       // then we will see `offset` disappears first then appears again. Although the parameters
       // are same, the state in Kafka cluster is changed, so the outer loop won't be endless.
-      logWarning(s"Found a disappeared offset $offset. Some data may be lost " +
-        s"${additionalMessage(topicPartition, groupId, failOnDataLoss = false)}")
+      logWarning(log"Found a disappeared offset ${MDC(OFFSET, offset)}. Some data may be lost " +
+        additionalWarningMessage(topicPartition, groupId))
       offset
     } else {
       // ------------------------------------------------------------------------------
@@ -466,10 +582,11 @@ private[kafka010] class KafkaDataConsumer(
       //   offset   earliestOffset   min(untilOffset,latestOffset)   max(untilOffset, latestOffset)
       val warningMessage =
       s"""
-         |The current available offset range is $range.
-         | Offset ${offset} is out of range, and records in [$offset, ${range.earliest}) will be
-         | skipped ${additionalMessage(topicPartition, groupId, failOnDataLoss = false)}
-        """.stripMargin
+         |The current available offset range is ${MDC(RANGE, range)}.
+         | Offset ${MDC(OFFSET, offset)} is out of range, and records in
+         | [${MDC(OFFSET, offset)}, ${MDC(UNTIL_OFFSET, range.earliest)}] will be
+         | skipped""".stripMargin +
+        additionalWarningMessage(topicPartition, groupId)
       logWarning(warningMessage)
       range.earliest
     }
@@ -535,18 +652,17 @@ private[kafka010] class KafkaDataConsumer(
         }
         // This may happen when some records aged out but their offsets already got verified
         if (failOnDataLoss) {
-          reportDataLoss(consumer.topicPartition, consumer.groupId, failOnDataLoss = true,
-            s"Cannot fetch records in [$offset, ${record.offset})")
+          throwOnDataLoss(offset, record.offset, consumer.topicPartition, consumer.groupId)
           // Never happen as "reportDataLoss" will throw an exception
           throw new IllegalStateException(
             "reportDataLoss didn't throw an exception when 'failOnDataLoss' is true")
         } else if (record.offset >= untilOffset) {
-          reportDataLoss(consumer.topicPartition, consumer.groupId, failOnDataLoss = false,
+          logOnDataLoss(consumer.topicPartition, consumer.groupId,
             s"Skip missing records in [$offset, $untilOffset)")
           // Set `nextOffsetToFetch` to `untilOffset` to finish the current batch.
           fetchedRecord.withRecord(null, untilOffset)
         } else {
-          reportDataLoss(consumer.topicPartition, consumer.groupId, failOnDataLoss = false,
+          logOnDataLoss(consumer.topicPartition, consumer.groupId,
             s"Skip missing records in [$offset, ${record.offset})")
           fetchedRecord.withRecord(record, fetchedData.nextOffsetInFetchedData)
         }
@@ -584,7 +700,7 @@ private[kafka010] class KafkaDataConsumer(
   }
 
   private[kafka010] def getOrRetrieveConsumer(): InternalKafkaConsumer = {
-    if (!_consumer.isDefined) {
+    if (_consumer.isEmpty) {
       retrieveConsumer()
     }
     require(_consumer.isDefined, "Consumer must be defined")
@@ -624,31 +740,49 @@ private[kafka010] class KafkaDataConsumer(
   /**
    * Return an addition message including useful message and instruction.
    */
-  private def additionalMessage(
+  private def additionalWarningMessage(
       topicPartition: TopicPartition,
-      groupId: String,
-      failOnDataLoss: Boolean): String = {
-    if (failOnDataLoss) {
-      s"(GroupId: $groupId, TopicPartition: $topicPartition). " +
-        s"$INSTRUCTION_FOR_FAIL_ON_DATA_LOSS_TRUE"
-    } else {
-      s"(GroupId: $groupId, TopicPartition: $topicPartition). " +
-        s"$INSTRUCTION_FOR_FAIL_ON_DATA_LOSS_FALSE"
-    }
+      groupId: String): MessageWithContext = {
+    log"(GroupId: ${MDC(GROUP_ID, groupId)}, " +
+      log"TopicPartition: ${MDC(TOPIC_PARTITION, topicPartition)}). " +
+      log"${MDC(TIP, INSTRUCTION_FOR_FAIL_ON_DATA_LOSS_FALSE)}"
   }
 
   /**
-   * Throw an exception or log a warning as per `failOnDataLoss`.
+   * Throw an exception when data loss is detected.
    */
-  private def reportDataLoss(
+  private def throwOnDataLoss(
+      startOffset: Long,
+      endOffset: Long,
       topicPartition: TopicPartition,
       groupId: String,
-      failOnDataLoss: Boolean,
+      cause: Throwable = null): Unit = {
+    dataLoss += 1
+    throw KafkaExceptions.couldNotReadOffsetRange(
+      startOffset,
+      endOffset,
+      topicPartition,
+      groupId,
+      cause)
+  }
+
+  /**
+   * Log a warning when data loss is detected.
+   */
+  private def logOnDataLoss(
+      topicPartition: TopicPartition,
+      groupId: String,
       message: String,
       cause: Throwable = null): Unit = {
-    val finalMessage = s"$message ${additionalMessage(topicPartition, groupId, failOnDataLoss)}"
+    val finalMessage = log"${MDC(ERROR, message)}" +
+      additionalWarningMessage(topicPartition, groupId)
+
     dataLoss += 1
-    reportDataLoss0(failOnDataLoss, finalMessage, cause)
+    if (cause != null) {
+      logWarning(finalMessage, cause)
+    } else {
+      logWarning(finalMessage)
+    }
   }
 
   private def runUninterruptiblyIfPossible[T](body: => T): T = Thread.currentThread match {
@@ -715,23 +849,7 @@ private[kafka010] object KafkaDataConsumer extends Logging {
     new KafkaDataConsumer(topicPartition, kafkaParams, consumerPool, fetchedDataPool)
   }
 
-  private def reportDataLoss0(
-      failOnDataLoss: Boolean,
-      finalMessage: String,
-      cause: Throwable = null): Unit = {
-    if (failOnDataLoss) {
-      if (cause != null) {
-        throw new IllegalStateException(finalMessage, cause)
-      } else {
-        throw new IllegalStateException(finalMessage)
-      }
-    } else {
-      if (cause != null) {
-        logWarning(finalMessage, cause)
-      } else {
-        logWarning(finalMessage)
-      }
-    }
+  private[kafka010] def getActiveSizeInConsumerPool(groupIdPrefix: String): Int = {
+    consumerPool.numActiveInGroupIdPrefix(groupIdPrefix)
   }
-
 }

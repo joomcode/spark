@@ -17,25 +17,37 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions.{Attribute, LeafExpression, Unevaluable}
 import org.apache.spark.sql.catalyst.plans.logical.{LeafNode, Statistics}
-import org.apache.spark.sql.catalyst.trees.TreePattern.{TreePattern, UNRESOLVED_FUNC}
+import org.apache.spark.sql.catalyst.trees.TreePattern.{TreePattern, UNRESOLVED_FUNC, UNRESOLVED_PROCEDURE}
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.catalyst.util.CharVarcharUtils
-import org.apache.spark.sql.connector.catalog.{CatalogPlugin, FunctionCatalog, Identifier, Table, TableCatalog}
+import org.apache.spark.sql.connector.catalog.{CatalogPlugin, FunctionCatalog, Identifier, ProcedureCatalog, Table, TableCatalog}
 import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
 import org.apache.spark.sql.connector.catalog.TableChange.ColumnPosition
 import org.apache.spark.sql.connector.catalog.functions.UnboundFunction
-import org.apache.spark.sql.types.{DataType, StructField, StructType}
+import org.apache.spark.sql.connector.catalog.procedures.Procedure
+import org.apache.spark.sql.types.{DataType, StructField}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Holds the name of a namespace that has yet to be looked up in a catalog. It will be resolved to
  * [[ResolvedNamespace]] during analysis.
  */
-case class UnresolvedNamespace(multipartIdentifier: Seq[String]) extends UnresolvedLeafNode
+case class UnresolvedNamespace(
+    multipartIdentifier: Seq[String],
+    fetchMetadata: Boolean = false) extends UnresolvedLeafNode
+
+/**
+ * A variant of [[UnresolvedNamespace]] that should be resolved to [[ResolvedNamespace]]
+ * representing the current namespace of the current catalog.
+ */
+case object CurrentNamespace extends UnresolvedLeafNode
 
 /**
  * Holds the name of a table that has yet to be looked up in a catalog. It will be resolved to
@@ -67,9 +79,9 @@ case class UnresolvedTableOrView(
     allowTempView: Boolean) extends UnresolvedLeafNode
 
 sealed trait PartitionSpec extends LeafExpression with Unevaluable {
-  override def dataType: DataType = throw new IllegalStateException(
+  override def dataType: DataType = throw SparkException.internalError(
     "PartitionSpec.dataType should not be called.")
-  override def nullable: Boolean = throw new IllegalStateException(
+  override def nullable: Boolean = throw SparkException.internalError(
     "PartitionSpec.nullable should not be called.")
 }
 
@@ -81,9 +93,9 @@ case class UnresolvedPartitionSpec(
 
 sealed trait FieldName extends LeafExpression with Unevaluable {
   def name: Seq[String]
-  override def dataType: DataType = throw new IllegalStateException(
+  override def dataType: DataType = throw SparkException.internalError(
     "FieldName.dataType should not be called.")
-  override def nullable: Boolean = throw new IllegalStateException(
+  override def nullable: Boolean = throw SparkException.internalError(
     "FieldName.nullable should not be called.")
 }
 
@@ -93,9 +105,9 @@ case class UnresolvedFieldName(name: Seq[String]) extends FieldName {
 
 sealed trait FieldPosition extends LeafExpression with Unevaluable {
   def position: ColumnPosition
-  override def dataType: DataType = throw new IllegalStateException(
+  override def dataType: DataType = throw SparkException.internalError(
     "FieldPosition.dataType should not be called.")
-  override def nullable: Boolean = throw new IllegalStateException(
+  override def nullable: Boolean = throw SparkException.internalError(
     "FieldPosition.nullable should not be called.")
 }
 
@@ -124,6 +136,12 @@ case class UnresolvedFunctionName(
 case class UnresolvedIdentifier(nameParts: Seq[String], allowTemp: Boolean = false)
   extends UnresolvedLeafNode
 
+/**
+ * A procedure identifier that should be resolved into [[ResolvedProcedure]].
+ */
+case class UnresolvedProcedure(nameParts: Seq[String]) extends UnresolvedLeafNode {
+  final override val nodePatterns: Seq[TreePattern] = Seq(UNRESOLVED_PROCEDURE)
+}
 
 /**
  * A resolved leaf node whose statistics has no meaning.
@@ -136,7 +154,10 @@ trait LeafNodeWithoutStats extends LeafNode {
 /**
  * A plan containing resolved namespace.
  */
-case class ResolvedNamespace(catalog: CatalogPlugin, namespace: Seq[String])
+case class ResolvedNamespace(
+    catalog: CatalogPlugin,
+    namespace: Seq[String],
+    metadata: Map[String, String] = Map.empty)
   extends LeafNodeWithoutStats {
   override def output: Seq[Attribute] = Nil
 }
@@ -152,7 +173,7 @@ case class ResolvedTable(
   extends LeafNodeWithoutStats {
   override def output: Seq[Attribute] = {
     val qualifier = catalog.name +: identifier.namespace :+ identifier.name
-    outputAttributes.map(_.withQualifier(qualifier))
+    outputAttributes.map(_.withQualifier(qualifier.toImmutableArraySeq))
   }
   def name: String = (catalog.name +: identifier.namespace() :+ identifier.name()).quoted
 }
@@ -178,6 +199,12 @@ case class ResolvedFieldName(path: Seq[String], field: StructField) extends Fiel
 
 case class ResolvedFieldPosition(position: ColumnPosition) extends FieldPosition
 
+case class ResolvedProcedure(
+    catalog: ProcedureCatalog,
+    ident: Identifier,
+    procedure: Procedure) extends LeafNodeWithoutStats {
+  override def output: Seq[Attribute] = Nil
+}
 
 /**
  * A plan containing resolved persistent views.
@@ -187,14 +214,14 @@ case class ResolvedFieldPosition(position: ColumnPosition) extends FieldPosition
 case class ResolvedPersistentView(
     catalog: CatalogPlugin,
     identifier: Identifier,
-    viewSchema: StructType) extends LeafNodeWithoutStats {
+    metadata: CatalogTable) extends LeafNodeWithoutStats {
   override def output: Seq[Attribute] = Nil
 }
 
 /**
  * A plan containing resolved (global) temp views.
  */
-case class ResolvedTempView(identifier: Identifier, viewSchema: StructType)
+case class ResolvedTempView(identifier: Identifier, metadata: CatalogTable)
   extends LeafNodeWithoutStats {
   override def output: Seq[Attribute] = Nil
 }
@@ -225,12 +252,25 @@ case class ResolvedNonPersistentFunc(
  */
 case class ResolvedIdentifier(
     catalog: CatalogPlugin,
-    identifier: Identifier) extends LeafNodeWithoutStats {
-  override def output: Seq[Attribute] = Nil
+    identifier: Identifier,
+    override val output: Seq[Attribute] = Nil) extends LeafNodeWithoutStats
+
+object ResolvedIdentifier {
+  def unapply(ri: ResolvedIdentifier): Option[(CatalogPlugin, Identifier)] = {
+    Some((ri.catalog, ri.identifier))
+  }
 }
 
 // A fake v2 catalog to hold temp views.
 object FakeSystemCatalog extends CatalogPlugin {
   override def initialize(name: String, options: CaseInsensitiveStringMap): Unit = {}
   override def name(): String = "system"
+}
+
+/**
+ * A fake v2 catalog to hold local variables for SQL scripting.
+ */
+object FakeLocalCatalog extends CatalogPlugin {
+  override def initialize(name: String, options: CaseInsensitiveStringMap): Unit = {}
+  override def name(): String = "local"
 }

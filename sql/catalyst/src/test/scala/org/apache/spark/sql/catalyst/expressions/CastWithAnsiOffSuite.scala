@@ -18,7 +18,7 @@
 package org.apache.spark.sql.catalyst.expressions
 
 import java.sql.{Date, Timestamp}
-import java.time.{Duration, Period}
+import java.time.{Duration, LocalTime, Period}
 import java.time.temporal.ChronoUnit
 
 import org.apache.spark.sql.Row
@@ -507,6 +507,8 @@ class CastWithAnsiOffSuite extends CastSuiteBase {
     checkEvaluation(cast(1.0 / 0.0, TimestampType), null)
     checkEvaluation(cast(Float.NaN, TimestampType), null)
     checkEvaluation(cast(1.0f / 0.0f, TimestampType), null)
+    checkEvaluation(cast(Literal(Long.MaxValue), TimestampType), Long.MaxValue)
+    checkEvaluation(cast(Literal(Long.MinValue), TimestampType), Long.MinValue)
   }
 
   test("cast a timestamp before the epoch 1970-01-01 00:00:00Z") {
@@ -514,9 +516,9 @@ class CastWithAnsiOffSuite extends CastSuiteBase {
       val negativeTs = Timestamp.valueOf("1900-05-05 18:34:56.1")
       assert(negativeTs.getTime < 0)
       val expectedSecs = Math.floorDiv(negativeTs.getTime, MILLIS_PER_SECOND)
-      checkEvaluation(cast(negativeTs, ByteType), expectedSecs.toByte)
-      checkEvaluation(cast(negativeTs, ShortType), expectedSecs.toShort)
-      checkEvaluation(cast(negativeTs, IntegerType), expectedSecs.toInt)
+      checkEvaluation(cast(negativeTs, ByteType), null)
+      checkEvaluation(cast(negativeTs, ShortType), null)
+      checkEvaluation(cast(negativeTs, IntegerType), null)
       checkEvaluation(cast(negativeTs, LongType), expectedSecs)
     }
   }
@@ -898,5 +900,34 @@ class CastWithAnsiOffSuite extends CastSuiteBase {
         checkExceptionInExpression[ArithmeticException](cast(v, toType),
           castOverflowErrMsg(toType))
     }
+  }
+
+  test("cast invalid string input to time") {
+    Seq("a", "123", "00:00:00ABC", "24:00:00").foreach { invalidInput =>
+      checkEvaluation(cast(invalidInput, TimeType()), null)
+    }
+  }
+
+  test("SPARK-52620: cast time to decimal with insufficient precision (ANSI off)") {
+    // Create a time that will overflow Decimal(2, 0): 23:59:59 = 86399 seconds.
+    val largeTime = Literal.create(LocalTime.of(23, 59, 59, 123456000), TimeType(6))
+    // Decimal(2, 0) cannot hold 86399.123456, so it should return null in non-ANSI mode.
+    checkEvaluation(cast(largeTime, DecimalType(2, 0)), null)
+  }
+
+  test("SPARK-52619: cast time to integral types with overflow with ansi off") {
+    // Create a time that will overflow Byte and Short: 23:59:59 = 86399 seconds
+    val largeTime6 = Literal.create(LocalTime.of(23, 59, 59, 123456000), TimeType(6))
+    val largeTime1 = Literal.create(LocalTime.of(23, 59, 59, 100000000), TimeType(1))
+
+    // Long and Int should work (86399 fits in both)
+    // Short and Byte should overflow and return null (non-ANSI mode)
+    // 86399 > Short.MaxValue (32767) and > Byte.MaxValue (127)
+    checkEvaluation(cast(largeTime6, LongType), 86399L)
+    checkEvaluation(cast(largeTime6, IntegerType), 86399)
+    checkEvaluation(cast(largeTime6, ShortType), null)
+    checkEvaluation(cast(largeTime6, ByteType), null)
+    checkEvaluation(cast(largeTime1, ShortType), null)
+    checkEvaluation(cast(largeTime1, ByteType), null)
   }
 }

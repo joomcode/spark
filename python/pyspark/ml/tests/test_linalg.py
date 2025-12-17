@@ -362,7 +362,10 @@ class VectorUDTTests(MLlibTestCase):
             Row(v2=unwrapped_vec(1, None, None, [1.0, 2.0, 3.0])),
             Row(v2=unwrapped_vec(0, 3, [1, 2], [1.0, 5.5])),
         ]
-        self.assertEquals(results, expected)
+        self.assertEqual(results, expected)
+
+    def test_hashable(self):
+        _ = hash(VectorUDT())
 
 
 class MatrixUDTTests(MLlibTestCase):
@@ -393,6 +396,9 @@ class MatrixUDTTests(MLlibTestCase):
                 self.assertTrue(m, self.sm1)
             else:
                 raise ValueError("Expected a matrix but got type %r" % type(m))
+
+    def test_hashable(self):
+        _ = hash(MatrixUDT())
 
 
 if __name__ == "__main__":

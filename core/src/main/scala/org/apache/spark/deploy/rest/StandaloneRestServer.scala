@@ -18,15 +18,17 @@
 package org.apache.spark.deploy.rest
 
 import java.io.File
-import javax.servlet.http.HttpServletResponse
+
+import jakarta.servlet.http.HttpServletResponse
 
 import org.apache.spark.{SPARK_VERSION => sparkVersion, SparkConf}
-import org.apache.spark.deploy.{Command, DeployMessages, DriverDescription}
+import org.apache.spark.deploy.{Command, DeployMessages, DriverDescription, SparkSubmit}
 import org.apache.spark.deploy.ClientArguments._
 import org.apache.spark.internal.config
 import org.apache.spark.launcher.{JavaModuleOptions, SparkLauncher}
 import org.apache.spark.resource.ResourceUtils
 import org.apache.spark.rpc.RpcEndpointRef
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 /**
@@ -63,8 +65,14 @@ private[deploy] class StandaloneRestServer(
     new StandaloneSubmitRequestServlet(masterEndpoint, masterUrl, masterConf)
   protected override val killRequestServlet =
     new StandaloneKillRequestServlet(masterEndpoint, masterConf)
+  protected override val killAllRequestServlet =
+    new StandaloneKillAllRequestServlet(masterEndpoint, masterConf)
   protected override val statusRequestServlet =
     new StandaloneStatusRequestServlet(masterEndpoint, masterConf)
+  protected override val clearRequestServlet =
+    new StandaloneClearRequestServlet(masterEndpoint, masterConf)
+  protected override val readyzRequestServlet =
+    new StandaloneReadyzRequestServlet(masterEndpoint, masterConf)
 }
 
 /**
@@ -80,6 +88,23 @@ private[rest] class StandaloneKillRequestServlet(masterEndpoint: RpcEndpointRef,
     k.serverSparkVersion = sparkVersion
     k.message = response.message
     k.submissionId = submissionId
+    k.success = response.success
+    k
+  }
+}
+
+/**
+ * A servlet for handling killAll requests passed to the [[StandaloneRestServer]].
+ */
+private[rest] class StandaloneKillAllRequestServlet(masterEndpoint: RpcEndpointRef, conf: SparkConf)
+  extends KillAllRequestServlet {
+
+  protected def handleKillAll() : KillAllSubmissionResponse = {
+    val response = masterEndpoint.askSync[DeployMessages.KillAllDriversResponse](
+      DeployMessages.RequestKillAllDrivers)
+    val k = new KillAllSubmissionResponse
+    k.serverSparkVersion = sparkVersion
+    k.message = response.message
     k.success = response.success
     k
   }
@@ -108,6 +133,39 @@ private[rest] class StandaloneStatusRequestServlet(masterEndpoint: RpcEndpointRe
 }
 
 /**
+ * A servlet for handling clear requests passed to the [[StandaloneRestServer]].
+ */
+private[rest] class StandaloneClearRequestServlet(masterEndpoint: RpcEndpointRef, conf: SparkConf)
+  extends ClearRequestServlet {
+
+  protected def handleClear(): ClearResponse = {
+    val response = masterEndpoint.askSync[Boolean](
+      DeployMessages.RequestClearCompletedDriversAndApps)
+    val c = new ClearResponse
+    c.serverSparkVersion = sparkVersion
+    c.message = ""
+    c.success = response
+    c
+  }
+}
+
+/**
+ * A servlet for handling readyz requests passed to the [[StandaloneRestServer]].
+ */
+private[rest] class StandaloneReadyzRequestServlet(masterEndpoint: RpcEndpointRef, conf: SparkConf)
+  extends ReadyzRequestServlet {
+
+  protected def handleReadyz(): ReadyzResponse = {
+    val success = masterEndpoint.askSync[Boolean](DeployMessages.RequestReadyz)
+    val r = new ReadyzResponse
+    r.serverSparkVersion = sparkVersion
+    r.message = ""
+    r.success = success
+    r
+  }
+}
+
+/**
  * A servlet for handling submit requests passed to the [[StandaloneRestServer]].
  */
 private[rest] class StandaloneSubmitRequestServlet(
@@ -115,6 +173,11 @@ private[rest] class StandaloneSubmitRequestServlet(
     masterUrl: String,
     conf: SparkConf)
   extends SubmitRequestServlet {
+
+  private def replacePlaceHolder(variable: String) = variable match {
+    case s"{{$name}}" if System.getenv(name) != null => System.getenv(name)
+    case _ => variable
+  }
 
   /**
    * Build a driver description from the fields specified in the submit request.
@@ -138,6 +201,7 @@ private[rest] class StandaloneSubmitRequestServlet(
 
     // Optional fields
     val sparkProperties = request.sparkProperties
+      .map(x => (x._1, replacePlaceHolder(x._2)))
     val driverMemory = sparkProperties.get(config.DRIVER_MEMORY.key)
     val driverCores = sparkProperties.get(config.DRIVER_CORES.key)
     val driverDefaultJavaOptions = sparkProperties.get(SparkLauncher.DRIVER_DEFAULT_JAVA_OPTIONS)
@@ -154,10 +218,13 @@ private[rest] class StandaloneSubmitRequestServlet(
     val (_, masterPort) = Utils.extractHostPortFromSparkUrl(masterUrl)
     val updatedMasters = masters.map(
       _.replace(s":$masterRestPort", s":$masterPort")).getOrElse(masterUrl)
-    val appArgs = request.appArgs
+    val appArgs = Option(request.appArgs).getOrElse(Array[String]())
     // Filter SPARK_LOCAL_(IP|HOSTNAME) environment variables from being set on the remote system.
+    // In addition, the placeholders are replaced into the values of environment variables.
     val environmentVariables =
-      request.environmentVariables.filterNot(x => x._1.matches("SPARK_LOCAL_(IP|HOSTNAME)"))
+      Option(request.environmentVariables).getOrElse(Map.empty[String, String])
+        .filterNot(x => x._1.matches("SPARK_LOCAL_(IP|HOSTNAME)"))
+        .map(x => (x._1, replacePlaceHolder(x._2)))
 
     // Construct driver description
     val conf = new SparkConf(false)
@@ -169,11 +236,18 @@ private[rest] class StandaloneSubmitRequestServlet(
       .getOrElse(Seq.empty)
     val extraJavaOpts = driverExtraJavaOptions.map(Utils.splitCommandString).getOrElse(Seq.empty)
     val sparkJavaOpts = Utils.sparkJavaOpts(conf)
-    val javaModuleOptions = JavaModuleOptions.defaultModuleOptionArray().toSeq
+    val javaModuleOptions = JavaModuleOptions.defaultModuleOptionArray().toImmutableArraySeq
     val javaOpts = javaModuleOptions ++ sparkJavaOpts ++ defaultJavaOpts ++ extraJavaOpts
+    val sparkSubmitOpts = if (mainClass.equals(classOf[SparkSubmit].getName)) {
+      sparkProperties.get("spark.app.name")
+        .map { v => Seq("-c", s"spark.app.name=$v") }
+        .getOrElse(Seq.empty[String])
+    } else {
+      Seq.empty[String]
+    }
     val command = new Command(
       "org.apache.spark.deploy.worker.DriverWrapper",
-      Seq("{{WORKER_URL}}", "{{USER_JAR}}", mainClass) ++ appArgs, // args to the DriverWrapper
+      Seq("{{WORKER_URL}}", "{{USER_JAR}}", mainClass) ++ sparkSubmitOpts ++ appArgs,
       environmentVariables, extraClassPath, extraLibraryPath, javaOpts)
     val actualDriverMemory = driverMemory.map(Utils.memoryStringToMb).getOrElse(DEFAULT_MEMORY)
     val actualDriverCores = driverCores.map(_.toInt).getOrElse(DEFAULT_CORES)

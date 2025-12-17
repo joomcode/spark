@@ -17,10 +17,10 @@
 
 package org.apache.spark.ui.env
 
-import javax.servlet.http.HttpServletRequest
-
 import scala.collection.mutable.StringBuilder
 import scala.xml.Node
+
+import jakarta.servlet.http.HttpServletRequest
 
 import org.apache.spark.SparkConf
 import org.apache.spark.resource.{ExecutorResourceRequest, TaskResourceRequest}
@@ -169,6 +169,7 @@ private[ui] class EnvironmentPage(
         <div class="aggregated-classpathEntries collapsible-table collapsed">
           {classpathEntriesTable}
         </div>
+        <script src={UIUtils.prependBaseUri(request, "/static/environmentpage.js")}></script>
       </span>
 
     UIUtils.headerSparkPage(request, "Environment", content, parent)

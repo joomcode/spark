@@ -25,6 +25,7 @@ import org.apache.spark.paths.SparkPath
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * A file status augmented with optional metadata, which tasks and file readers can use however they
@@ -33,8 +34,7 @@ import org.apache.spark.sql.types.StructType
  */
 case class FileStatusWithMetadata(fileStatus: FileStatus, metadata: Map[String, Any] = Map.empty) {
   // Wrapper methods to improve source compatibility in code that still expects a [[FileStatus]].
-  // NOTE: getPath() is very expensive, so we only want to call it once (if accessed at all).
-  lazy val getPath: Path = fileStatus.getPath
+  def getPath: Path = fileStatus.getPath
   def getLen: Long = fileStatus.getLen
   def getModificationTime: Long = fileStatus.getModificationTime
   def isDirectory: Boolean = fileStatus.isDirectory
@@ -101,7 +101,7 @@ class FilePruningRunner(filters: Seq[Expression]) {
 object PartitionDirectory {
   // For backward compat with code that does not know about extra file metadata
   def apply(values: InternalRow, files: Array[FileStatus]): PartitionDirectory =
-    PartitionDirectory(values, files.map(FileStatusWithMetadata(_)))
+    PartitionDirectory(values, files.map(FileStatusWithMetadata(_)).toImmutableArraySeq)
 }
 
 /**

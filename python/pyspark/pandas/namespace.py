@@ -36,6 +36,7 @@ from collections.abc import Iterable
 from datetime import tzinfo
 from functools import reduce
 from io import BytesIO
+import pickle
 import json
 import warnings
 
@@ -65,6 +66,7 @@ from pyspark.sql.types import (
     StringType,
     DateType,
     StructType,
+    StructField,
     DataType,
 )
 from pyspark.sql.dataframe import DataFrame as PySparkDataFrame
@@ -74,6 +76,7 @@ from pyspark.pandas.base import IndexOpsMixin
 from pyspark.pandas.utils import (
     align_diff_frames,
     default_session,
+    is_ansi_mode_enabled,
     is_name_like_tuple,
     is_name_like_value,
     name_like_string,
@@ -82,20 +85,20 @@ from pyspark.pandas.utils import (
     validate_axis,
     log_advice,
 )
+from pyspark.pandas.config import get_option
 from pyspark.pandas.frame import DataFrame, _reduce_spark_multi
 from pyspark.pandas.internal import (
     InternalFrame,
+    InternalField,
     DEFAULT_SERIES_NAME,
     HIDDEN_COLUMNS,
     SPARK_INDEX_NAME_FORMAT,
+    NATURAL_ORDER_COLUMN_NAME,
 )
 from pyspark.pandas.series import Series, first_series
 from pyspark.pandas.spark.utils import as_nullable_spark_type, force_decimal_precision_scale
 from pyspark.pandas.indexes import Index, DatetimeIndex, TimedeltaIndex
 from pyspark.pandas.indexes.multi import MultiIndex
-
-# For Supporting Spark Connect
-from pyspark.sql.utils import get_column_class
 
 __all__ = [
     "from_pandas",
@@ -128,6 +131,7 @@ __all__ = [
     "to_numeric",
     "broadcast",
     "read_orc",
+    "json_normalize",
 ]
 
 
@@ -139,14 +143,44 @@ def from_pandas(pobj: Union[pd.DataFrame, pd.Series, pd.Index]) -> Union[Series,
 
     Parameters
     ----------
-    pobj : pandas.DataFrame or pandas.Series
-        pandas DataFrame or Series to read.
+    pobj : pandas.DataFrame, pandas.Series or pandas.Index
+        pandas DataFrame, Series or Index to read.
 
     Returns
     -------
-    Series or DataFrame
-        If a pandas Series is passed in, this function returns a pandas-on-Spark Series.
+    DataFrame, Series or Index
         If a pandas DataFrame is passed in, this function returns a pandas-on-Spark DataFrame.
+        If a pandas Series is passed in, this function returns a pandas-on-Spark Series.
+        If a pandas Index is passed in, this function returns a pandas-on-Spark Index.
+
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> import pyspark.pandas as ps
+
+    Convert a pandas DataFrame:
+    >>> pdf = pd.DataFrame({'a': [1, 2, 3]})
+    >>> psdf = ps.from_pandas(pdf)
+    >>> psdf
+       a
+    0  1
+    1  2
+    2  3
+
+    Convert a pandas Series:
+    >>> pser = pd.Series([1, 2, 3])
+    >>> psser = ps.from_pandas(pser)
+    >>> psser
+    0    1
+    1    2
+    2    3
+    dtype: int64
+
+    Convert a pandas Index:
+    >>> pidx = pd.Index([1, 2, 3])
+    >>> psidx = ps.from_pandas(pidx)
+    >>> psidx
+    Index([1, 2, 3], dtype='int64')
     """
     if isinstance(pobj, pd.Series):
         return Series(pobj)
@@ -222,7 +256,6 @@ def read_csv(
     names: Optional[Union[str, List[str]]] = None,
     index_col: Optional[Union[str, List[str]]] = None,
     usecols: Optional[Union[List[int], List[str], Callable[[str], bool]]] = None,
-    mangle_dupe_cols: bool = True,
     dtype: Optional[Union[str, Dtype, Dict[str, Union[str, Dtype]]]] = None,
     nrows: Optional[int] = None,
     parse_dates: bool = False,
@@ -261,14 +294,6 @@ def read_csv(
         from the document header row(s).
         If callable, the callable function will be evaluated against the column names,
         returning names where the callable function evaluates to `True`.
-    mangle_dupe_cols : bool, default True
-        Duplicate columns will be specified as 'X0', 'X1', ... 'XN', rather
-        than 'X' ... 'X'. Passing in False will cause data to be overwritten if
-        there are duplicate names in the columns.
-        Currently only `True` is allowed.
-
-        .. deprecated:: 3.4.0
-
     dtype : Type name or dict of column -> type, default None
         Data type for data or columns. E.g. {‘a’: np.float64, ‘b’: np.int32} Use str or object
         together with suitable na_values settings to preserve and not interpret dtype.
@@ -310,8 +335,6 @@ def read_csv(
     if "options" in options and isinstance(options.get("options"), dict) and len(options) == 1:
         options = options.get("options")
 
-    if mangle_dupe_cols is not True:
-        raise ValueError("mangle_dupe_cols can only be `True`: %s" % mangle_dupe_cols)
     if parse_dates is not False:
         raise ValueError("parse_dates can only be `False`: %s" % parse_dates)
 
@@ -917,8 +940,6 @@ def read_excel(
     thousands: Optional[str] = None,
     comment: Optional[str] = None,
     skipfooter: int = 0,
-    convert_float: bool = True,
-    mangle_dupe_cols: bool = True,
     **kwds: Any,
 ) -> Union[DataFrame, Series, Dict[str, Union[DataFrame, Series]]]:
     """
@@ -1041,20 +1062,6 @@ def read_excel(
         comment string and the end of the current line is ignored.
     skipfooter : int, default 0
         Rows at the end to skip (0-indexed).
-    convert_float : bool, default True
-        Convert integral floats to int (i.e., 1.0 --> 1). If False, all numeric
-        data will be read in as floats: Excel stores all numbers as floats
-        internally.
-
-        .. deprecated:: 3.4.0
-
-    mangle_dupe_cols : bool, default True
-        Duplicate columns will be specified as 'X', 'X.1', ...'X.N', rather than
-        'X'...'X'. Passing in False will cause data to be overwritten if there
-        are duplicate names in the columns.
-
-        .. deprecated:: 3.4.0
-
     **kwds : optional
         Optional keyword arguments can be passed to ``TextFileReader``.
 
@@ -1126,7 +1133,9 @@ def read_excel(
     """
 
     def pd_read_excel(
-        io_or_bin: Any, sn: Union[str, int, List[Union[str, int]], None]
+        io_or_bin: Any,
+        sn: Union[str, int, List[Union[str, int]], None],
+        nr: Optional[int] = None,
     ) -> pd.DataFrame:
         return pd.read_excel(
             io=BytesIO(io_or_bin) if isinstance(io_or_bin, (bytes, bytearray)) else io_or_bin,
@@ -1141,7 +1150,7 @@ def read_excel(
             true_values=true_values,
             false_values=false_values,
             skiprows=skiprows,
-            nrows=nrows,
+            nrows=nr,
             na_values=na_values,
             keep_default_na=keep_default_na,
             verbose=verbose,
@@ -1150,23 +1159,12 @@ def read_excel(
             thousands=thousands,
             comment=comment,
             skipfooter=skipfooter,
-            convert_float=convert_float,
-            mangle_dupe_cols=mangle_dupe_cols,
             **kwds,
         )
 
-    if isinstance(io, str):
-        # 'binaryFile' format is available since Spark 3.0.0.
-        binaries = default_session().read.format("binaryFile").load(io).select("content").head(2)
-        io_or_bin = binaries[0][0]
-        single_file = len(binaries) == 1
-    else:
-        io_or_bin = io
-        single_file = True
-
-    pdf_or_psers = pd_read_excel(io_or_bin, sn=sheet_name)
-
-    if single_file:
+    if not isinstance(io, str):
+        # When io is not a path, always need to load all data to python side
+        pdf_or_psers = pd_read_excel(io, sn=sheet_name, nr=nrows)
         if isinstance(pdf_or_psers, dict):
             return {
                 sn: cast(Union[DataFrame, Series], from_pandas(pdf_or_pser))
@@ -1174,52 +1172,89 @@ def read_excel(
             }
         else:
             return cast(Union[DataFrame, Series], from_pandas(pdf_or_psers))
-    else:
 
-        def read_excel_on_spark(
-            pdf_or_pser: Union[pd.DataFrame, pd.Series],
-            sn: Union[str, int, List[Union[str, int]], None],
-        ) -> Union[DataFrame, Series]:
-            if isinstance(pdf_or_pser, pd.Series):
-                pdf = pdf_or_pser.to_frame()
-            else:
-                pdf = pdf_or_pser
+    spark = default_session()
 
-            psdf = cast(DataFrame, from_pandas(pdf))
-            return_schema = force_decimal_precision_scale(
-                as_nullable_spark_type(psdf._internal.spark_frame.drop(*HIDDEN_COLUMNS).schema)
-            )
+    # Collect the first #nr rows from the first file
+    nr = get_option("compute.max_rows", 1000)
+    if nrows is not None and nrows < nr:
+        nr = nrows
 
-            def output_func(pdf: pd.DataFrame) -> pd.DataFrame:
-                pdf = pd.concat([pd_read_excel(bin, sn=sn) for bin in pdf[pdf.columns[0]]])
+    def sample_data(pdf: pd.DataFrame) -> pd.DataFrame:
+        raw_data = BytesIO(pdf.content[0])
+        pdf_or_dict = pd_read_excel(raw_data, sn=sheet_name, nr=nr)
+        return pd.DataFrame({"sampled": [pickle.dumps(pdf_or_dict)]})
 
-                reset_index = pdf.reset_index()
-                for name, col in reset_index.items():
-                    dt = col.dtype
-                    if is_datetime64_dtype(dt) or isinstance(dt, pd.DatetimeTZDtype):
-                        continue
-                    reset_index[name] = col.replace({np.nan: None})
-                pdf = reset_index
+    # 'binaryFile' format is available since Spark 3.0.0.
+    sampled = (
+        spark.read.format("binaryFile")
+        .load(io)
+        .select("content")
+        .limit(1)  # Read at most 1 file
+        .mapInPandas(func=lambda iterator: map(sample_data, iterator), schema="sampled BINARY")
+        .head()
+    )
+    sampled = pickle.loads(sampled[0])
 
-                # Just positionally map the column names to given schema's.
-                return pdf.rename(columns=dict(zip(pdf.columns, return_schema.names)))
-
-            sdf = (
-                default_session()
-                .read.format("binaryFile")
-                .load(io)
-                .select("content")
-                .mapInPandas(lambda iterator: map(output_func, iterator), schema=return_schema)
-            )
-
-            return DataFrame(psdf._internal.with_new_sdf(sdf))
-
-        if isinstance(pdf_or_psers, dict):
-            return {
-                sn: read_excel_on_spark(pdf_or_pser, sn) for sn, pdf_or_pser in pdf_or_psers.items()
-            }
+    def read_excel_on_spark(
+        pdf_or_pser: Union[pd.DataFrame, pd.Series],
+        sn: Union[str, int, List[Union[str, int]], None],
+    ) -> Union[DataFrame, Series]:
+        if isinstance(pdf_or_pser, pd.Series):
+            pdf = pdf_or_pser.to_frame()
         else:
-            return read_excel_on_spark(pdf_or_psers, sheet_name)
+            pdf = pdf_or_pser
+
+        psdf = cast(DataFrame, from_pandas(pdf))
+
+        raw_schema = psdf._internal.spark_frame.drop(*HIDDEN_COLUMNS).schema
+        index_scol_names = psdf._internal.index_spark_column_names
+        nullable_fields = []
+        for field in raw_schema.fields:
+            if field.name in index_scol_names:
+                nullable_fields.append(field)
+            else:
+                nullable_fields.append(
+                    StructField(
+                        field.name,
+                        as_nullable_spark_type(field.dataType),
+                        nullable=True,
+                        metadata=field.metadata,
+                    )
+                )
+        nullable_schema = StructType(nullable_fields)
+        return_schema = force_decimal_precision_scale(nullable_schema)
+
+        return_data_fields: Optional[List[InternalField]] = None
+        if psdf._internal.data_fields is not None:
+            return_data_fields = [f.normalize_spark_type() for f in psdf._internal.data_fields]
+
+        def output_func(pdf: pd.DataFrame) -> pd.DataFrame:
+            pdf = pd.concat([pd_read_excel(bin, sn=sn, nr=nrows) for bin in pdf[pdf.columns[0]]])
+
+            reset_index = pdf.reset_index()
+            for name, col in reset_index.items():
+                dt = col.dtype
+                if is_datetime64_dtype(dt) or isinstance(dt, pd.DatetimeTZDtype):
+                    continue
+                reset_index[name] = col.replace({np.nan: None})
+            pdf = reset_index
+
+            # Just positionally map the column names to given schema's.
+            return pdf.rename(columns=dict(zip(pdf.columns, return_schema.names)))
+
+        sdf = (
+            spark.read.format("binaryFile")
+            .load(io)
+            .select("content")
+            .mapInPandas(lambda iterator: map(output_func, iterator), schema=return_schema)
+        )
+        return DataFrame(psdf._internal.with_new_sdf(sdf, data_fields=return_data_fields))
+
+    if isinstance(sampled, dict):
+        return {sn: read_excel_on_spark(pdf_or_pser, sn) for sn, pdf_or_pser in sampled.items()}
+    else:
+        return read_excel_on_spark(cast(Union[pd.DataFrame, pd.Series], sampled), sheet_name)
 
 
 def read_html(
@@ -1832,7 +1867,7 @@ def date_range(
 
     Changed the `freq` (frequency) to ``'M'`` (month end frequency).
 
-    >>> ps.date_range(start='1/1/2018', periods=5, freq='M')  # doctest: +SKIP
+    >>> ps.date_range(start='1/1/2018', periods=5, freq='ME')  # doctest: +SKIP
     DatetimeIndex(['2018-01-31', '2018-02-28', '2018-03-31', '2018-04-30',
                    '2018-05-31'],
                   dtype='datetime64[ns]', freq=None)
@@ -2285,10 +2320,10 @@ def get_dummies(
             values = values[1:]
 
         def column_name(v: Any) -> Name:
-            if prefix is None or cast(List[str], prefix)[i] == "":
+            if prefix is None or prefix[i] == "":  # type: ignore[index]
                 return v
             else:
-                return "{}{}{}".format(cast(List[str], prefix)[i], prefix_sep, v)
+                return "{}{}{}".format(prefix[i], prefix_sep, v)  # type: ignore[index]
 
         for value in values:
             remaining_columns.append(
@@ -2583,7 +2618,10 @@ def concat(
         if isinstance(obj, Series):
             num_series += 1
             series_names.add(obj.name)
-            new_objs.append(obj.to_frame(DEFAULT_SERIES_NAME))
+            if not ignore_index and not should_return_series:
+                new_objs.append(obj.to_frame())
+            else:
+                new_objs.append(obj.to_frame(DEFAULT_SERIES_NAME))
         else:
             assert isinstance(obj, DataFrame)
             new_objs.append(obj)
@@ -2841,7 +2879,7 @@ def notna(obj):
     --------
     Show which entries in a DataFrame are not NA.
 
-    >>> df = ps.DataFrame({'age': [5, 6, np.NaN],
+    >>> df = ps.DataFrame({'age': [5, 6, np.nan],
     ...                    'born': [pd.NaT, pd.Timestamp('1939-05-27'),
     ...                             pd.Timestamp('1940-04-25')],
     ...                    'name': ['Alfred', 'Batman', ''],
@@ -2860,7 +2898,7 @@ def notna(obj):
 
     Show which entries in a Series are not NA.
 
-    >>> ser = ps.Series([5, 6, np.NaN])
+    >>> ser = ps.Series([5, 6, np.nan])
     >>> ser
     0    5.0
     1    6.0
@@ -3424,8 +3462,7 @@ def merge_asof(
     else:
         on = None
 
-    Column = get_column_class()
-    if tolerance is not None and not isinstance(tolerance, Column):
+    if tolerance is not None and not isinstance(tolerance, PySparkColumn):
         tolerance = F.lit(tolerance)
 
     as_of_joined_table = left_table._joinAsOf(
@@ -3450,10 +3487,10 @@ def merge_asof(
     data_columns = []
     column_labels = []
 
-    def left_scol_for(label: Label) -> Column:  # type: ignore[valid-type]
+    def left_scol_for(label: Label) -> PySparkColumn:
         return scol_for(as_of_joined_table, left_internal.spark_column_name_for(label))
 
-    def right_scol_for(label: Label) -> Column:  # type: ignore[valid-type]
+    def right_scol_for(label: Label) -> PySparkColumn:
         return scol_for(as_of_joined_table, right_internal.spark_column_name_for(label))
 
     for label in left_internal.column_labels:
@@ -3467,7 +3504,7 @@ def merge_asof(
                 pass
             else:
                 col = col + left_suffix
-                scol = scol.alias(col)  # type: ignore[attr-defined]
+                scol = scol.alias(col)
                 label = tuple([str(label[0]) + left_suffix] + list(label[1:]))
         exprs.append(scol)
         data_columns.append(col)
@@ -3475,7 +3512,7 @@ def merge_asof(
     for label in right_internal.column_labels:
         # recover `right_prefix` here.
         col = right_internal.spark_column_name_for(label)[len(right_prefix) :]
-        scol = right_scol_for(label).alias(col)  # type: ignore[attr-defined]
+        scol = right_scol_for(label).alias(col)
         if label in duplicate_columns:
             spark_column_name = left_internal.spark_column_name_for(label)
             if spark_column_name in left_as_of_names + left_join_on_names and (
@@ -3484,7 +3521,7 @@ def merge_asof(
                 continue
             else:
                 col = col + right_suffix
-                scol = scol.alias(col)  # type: ignore[attr-defined]
+                scol = scol.alias(col)
                 label = tuple([str(label[0]) + right_suffix] + list(label[1:]))
         exprs.append(scol)
         data_columns.append(col)
@@ -3594,7 +3631,11 @@ def to_numeric(arg, errors="raise"):
     """
     if isinstance(arg, Series):
         if errors == "coerce":
-            return arg._with_new_scol(arg.spark.column.cast("float"))
+            spark_session = arg._internal.spark_frame.sparkSession
+            if is_ansi_mode_enabled(spark_session):
+                return arg._with_new_scol(arg.spark.column.try_cast("float"))
+            else:
+                return arg._with_new_scol(arg.spark.column.cast("float"))
         elif errors == "raise":
             scol = arg.spark.column
             scol_casted = scol.cast("float")
@@ -3717,6 +3758,82 @@ def read_orc(
     return psdf
 
 
+def json_normalize(
+    data: Union[Dict, List[Dict]],
+    sep: str = ".",
+) -> DataFrame:
+    """
+    Normalize semi-structured JSON data into a flat table.
+
+    .. versionadded:: 4.0.0
+
+    Parameters
+    ----------
+    data : dict or list of dicts
+        Unserialized JSON objects.
+    sep : str, default '.'
+        Nested records will generate names separated by sep.
+
+    Returns
+    -------
+    DataFrame
+
+    See Also
+    --------
+    DataFrame.to_json : Convert the pandas-on-Spark DataFrame to a JSON string.
+
+    Examples
+    --------
+    >>> data = [
+    ...     {"id": 1, "name": "Alice", "address": {"city": "NYC", "zipcode": "10001"}},
+    ...     {"id": 2, "name": "Bob", "address": {"city": "SF", "zipcode": "94105"}},
+    ... ]
+    >>> ps.json_normalize(data)
+       id   name address.city address.zipcode
+    0   1  Alice          NYC           10001
+    1   2    Bob           SF           94105
+    """
+    # Convert the input JSON data to a Pandas-on-Spark DataFrame.
+    psdf: DataFrame = ps.DataFrame(data)
+    internal = psdf._internal
+    sdf = internal.spark_frame
+
+    index_spark_column_names = internal.index_spark_column_names
+
+    def flatten_schema(schema: StructType, prefix: str = "") -> Tuple[List[str], List[str]]:
+        """
+        Recursively flattens a nested schema and returns a list of columns and aliases.
+        """
+        fields = []
+        aliases = []
+        for field in schema.fields:
+            field_name = field.name
+            if field_name not in index_spark_column_names + [NATURAL_ORDER_COLUMN_NAME]:
+                name = f"{prefix}.{field_name}" if prefix else field_name
+                alias = f"{prefix}{sep}{field_name}" if prefix else field_name
+                if isinstance(field.dataType, StructType):
+                    subfields, subaliases = flatten_schema(field.dataType, prefix=name)
+                    fields += subfields
+                    aliases += subaliases
+                else:
+                    fields.append(name)
+                    aliases.append(alias)
+        return fields, aliases
+
+    fields, aliases = flatten_schema(sdf.schema)
+
+    # Create columns using fields and aliases
+    selected_columns = [F.col(field).alias(alias) for field, alias in zip(fields, aliases)]
+
+    # Update internal frame with new columns
+    internal = internal.with_new_columns(
+        selected_columns, column_labels=[(column_label,) for column_label in aliases]
+    )
+
+    # Convert back to Pandas-on-Spark DataFrame
+    return ps.DataFrame(internal)
+
+
 def _get_index_map(
     sdf: PySparkDataFrame, index_col: Optional[Union[str, List[str]]] = None
 ) -> Tuple[Optional[List[PySparkColumn]], Optional[List[Label]]]:
@@ -3761,12 +3878,20 @@ def _test() -> None:
     import uuid
     from pyspark.sql import SparkSession
     import pyspark.pandas.namespace
+    from pandas.util.version import Version
 
     os.chdir(os.environ["SPARK_HOME"])
+
+    if Version(np.__version__) >= Version("2"):
+        # Numpy 2.0+ changed its string format,
+        # adding type information to numeric scalars.
+        # `legacy="1.25"` only available in `nump>=2`
+        np.set_printoptions(legacy="1.25")  # type: ignore[arg-type]
 
     globs = pyspark.pandas.namespace.__dict__.copy()
     globs["ps"] = pyspark.pandas
     globs["sf"] = F
+
     spark = (
         SparkSession.builder.master("local[4]")
         .appName("pyspark.pandas.namespace tests")

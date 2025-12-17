@@ -17,7 +17,7 @@
 
 package org.apache.spark.deploy
 
-import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, DataOutputStream, File, IOException}
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, DataOutputStream, File, FileNotFoundException, IOException}
 import java.net.InetAddress
 import java.security.PrivilegedExceptionAction
 import java.text.DateFormat
@@ -36,9 +36,10 @@ import org.apache.hadoop.security.{Credentials, UserGroupInformation}
 import org.apache.hadoop.security.token.{Token, TokenIdentifier}
 import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenIdentifier
 
-import org.apache.spark.{SparkConf, SparkException}
-import org.apache.spark.internal.Logging
+import org.apache.spark.{ReadOnlySparkConf, SparkConf, SparkException}
+import org.apache.spark.internal.{Logging, LogKeys}
 import org.apache.spark.internal.config.BUFFER_SIZE
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 /**
@@ -89,7 +90,7 @@ private[spark] class SparkHadoopUtil extends Logging {
    * Appends spark.hadoop.* configurations from a [[SparkConf]] to a Hadoop
    * configuration without the spark.hadoop. prefix.
    */
-  def appendSparkHadoopConfigs(conf: SparkConf, hadoopConf: Configuration): Unit = {
+  def appendSparkHadoopConfigs(conf: ReadOnlySparkConf, hadoopConf: Configuration): Unit = {
     SparkHadoopUtil.appendSparkHadoopConfigs(conf, hadoopConf)
   }
 
@@ -141,8 +142,9 @@ private[spark] class SparkHadoopUtil extends Logging {
     if (!new File(keytabFilename).exists()) {
       throw new SparkException(s"Keytab file: ${keytabFilename} does not exist")
     } else {
-      logInfo("Attempting to login to Kerberos " +
-        s"using principal: ${principalName} and keytab: ${keytabFilename}")
+      logInfo(log"Attempting to login to Kerberos using principal: " +
+        log"${MDC(LogKeys.PRINCIPAL, principalName)} and keytab: " +
+        log"${MDC(LogKeys.KEYTAB, keytabFilename)}")
       UserGroupInformation.loginUserFromKeytab(principalName, keytabFilename)
     }
   }
@@ -219,7 +221,7 @@ private[spark] class SparkHadoopUtil extends Logging {
   def listLeafStatuses(fs: FileSystem, baseStatus: FileStatus): Seq[FileStatus] = {
     def recurse(status: FileStatus): Seq[FileStatus] = {
       val (directories, leaves) = fs.listStatus(status.getPath).partition(_.isDirectory)
-      leaves ++ directories.flatMap(f => listLeafStatuses(fs, f))
+      (leaves ++ directories.flatMap(f => listLeafStatuses(fs, f))).toImmutableArraySeq
     }
 
     if (baseStatus.isDirectory) recurse(baseStatus) else Seq(baseStatus)
@@ -236,7 +238,7 @@ private[spark] class SparkHadoopUtil extends Logging {
 
   def globPath(fs: FileSystem, pattern: Path): Seq[Path] = {
     Option(fs.globStatus(pattern)).map { statuses =>
-      statuses.map(_.getPath.makeQualified(fs.getUri, fs.getWorkingDirectory)).toSeq
+      statuses.map(_.getPath.makeQualified(fs.getUri, fs.getWorkingDirectory)).toImmutableArraySeq
     }.getOrElse(Seq.empty[Path])
   }
 
@@ -428,14 +430,14 @@ private[spark] object SparkHadoopUtil extends Logging {
    * and if found on the classpath, those of core-site.xml.
    * This is done before the spark overrides are applied.
    */
-  private[spark] def newConfiguration(conf: SparkConf): Configuration = {
+  private[spark] def newConfiguration(conf: ReadOnlySparkConf): Configuration = {
     val hadoopConf = new Configuration()
     appendS3AndSparkHadoopHiveConfigurations(conf, hadoopConf)
     hadoopConf
   }
 
   private def appendS3AndSparkHadoopHiveConfigurations(
-      conf: SparkConf,
+      conf: ReadOnlySparkConf,
       hadoopConf: Configuration): Unit = {
     // Note: this null check is around more than just access to the "conf" object to maintain
     // the behavior of the old implementation of this code, for backwards compatibility.
@@ -512,7 +514,7 @@ private[spark] object SparkHadoopUtil extends Logging {
     }
   }
 
-  private def appendSparkHadoopConfigs(conf: SparkConf, hadoopConf: Configuration): Unit = {
+  private def appendSparkHadoopConfigs(conf: ReadOnlySparkConf, hadoopConf: Configuration): Unit = {
     // Copy any "spark.hadoop.foo=bar" spark properties into conf as "foo=bar"
     for ((key, value) <- conf.getAll if key.startsWith("spark.hadoop.")) {
       hadoopConf.set(key.substring("spark.hadoop.".length), value,
@@ -528,19 +530,9 @@ private[spark] object SparkHadoopUtil extends Logging {
     if (conf.getOption("spark.hadoop.fs.s3a.downgrade.syncable.exceptions").isEmpty) {
       hadoopConf.set("fs.s3a.downgrade.syncable.exceptions", "true", setBySpark)
     }
-    // In Hadoop 3.3.1, AWS region handling with the default "" endpoint only works
-    // in EC2 deployments or when the AWS CLI is installed.
-    // The workaround is to set the name of the S3 endpoint explicitly,
-    // if not already set. See HADOOP-17771.
-    if (hadoopConf.get("fs.s3a.endpoint", "").isEmpty &&
-      hadoopConf.get("fs.s3a.endpoint.region") == null) {
-      // set to US central endpoint which can also connect to buckets
-      // in other regions at the expense of a HEAD request during fs creation
-      hadoopConf.set("fs.s3a.endpoint", "s3.amazonaws.com", setBySpark)
-    }
   }
 
-  private def appendSparkHiveConfigs(conf: SparkConf, hadoopConf: Configuration): Unit = {
+  private def appendSparkHiveConfigs(conf: ReadOnlySparkConf, hadoopConf: Configuration): Unit = {
     // Copy any "spark.hive.foo=bar" spark properties into conf as "hive.foo=bar"
     for ((key, value) <- conf.getAll if key.startsWith("spark.hive.")) {
       hadoopConf.set(key.substring("spark.".length), value, SOURCE_SPARK_HIVE)
@@ -592,4 +584,11 @@ private[spark] object SparkHadoopUtil extends Logging {
     }
   }
 
+  def isFile(fs: FileSystem, path: Path): Boolean = {
+    try {
+      fs.getFileStatus(path).isFile
+    } catch {
+      case _: FileNotFoundException => false
+    }
+  }
 }

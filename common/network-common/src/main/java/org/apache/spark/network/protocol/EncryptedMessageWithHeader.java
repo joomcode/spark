@@ -1,4 +1,3 @@
-
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -15,13 +14,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.spark.network.protocol;
 
 import java.io.EOFException;
 import java.io.InputStream;
 import javax.annotation.Nullable;
 
-import com.google.common.base.Preconditions;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.channel.ChannelHandlerContext;
@@ -29,6 +28,7 @@ import io.netty.handler.stream.ChunkedStream;
 import io.netty.handler.stream.ChunkedInput;
 
 import org.apache.spark.network.buffer.ManagedBuffer;
+import org.apache.spark.network.util.JavaUtils;
 
 /**
  * A wrapper message that holds two separate pieces (a header and a body).
@@ -60,7 +60,7 @@ public class EncryptedMessageWithHeader implements ChunkedInput<ByteBuf> {
 
   public EncryptedMessageWithHeader(
       @Nullable ManagedBuffer managedBuffer, ByteBuf header, Object body, long bodyLength) {
-    Preconditions.checkArgument(body instanceof InputStream || body instanceof ChunkedStream,
+    JavaUtils.checkArgument(body instanceof InputStream || body instanceof ChunkedStream,
       "Body must be an InputStream or a ChunkedStream.");
     this.managedBuffer = managedBuffer;
     this.header = header;
@@ -84,8 +84,7 @@ public class EncryptedMessageWithHeader implements ChunkedInput<ByteBuf> {
     if (totalBytesTransferred < headerLength) {
       totalBytesTransferred += headerLength;
       return header.retain();
-    } else if (body instanceof InputStream) {
-      InputStream stream = (InputStream) body;
+    } else if (body instanceof InputStream stream) {
       int available = stream.available();
       if (available <= 0) {
         available = (int) (length() - totalBytesTransferred);
@@ -101,8 +100,7 @@ public class EncryptedMessageWithHeader implements ChunkedInput<ByteBuf> {
       } else {
         throw new EOFException("Unable to read bytes from InputStream");
       }
-    } else if (body instanceof ChunkedStream) {
-      ChunkedStream stream = (ChunkedStream) body;
+    } else if (body instanceof ChunkedStream stream) {
       long old = stream.transferredBytes();
       ByteBuf buffer = stream.readChunk(allocator);
       long read = stream.transferredBytes() - old;
@@ -139,10 +137,10 @@ public class EncryptedMessageWithHeader implements ChunkedInput<ByteBuf> {
     if (managedBuffer != null) {
       managedBuffer.release();
     }
-    if (body instanceof InputStream) {
-      ((InputStream) body).close();
-    } else if (body instanceof ChunkedStream) {
-      ((ChunkedStream) body).close();
+    if (body instanceof InputStream stream) {
+      stream.close();
+    } else if (body instanceof ChunkedStream stream) {
+      stream.close();
     }
   }
 }

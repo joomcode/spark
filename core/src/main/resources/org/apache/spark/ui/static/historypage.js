@@ -15,13 +15,27 @@
  * limitations under the License.
  */
 
-/* global $, Mustache, formatDuration, formatTimeMillis, jQuery, uiRoot */
+/* global $, Mustache, jQuery, uiRoot */
+
+import {formatDuration, formatTimeMillis, stringAbbreviate} from "./utils.js";
+
+export {setAppLimit};
 
 var appLimit = -1;
 
 /* eslint-disable no-unused-vars */
 function setAppLimit(val) {
   appLimit = val;
+}
+/* escape XSS  */
+function escapeHtml(text) {
+  if (typeof text !== 'string') return text;
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
 /* eslint-enable no-unused-vars*/
 
@@ -147,7 +161,7 @@ $(document).ready(function() {
         attempt["durationMillisec"] = attempt["duration"];
         attempt["duration"] = formatDuration(attempt["duration"]);
         attempt["id"] = id;
-        attempt["name"] = name;
+        attempt["name"] = escapeHtml(name);
         attempt["version"] = version;
         attempt["attemptUrl"] = uiRoot + "/history/" + id + "/" +
           (attempt.hasOwnProperty("attemptId") ? attempt["attemptId"] + "/" : "") + "jobs/";
@@ -182,9 +196,13 @@ $(document).ready(function() {
             name: 'appId',
             type: "appid-numeric",
             data: 'id',
-            render:  (id, type, row) => `<span title="${id}"><a href="${row.attemptUrl}">${id}</a></span>`
+            render: (id, type, row) => `<span title="${id}"><a href="${row.attemptUrl}">${id}</a></span>`
           },
-          {name: 'appName', data: 'name' },
+          {
+            name: 'appName',
+            data: 'name',
+            render: (name) => stringAbbreviate(name, 60)
+          },
           {
             name: attemptIdColumnName,
             data: 'attemptId',
@@ -192,8 +210,17 @@ $(document).ready(function() {
           },
           {name: startedColumnName, data: 'startTime' },
           {name: completedColumnName, data: 'endTime' },
-          {name: durationColumnName, type: "title-numeric", data: 'duration' },
-          {name: 'user', data: 'sparkUser' },
+          {
+            name: durationColumnName,
+            type: "title-numeric",
+            data: 'duration',
+            render: (id, type, row) => `<span title="${row.durationMillisec}">${row.duration}</span>`
+          },
+          {
+            name: 'user',
+            data: 'sparkUser',
+            render: (name) => escapeHtml(name)
+          },
           {name: 'lastUpdated', data: 'lastUpdated' },
           {
             name: 'eventLog',

@@ -21,14 +21,13 @@ import java.util
 
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
 import org.apache.spark.sql.connector.expressions.Transform
-import org.apache.spark.sql.types.StructType
 
 class InMemoryTableWithV2FilterCatalog extends InMemoryTableCatalog {
   import CatalogV2Implicits._
 
   override def createTable(
       ident: Identifier,
-      schema: StructType,
+      columns: Array[Column],
       partitions: Array[Transform],
       properties: util.Map[String, String]): Table = {
     if (tables.containsKey(ident)) {
@@ -38,9 +37,13 @@ class InMemoryTableWithV2FilterCatalog extends InMemoryTableCatalog {
     InMemoryTableCatalog.maybeSimulateFailedTableCreation(properties)
 
     val tableName = s"$name.${ident.quoted}"
-    val table = new InMemoryTableWithV2Filter(tableName, schema, partitions, properties)
+    val table = new InMemoryTableWithV2Filter(tableName, columns, partitions, properties)
     tables.put(ident, table)
     namespaces.putIfAbsent(ident.namespace.toList, Map())
     table
+  }
+
+  override def createTable(ident: Identifier, tableInfo: TableInfo): Table = {
+    createTable(ident, tableInfo.columns(), tableInfo.partitions(), tableInfo.properties)
   }
 }

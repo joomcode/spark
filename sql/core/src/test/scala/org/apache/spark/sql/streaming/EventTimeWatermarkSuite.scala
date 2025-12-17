@@ -23,18 +23,17 @@ import java.text.SimpleDateFormat
 import java.util.{Calendar, Date, Locale}
 import java.util.concurrent.TimeUnit._
 
-import org.apache.commons.io.FileUtils
 import org.scalatest.BeforeAndAfter
 import org.scalatest.matchers.must.Matchers
 import org.scalatest.matchers.should.Matchers._
 
-import org.apache.spark.SparkException
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{AnalysisException, DataFrame, Dataset}
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.catalyst.util.DateTimeConstants._
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.UTC
-import org.apache.spark.sql.execution.streaming._
+import org.apache.spark.sql.execution.streaming.operators.stateful.{EventTimeStats, StateStoreSaveExec}
+import org.apache.spark.sql.execution.streaming.runtime._
 import org.apache.spark.sql.execution.streaming.sources.MemorySink
 import org.apache.spark.sql.functions.{count, expr, timestamp_seconds, window}
 import org.apache.spark.sql.internal.SQLConf
@@ -74,14 +73,15 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
     // Make sure `largeValue` will cause overflow if we use a Long sum to calc avg.
     assert(largeValue * largeValue != BigInt(largeValue) * BigInt(largeValue))
     val stats =
-      EventTimeStats(max = largeValue, min = largeValue, avg = largeValue, count = largeValue - 1)
+      EventTimeStats(
+        max = largeValue, min = largeValue, avg = largeValue.toDouble, count = largeValue - 1)
     stats.add(largeValue)
     stats.avg should be (largeValue.toDouble +- epsilon)
 
     val stats2 = EventTimeStats(
       max = largeValue + 1,
       min = largeValue,
-      avg = largeValue + 1,
+      avg = largeValue + 1.0,
       count = largeValue)
     stats.merge(stats2)
     stats.avg should be ((largeValue + 0.5) +- epsilon)
@@ -245,7 +245,7 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
     val checkpointDir = Utils.createTempDir().getCanonicalFile
     // Copy the checkpoint to a temp dir to prevent changes to the original.
     // Not doing this will lead to the test passing on the first run, but fail subsequent runs.
-    FileUtils.copyDirectory(new File(resourceUri), checkpointDir)
+    Utils.copyDirectory(new File(resourceUri), checkpointDir)
 
     inputData.addData(15)
     inputData.addData(10, 12, 14)
@@ -651,10 +651,9 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
           (input1, Seq(("A", 200L), ("B", 300L))),
           (input2, Seq(("A", 190L), ("C", 350L)))
         ),
-        ExpectFailure[SparkException](assertFailure = exc => {
-          val cause = exc.getCause
-          assert(cause.getMessage.contains("More than one event time columns are available."))
-          assert(cause.getMessage.contains(
+        ExpectFailure[AnalysisException](assertFailure = ex => {
+          assert(ex.getMessage.contains("More than one event time columns are available."))
+          assert(ex.getMessage.contains(
             "Please ensure there is at most one event time column per stream."))
         })
       )
@@ -851,7 +850,7 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
     val checkpointDir = Utils.createTempDir().getCanonicalFile
     // Copy the checkpoint to a temp dir to prevent changes to the original.
     // Not doing this will lead to the test passing on the first run, but fail subsequent runs.
-    FileUtils.copyDirectory(new File(resourceUri), checkpointDir)
+    Utils.copyDirectory(new File(resourceUri), checkpointDir)
 
     input1.addData(20)
     input2.addData(30)

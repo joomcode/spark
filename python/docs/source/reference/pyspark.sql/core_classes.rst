@@ -42,3 +42,13 @@ Core Classes
     UDTFRegistration
     udf.UserDefinedFunction
     udtf.UserDefinedTableFunction
+    datasource.DataSource
+    datasource.DataSourceReader
+    datasource.DataSourceStreamReader
+    datasource.DataSourceWriter
+    datasource.DataSourceRegistration
+    datasource.InputPartition
+    datasource.WriterCommitMessage
+    tvf.TableValuedFunction
+    VariantVal
+    table_arg.TableArg

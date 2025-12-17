@@ -31,9 +31,12 @@ Data Types
     ByteType
     DataType
     DateType
+    TimeType
     DecimalType
     DoubleType
     FloatType
+    GeographyType
+    GeometryType
     IntegerType
     LongType
     MapType
@@ -44,6 +47,7 @@ Data Types
     VarcharType
     StructField
     StructType
+    VariantType
     TimestampType
     TimestampNTZType
     DayTimeIntervalType

@@ -26,13 +26,31 @@ import org.apache.spark.sql.connector.catalog.TableCapability._
 import org.apache.spark.sql.connector.catalog.index.{SupportsIndex, TableIndex}
 import org.apache.spark.sql.connector.expressions.NamedReference
 import org.apache.spark.sql.connector.write.{LogicalWriteInfo, WriteBuilder}
+import org.apache.spark.sql.errors.DataTypeErrorsBase
 import org.apache.spark.sql.execution.datasources.jdbc.{JDBCOptions, JdbcOptionsInWrite, JdbcUtils}
+import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.jdbc.JdbcDialects
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
-case class JDBCTable(ident: Identifier, schema: StructType, jdbcOptions: JDBCOptions)
-  extends Table with SupportsRead with SupportsWrite with SupportsIndex {
+case class JDBCTable(
+    ident: Identifier,
+    override val schema: StructType,
+    jdbcOptions: JDBCOptions,
+    additionalMetrics: Map[String, SQLMetric] = Map())
+  extends Table
+  with SupportsRead
+  with SupportsWrite
+  with SupportsIndex
+  with DataTypeErrorsBase {
+
+  override def hashCode(): Int = (ident, schema, jdbcOptions).##
+
+  override def equals(obj: Any): Boolean = obj match {
+    case that: JDBCTable =>
+      this.ident == that.ident && this.schema == that.schema && this.jdbcOptions == that.jdbcOptions
+    case _ => false
+  }
 
   override def name(): String = ident.toString
 
@@ -43,7 +61,7 @@ case class JDBCTable(ident: Identifier, schema: StructType, jdbcOptions: JDBCOpt
   override def newScanBuilder(options: CaseInsensitiveStringMap): JDBCScanBuilder = {
     val mergedOptions = new JDBCOptions(
       jdbcOptions.parameters.originalMap ++ options.asCaseSensitiveMap().asScala)
-    JDBCScanBuilder(SparkSession.active, schema, mergedOptions)
+    JDBCScanBuilder(SparkSession.active, schema, mergedOptions, additionalMetrics)
   }
 
   override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = {
@@ -58,8 +76,15 @@ case class JDBCTable(ident: Identifier, schema: StructType, jdbcOptions: JDBCOpt
       columnsProperties: util.Map[NamedReference, util.Map[String, String]],
       properties: util.Map[String, String]): Unit = {
     JdbcUtils.withConnection(jdbcOptions) { conn =>
-      JdbcUtils.classifyException(s"Failed to create index $indexName in ${name()}",
-        JdbcDialects.get(jdbcOptions.url)) {
+      JdbcUtils.classifyException(
+        condition = "FAILED_JDBC.CREATE_INDEX",
+        messageParameters = Map(
+          "url" -> jdbcOptions.getRedactUrl(),
+          "indexName" -> toSQLId(indexName),
+          "tableName" -> toSQLId(name)),
+        dialect = JdbcDialects.get(jdbcOptions.url),
+        description = s"Failed to create index $indexName in ${name()}",
+        isRuntime = false) {
         JdbcUtils.createIndex(
           conn, indexName, ident, columns, columnsProperties, properties, jdbcOptions)
       }
@@ -74,8 +99,15 @@ case class JDBCTable(ident: Identifier, schema: StructType, jdbcOptions: JDBCOpt
 
   override def dropIndex(indexName: String): Unit = {
     JdbcUtils.withConnection(jdbcOptions) { conn =>
-      JdbcUtils.classifyException(s"Failed to drop index $indexName in ${name()}",
-        JdbcDialects.get(jdbcOptions.url)) {
+      JdbcUtils.classifyException(
+        condition = "FAILED_JDBC.DROP_INDEX",
+        messageParameters = Map(
+          "url" -> jdbcOptions.getRedactUrl(),
+          "indexName" -> toSQLId(indexName),
+          "tableName" -> toSQLId(name)),
+        dialect = JdbcDialects.get(jdbcOptions.url),
+        description = s"Failed to drop index $indexName in ${name()}",
+        isRuntime = false) {
         JdbcUtils.dropIndex(conn, indexName, ident, jdbcOptions)
       }
     }

@@ -106,16 +106,19 @@ object SparkPlanGraph {
           buildSparkPlanGraphNode(
             planInfo.children.head, nodeIdGenerator, nodes, edges, parent, null, exchanges)
         }
-      case "TableCacheQueryStage" =>
+      case "TableCacheQueryStage" | "ResultQueryStage" =>
         buildSparkPlanGraphNode(
           planInfo.children.head, nodeIdGenerator, nodes, edges, parent, null, exchanges)
       case "Subquery" if subgraph != null =>
         // Subquery should not be included in WholeStageCodegen
         buildSparkPlanGraphNode(planInfo, nodeIdGenerator, nodes, edges, parent, null, exchanges)
       case "Subquery" if exchanges.contains(planInfo) =>
-        // Point to the re-used subquery
         val node = exchanges(planInfo)
-        edges += SparkPlanGraphEdge(node.id, parent.id)
+        val newEdge = SparkPlanGraphEdge(node.id, parent.id)
+        if (!edges.contains(newEdge)) {
+          // Point to the re-used subquery
+          edges += newEdge
+        }
       case "ReusedSubquery" =>
         // Re-used subquery might appear before the original subquery, so skip this node and let
         // the previous `case` make sure the re-used and the original point to the same node.
@@ -189,7 +192,7 @@ class SparkPlanGraphNode(
     } else {
       // SPARK-30684: when there is no metrics, add empty lines to increase the height of the node,
       // so that there won't be gaps between an edge and a small node.
-      s"<br><b>$name</b><br><br>"
+      s"<br><b>${StringEscapeUtils.escapeJava(name)}</b><br><br>"
     }
     s"""  $id [id="$nodeId" labelType="html" label="$labelStr" tooltip="$tooltip"];"""
 

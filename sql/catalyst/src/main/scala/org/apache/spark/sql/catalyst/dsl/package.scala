@@ -30,9 +30,11 @@ import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.expressions.objects.Invoke
 import org.apache.spark.sql.catalyst.plans.{Inner, JoinType}
 import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.catalyst.trees.CurrentOrigin
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.catalyst.util.CollationFactory
 import org.apache.spark.sql.types._
-import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
 
 /**
  * A collection of implicit conversions that create a DSL for constructing catalyst data structures.
@@ -63,7 +65,7 @@ import org.apache.spark.unsafe.types.UTF8String
  *    LocalRelation [key#2,value#3], []
  * }}}
  */
-package object dsl {
+package object dsl extends SQLConfHelper {
   trait ImplicitOperators {
     def expr: Expression
 
@@ -152,9 +154,6 @@ package object dsl {
     def desc: SortOrder = SortOrder(expr, Descending)
     def desc_nullsFirst: SortOrder = SortOrder(expr, Descending, NullsFirst, Seq.empty)
     def as(alias: String): NamedExpression = Alias(expr, alias)()
-    // TODO: Remove at Spark 4.0.0
-    @deprecated("Use as(alias: String)", "3.4.0")
-    def as(alias: Symbol): NamedExpression = Alias(expr, alias.name)()
   }
 
   trait ExpressionConversions {
@@ -304,8 +303,12 @@ package object dsl {
       /** Creates a new AttributeReference of type double */
       def double: AttributeReference = attrRef(DoubleType)
 
-      /** Creates a new AttributeReference of type string */
+      /** Creates a new AttributeReference of type string with default collation */
       def string: AttributeReference = attrRef(StringType)
+
+      /** Creates a new AttributeReference of type string with specified collation */
+      def string(collation: String): AttributeReference =
+        attrRef(StringType(CollationFactory.collationNameToId(collation)))
 
       /** Creates a new AttributeReference of type date */
       def date: AttributeReference = attrRef(DateType)
@@ -398,6 +401,12 @@ package object dsl {
 
       def limit(limitExpr: Expression): LogicalPlan = Limit(limitExpr, logicalPlan)
 
+      def localLimit(limitExpr: Expression): LogicalPlan = LocalLimit(limitExpr, logicalPlan)
+
+      def globalLimit(limitExpr: Expression): LogicalPlan = GlobalLimit(limitExpr, logicalPlan)
+
+      def limitAll(): LogicalPlan = LimitAll(logicalPlan)
+
       def offset(offsetExpr: Expression): LogicalPlan = Offset(offsetExpr, logicalPlan)
 
       def join(
@@ -435,16 +444,42 @@ package object dsl {
           otherPlan)
       }
 
-      def orderBy(sortExprs: SortOrder*): LogicalPlan = Sort(sortExprs, true, logicalPlan)
+      def orderBy(sortExprs: SortOrder*): LogicalPlan = {
+        val sortExpressionsWithOrdinals = sortExprs.map(replaceOrdinalsInSortOrder)
+        Sort(sortExpressionsWithOrdinals, true, logicalPlan)
+      }
 
-      def sortBy(sortExprs: SortOrder*): LogicalPlan = Sort(sortExprs, false, logicalPlan)
+      def sortBy(sortExprs: SortOrder*): LogicalPlan = {
+        val sortExpressionsWithOrdinals = sortExprs.map(replaceOrdinalsInSortOrder)
+        Sort(sortExpressionsWithOrdinals, false, logicalPlan)
+      }
+
+      /**
+       * Replaces top-level integer literals from [[SortOrder]] with [[UnresolvedOrdinal]], if
+       * `orderByOrdinal` is enabled.
+       */
+      private def replaceOrdinalsInSortOrder(sortOrder: SortOrder): SortOrder = sortOrder match {
+        case sortOrderByOrdinal @ SortOrder(literal @ Literal(value: Int, IntegerType), _, _, _)
+            if conf.orderByOrdinal =>
+          val ordinal = CurrentOrigin.withOrigin(literal.origin) { UnresolvedOrdinal(value) }
+          sortOrderByOrdinal
+            .withNewChildren(newChildren = Seq(ordinal))
+            .asInstanceOf[SortOrder]
+        case other => other
+      }
 
       def groupBy(groupingExprs: Expression*)(aggregateExprs: Expression*): LogicalPlan = {
+        // Replace top-level integer literals with ordinals, if `groupByOrdinal` is enabled.
+        val groupingExpressionsWithOrdinals = groupingExprs.map {
+          case literal @ Literal(value: Int, IntegerType) if conf.groupByOrdinal =>
+            CurrentOrigin.withOrigin(literal.origin) { UnresolvedOrdinal(value) }
+          case other => other
+        }
         val aliasedExprs = aggregateExprs.map {
           case ne: NamedExpression => ne
           case e => UnresolvedAlias(e)
         }
-        Aggregate(groupingExprs, aliasedExprs, logicalPlan)
+        Aggregate(groupingExpressionsWithOrdinals, aliasedExprs, logicalPlan)
       }
 
       def having(
@@ -468,9 +503,6 @@ package object dsl {
           limit: Int): LogicalPlan =
         WindowGroupLimit(partitionSpec, orderSpec, rankLikeFunction, limit, logicalPlan)
 
-      // TODO: Remove at Spark 4.0.0
-      @deprecated("Use subquery(alias: String)", "3.4.0")
-      def subquery(alias: Symbol): LogicalPlan = SubqueryAlias(alias.name, logicalPlan)
       def subquery(alias: String): LogicalPlan = SubqueryAlias(alias, logicalPlan)
       def as(alias: String): LogicalPlan = SubqueryAlias(alias, logicalPlan)
 
@@ -534,6 +566,19 @@ package object dsl {
       }
 
       def deduplicate(colNames: Attribute*): LogicalPlan = Deduplicate(colNames, logicalPlan)
+
+      def withWatermark(
+          uuid: java.util.UUID,
+          expr: NamedExpression,
+          delayThreshold: CalendarInterval): LogicalPlan = {
+        EventTimeWatermark(uuid, expr.toAttribute, delayThreshold, logicalPlan)
+      }
+
+      def unresolvedWithWatermark(
+          expr: NamedExpression,
+          delayThreshold: CalendarInterval): LogicalPlan = {
+        UnresolvedEventTimeWatermark(expr, delayThreshold, logicalPlan)
+      }
     }
   }
 }

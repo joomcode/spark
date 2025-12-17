@@ -14,8 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from pyspark.errors import PySparkRuntimeError, PySparkValueError
 from pyspark.sql.connect.utils import check_dependencies
-from pyspark.sql.connect.client.logging import logger
+from pyspark.sql.connect.logging import logger
 
 check_dependencies(__name__)
 
@@ -112,7 +113,10 @@ class Artifact:
         if isinstance(self.storage, LocalData):
             return self.storage.size
         else:
-            raise RuntimeError(f"Unsupported storage {type(self.storage)}")
+            raise PySparkRuntimeError(
+                errorClass="UNSUPPORTED_OPERATION",
+                messageParameters={"operation": f"{self.storage} storage"},
+            )
 
 
 def new_jar_artifact(file_name: str, storage: LocalData) -> Artifact:
@@ -214,7 +218,13 @@ class ArtifactManager:
                     # Minimal fix for the workaround of fragment handling in URI.
                     # This has a limitation - hash(#) in the file name would not work.
                     if "#" in local_path:
-                        raise ValueError("'#' in the path is not supported for adding an archive.")
+                        raise PySparkValueError(
+                            errorClass="VALUE_ALLOWED",
+                            messageParameters={
+                                "arg_name": "artifact path",
+                                "disallowed_value": "#",
+                            },
+                        )
                     name = f"{name}#{parsed.fragment}"
 
                 artifact = new_archive_artifact(name, LocalFile(local_path))
@@ -223,9 +233,15 @@ class ArtifactManager:
             elif name.endswith(".jar"):
                 artifact = new_jar_artifact(name, LocalFile(local_path))
             else:
-                raise RuntimeError(f"Unsupported file format: {local_path}")
+                raise PySparkRuntimeError(
+                    errorClass="UNSUPPORTED_OPERATION",
+                    messageParameters={"operation": f"{local_path} file format"},
+                )
             return [artifact]
-        raise RuntimeError(f"Unsupported scheme: {parsed.scheme}")
+        raise PySparkRuntimeError(
+            errorClass="UNSUPPORTED_OPERATION",
+            messageParameters={"operation": f"{parsed.scheme} scheme"},
+        )
 
     def _parse_forward_to_fs_artifacts(self, local_path: str, dest_path: str) -> List[Artifact]:
         abs_path: Path = Path(local_path).absolute()
@@ -411,6 +427,30 @@ class ArtifactManager:
         status = resp.statuses.get(artifactName)
         return status.exists if status is not None else False
 
+    def get_cached_artifacts(self, hashes: list[str]) -> set[str]:
+        """
+        Batch check which artifacts are already cached on the server.
+        Returns a set of hashes that are already cached.
+        """
+        if not hashes:
+            return set()
+
+        artifact_names = [f"{CACHE_PREFIX}/{hash}" for hash in hashes]
+        request = proto.ArtifactStatusesRequest(
+            user_context=self._user_context, session_id=self._session_id, names=artifact_names
+        )
+        resp: proto.ArtifactStatusesResponse = self._stub.ArtifactStatus(
+            request, metadata=self._metadata
+        )
+
+        cached = set()
+        for hash in hashes:
+            artifact_name = f"{CACHE_PREFIX}/{hash}"
+            status = resp.statuses.get(artifact_name)
+            if status is not None and status.exists:
+                cached.add(hash)
+        return cached
+
     def cache_artifact(self, blob: bytes) -> str:
         """
         Cache the give blob at the session.
@@ -426,3 +466,34 @@ class ArtifactManager:
                 # TODO(SPARK-42658): Handle responses containing CRC failures.
 
         return hash
+
+    def cache_artifacts(self, blobs: list[bytes]) -> list[str]:
+        """
+        Cache the given blobs at the session.
+
+        This method batches artifact status checks and uploads to minimize RPC overhead.
+        """
+        # Compute hashes for all blobs upfront
+        hashes = [hashlib.sha256(blob).hexdigest() for blob in blobs]
+        unique_hashes = list(set(hashes))
+
+        # Batch check which artifacts are already cached
+        cached_hashes = self.get_cached_artifacts(unique_hashes)
+
+        # Collect unique artifacts that need to be uploaded
+        seen_hashes = set()
+        artifacts_to_add = []
+        for blob, hash in zip(blobs, hashes):
+            if hash not in cached_hashes and hash not in seen_hashes:
+                artifacts_to_add.append(new_cache_artifact(hash, InMemory(blob)))
+                seen_hashes.add(hash)
+
+        # Batch upload all missing artifacts in a single RPC call
+        if artifacts_to_add:
+            requests = self._add_artifacts(artifacts_to_add)
+            response: proto.AddArtifactsResponse = self._retrieve_responses(requests)
+            summaries: List[proto.AddArtifactsResponse.ArtifactSummary] = []
+            for summary in response.artifacts:
+                summaries.append(summary)
+                # TODO(SPARK-42658): Handle responses containing CRC failures.
+        return hashes

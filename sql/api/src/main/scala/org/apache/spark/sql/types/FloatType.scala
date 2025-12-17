@@ -27,7 +27,8 @@ import org.apache.spark.annotation.Stable
  * @since 1.3.0
  */
 @Stable
-class FloatType private() extends FractionalType {
+class FloatType private () extends FractionalType {
+
   /**
    * The default size of a value of the FloatType is 4 bytes.
    */
@@ -36,15 +37,12 @@ class FloatType private() extends FractionalType {
   private[spark] override def asNullable: FloatType = this
 }
 
-
 /**
  * @since 1.3.0
  */
 @Stable
 case object FloatType extends FloatType {
 
-  // Traits below copied from Scala 2.12; not present in 2.13
-  // TODO: SPARK-30011 revisit once Scala 2.12 support is dropped
   trait FloatIsConflicted extends Numeric[Float] {
     def plus(x: Float, y: Float): Float = x + y
     def minus(x: Float, y: Float): Float = x - y
@@ -57,8 +55,7 @@ case object FloatType extends FloatType {
     def toDouble(x: Float): Double = x.toDouble
     // logic in Numeric base trait mishandles abs(-0.0f)
     override def abs(x: Float): Float = math.abs(x)
-    // Added from Scala 2.13; don't override to work in 2.12
-    def parseString(str: String): Option[Float] =
+    override def parseString(str: String): Option[Float] =
       Try(java.lang.Float.parseFloat(str)).toOption
   }
 

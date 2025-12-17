@@ -27,7 +27,7 @@ import org.scalatestplus.mockito.MockitoSugar
 import org.apache.spark._
 import org.apache.spark.network.client.TransportClient
 import org.apache.spark.rpc._
-import org.apache.spark.util.ThreadUtils
+import org.apache.spark.util.{SslTestUtils, ThreadUtils}
 
 class NettyRpcEnvSuite extends RpcEnvSuite with MockitoSugar with TimeLimits {
 
@@ -184,5 +184,11 @@ class NettyRpcEnvSuite extends RpcEnvSuite with MockitoSugar with TimeLimits {
 class SslNettyRpcEnvSuite extends NettyRpcEnvSuite with MockitoSugar with TimeLimits {
   override def createSparkConf(): SparkConf = {
     SslTestUtils.updateWithSSLConfig(super.createSparkConf())
+  }
+}
+
+class AutoNettyRpcEnvSuite extends NettyRpcEnvSuite with MockitoSugar with TimeLimits {
+  override def createSparkConf(): SparkConf = {
+    super.createSparkConf().set("spark.rpc.io.mode", "AUTO")
   }
 }

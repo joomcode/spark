@@ -21,7 +21,7 @@ A wrapper for GroupedData to behave like pandas GroupBy.
 from abc import ABCMeta, abstractmethod
 import inspect
 from collections import defaultdict, namedtuple
-from functools import partial
+from functools import partial, wraps
 from itertools import product
 from typing import (
     Any,
@@ -36,6 +36,7 @@ from typing import (
     Set,
     Tuple,
     Type,
+    TypeVar,
     Union,
     cast,
     TYPE_CHECKING,
@@ -47,6 +48,7 @@ from pandas.api.types import is_number, is_hashable, is_list_like  # type: ignor
 from pandas.core.common import _builtin_table  # type: ignore[attr-defined]
 
 from pyspark.sql import Column, DataFrame as SparkDataFrame, Window, functions as F
+from pyspark.sql.internal import InternalFunction as SF
 from pyspark.sql.types import (
     BooleanType,
     DataType,
@@ -74,10 +76,17 @@ from pyspark.pandas.missing.groupby import (
     MissingPandasLikeSeriesGroupBy,
 )
 from pyspark.pandas.series import Series, first_series
-from pyspark.pandas.spark import functions as SF
 from pyspark.pandas.config import get_option
+from pyspark.pandas.correlation import (
+    compute,
+    CORRELATION_VALUE_1_COLUMN,
+    CORRELATION_VALUE_2_COLUMN,
+    CORRELATION_CORR_OUTPUT_COLUMN,
+    CORRELATION_COUNT_OUTPUT_COLUMN,
+)
 from pyspark.pandas.utils import (
     align_diff_frames,
+    ansi_mode_context,
     is_name_like_tuple,
     is_name_like_value,
     name_like_string,
@@ -91,6 +100,18 @@ from pyspark.pandas.exceptions import DataError
 
 if TYPE_CHECKING:
     from pyspark.pandas.window import RollingGroupby, ExpandingGroupby, ExponentialMovingGroupby
+
+
+FuncT = TypeVar("FuncT", bound=Callable[..., Any])
+
+
+def with_ansi_mode_context(f: FuncT) -> FuncT:
+    @wraps(f)
+    def _with_ansi_mode_context(self: "GroupBy", *args: Any, **kwargs: Any) -> Any:
+        with ansi_mode_context(self._psdf._internal.spark_frame.sparkSession):
+            return f(self, *args, **kwargs)
+
+    return cast(FuncT, _with_ansi_mode_context)
 
 
 # to keep it the same as pandas
@@ -301,6 +322,7 @@ class GroupBy(Generic[FrameLike], metaclass=ABCMeta):
             )
 
         if not self._as_index:
+            index_cols = psdf._internal.column_labels
             should_drop_index = set(
                 i for i, gkey in enumerate(self._groupkeys) if gkey._psdf is not self._psdf
             )
@@ -315,8 +337,12 @@ class GroupBy(Generic[FrameLike], metaclass=ABCMeta):
                 psdf = psdf.reset_index(level=should_drop_index, drop=drop)
             if len(should_drop_index) < len(self._groupkeys):
                 psdf = psdf.reset_index()
+            index_cols = [c for c in psdf._internal.column_labels if c not in index_cols]
+            if relabeling:
+                psdf = psdf[pd.Index(index_cols + list(order))]
+                psdf.columns = pd.Index([c[0] for c in index_cols] + list(columns))
 
-        if relabeling:
+        if relabeling and self._as_index:
             psdf = psdf[order]
             psdf.columns = columns  # type: ignore[assignment]
         return psdf
@@ -2614,20 +2640,6 @@ class GroupBy(Generic[FrameLike], metaclass=ABCMeta):
         """
         return self.fillna(method="bfill", limit=limit)
 
-    def backfill(self, limit: Optional[int] = None) -> FrameLike:
-        """
-        Alias for bfill.
-
-        .. deprecated:: 3.4.0
-        """
-        warnings.warn(
-            "The GroupBy.backfill method is deprecated "
-            "and will be removed in a future version. "
-            "Use GroupBy.bfill instead.",
-            FutureWarning,
-        )
-        return self.bfill(limit=limit)
-
     def ffill(self, limit: Optional[int] = None) -> FrameLike:
         """
         Synonym for `DataFrame.fillna()` with ``method=`ffill```.
@@ -2676,20 +2688,6 @@ class GroupBy(Generic[FrameLike], metaclass=ABCMeta):
         3  3.0  1.0  4
         """
         return self.fillna(method="ffill", limit=limit)
-
-    def pad(self, limit: Optional[int] = None) -> FrameLike:
-        """
-        Alias for ffill.
-
-        .. deprecated:: 3.4.0
-        """
-        warnings.warn(
-            "The GroupBy.pad method is deprecated "
-            "and will be removed in a future version. "
-            "Use GroupBy.ffill instead.",
-            FutureWarning,
-        )
-        return self.ffill(limit=limit)
 
     def _limit(self, n: int, asc: bool) -> FrameLike:
         """
@@ -2992,7 +2990,7 @@ class GroupBy(Generic[FrameLike], metaclass=ABCMeta):
             When the given function has the return type annotated, the original index of the
             GroupBy object will be lost, and a default index will be attached to the result.
             Please be careful about configuring the default index. See also `Default Index Type
-            <https://spark.apache.org/docs/latest/api/python/user_guide/pandas_on_spark/options.html#default-index-type>`_.
+            <https://spark.apache.org/docs/latest/api/python/tutorial/pandas_on_spark/options.html#default-index-type>`_.
 
         .. note:: the series within ``func`` is actually a pandas series. Therefore,
             any pandas API within this function is allowed.
@@ -3956,6 +3954,216 @@ class DataFrameGroupBy(GroupBy[DataFrame]):
         # Cast columns to ``"float64"`` to match `pandas.DataFrame.groupby`.
         return DataFrame(internal).astype("float64")
 
+    @with_ansi_mode_context
+    def corr(
+        self,
+        method: str = "pearson",
+        min_periods: int = 1,
+        numeric_only: bool = False,
+    ) -> "DataFrame":
+        """
+        Compute pairwise correlation of columns, excluding NA/null values.
+
+        .. versionadded:: 4.0.0
+
+        Parameters
+        ----------
+        method : {'pearson', 'spearman', 'kendall'}
+            * pearson : standard correlation coefficient
+            * spearman : Spearman rank correlation
+            * kendall : Kendall Tau correlation coefficient
+
+        min_periods : int, default 1
+            Minimum number of observations in window required to have a value
+            (otherwise result is NA).
+
+        numeric_only : bool, default False
+            Include only `float`, `int` or `boolean` data.
+
+        Returns
+        -------
+        DataFrame
+
+        See Also
+        --------
+        DataFrame.corrwith
+        Series.corr
+
+        Notes
+        -----
+        1. Pearson, Kendall and Spearman correlation are currently computed using pairwise
+           complete observations.
+
+        2. The complexity of Kendall correlation is O(#row * #row), if the dataset is too
+           large, sampling ahead of correlation computation is recommended.
+
+        Examples
+        --------
+        >>> df = ps.DataFrame(
+        ...     {"A": [0, 0, 0, 1, 1, 2], "B": [-1, 2, 3, 5, 6, 0], "C": [4, 6, 5, 1, 3, 0]},
+        ...     columns=["A", "B", "C"])
+        >>> df.groupby("A").corr()
+                    B         C
+        A
+        0 B  1.000000  0.720577
+          C  0.720577  1.000000
+        1 B  1.000000  1.000000
+          C  1.000000  1.000000
+        2 B       NaN       NaN
+          C       NaN       NaN
+
+        >>> df.groupby("A").corr(min_periods=2)
+                    B         C
+        A
+        0 B  1.000000  0.720577
+          C  0.720577  1.000000
+        1 B  1.000000  1.000000
+          C  1.000000  1.000000
+        2 B       NaN       NaN
+          C       NaN       NaN
+
+        >>> df.groupby("A").corr("spearman")
+               B    C
+        A
+        0 B  1.0  0.5
+          C  0.5  1.0
+        1 B  1.0  1.0
+          C  1.0  1.0
+        2 B  NaN  NaN
+          C  NaN  NaN
+
+        >>> df.groupby("A").corr('kendall')
+                    B         C
+        A
+        0 B  1.000000  0.333333
+          C  0.333333  1.000000
+        1 B  1.000000  1.000000
+          C  1.000000  1.000000
+        2 B  1.000000       NaN
+          C       NaN  1.000000
+        """
+        if method not in ["pearson", "spearman", "kendall"]:
+            raise ValueError(f"Invalid method {method}")
+
+        groupkey_names: List[str] = [str(key.name) for key in self._groupkeys]
+        internal, agg_columns, sdf = self._prepare_reduce(
+            groupkey_names=groupkey_names,
+            accepted_spark_types=(NumericType, BooleanType) if numeric_only else None,
+            bool_to_numeric=False,
+        )
+
+        numeric_labels = [
+            label
+            for label in internal.column_labels
+            if isinstance(internal.spark_type_for(label), (NumericType, BooleanType))
+        ]
+        numeric_scols: List[Column] = [
+            internal.spark_column_for(label).cast("double") for label in numeric_labels
+        ]
+        numeric_col_names: List[str] = [name_like_string(label) for label in numeric_labels]
+        num_scols = len(numeric_scols)
+
+        sdf = internal.spark_frame
+        index_1_col_name = verify_temp_column_name(sdf, "__groupby_corr_index_1_temp_column__")
+        index_2_col_name = verify_temp_column_name(sdf, "__groupby_corr_index_2_temp_column__")
+
+        pair_scols: List[Column] = []
+        for i in range(0, num_scols):
+            for j in range(i, num_scols):
+                pair_scols.append(
+                    F.struct(
+                        F.lit(i).alias(index_1_col_name),
+                        F.lit(j).alias(index_2_col_name),
+                        numeric_scols[i].alias(CORRELATION_VALUE_1_COLUMN),
+                        numeric_scols[j].alias(CORRELATION_VALUE_2_COLUMN),
+                    )
+                )
+
+        sdf = sdf.select(*[F.col(key) for key in groupkey_names], *[F.inline(F.array(*pair_scols))])
+
+        sdf = compute(
+            sdf=sdf, groupKeys=groupkey_names + [index_1_col_name, index_2_col_name], method=method
+        )
+        if method == "kendall":
+            sdf = sdf.withColumn(
+                CORRELATION_CORR_OUTPUT_COLUMN,
+                F.when(F.col(index_1_col_name) == F.col(index_2_col_name), F.lit(1.0)).otherwise(
+                    F.col(CORRELATION_CORR_OUTPUT_COLUMN)
+                ),
+            )
+
+        sdf = sdf.withColumn(
+            CORRELATION_CORR_OUTPUT_COLUMN,
+            F.when(F.col(CORRELATION_COUNT_OUTPUT_COLUMN) < min_periods, F.lit(None)).otherwise(
+                F.col(CORRELATION_CORR_OUTPUT_COLUMN)
+            ),
+        )
+
+        auxiliary_col_name = verify_temp_column_name(sdf, "__groupby_corr_auxiliary_temp_column__")
+        sdf = sdf.withColumn(
+            auxiliary_col_name,
+            F.explode(
+                F.when(
+                    F.col(index_1_col_name) == F.col(index_2_col_name),
+                    F.lit([0]),
+                ).otherwise(F.lit([0, 1]))
+            ),
+        ).select(
+            *[F.col(key) for key in groupkey_names],
+            *[
+                F.when(F.col(auxiliary_col_name) == 0, F.col(index_1_col_name))
+                .otherwise(F.col(index_2_col_name))
+                .alias(index_1_col_name),
+                F.when(F.col(auxiliary_col_name) == 0, F.col(index_2_col_name))
+                .otherwise(F.col(index_1_col_name))
+                .alias(index_2_col_name),
+                F.col(CORRELATION_CORR_OUTPUT_COLUMN),
+            ],
+        )
+
+        array_col_name = verify_temp_column_name(sdf, "__groupby_corr_array_temp_column__")
+        sdf = sdf.groupby(groupkey_names + [index_1_col_name]).agg(
+            F.array_sort(
+                F.collect_list(
+                    F.struct(
+                        F.col(index_2_col_name),
+                        F.col(CORRELATION_CORR_OUTPUT_COLUMN),
+                    )
+                )
+            ).alias(array_col_name)
+        )
+
+        for i in range(0, num_scols):
+            sdf = sdf.withColumn(auxiliary_col_name, F.get(F.col(array_col_name), i)).withColumn(
+                numeric_col_names[i],
+                F.col(f"{auxiliary_col_name}.{CORRELATION_CORR_OUTPUT_COLUMN}"),
+            )
+
+        sdf = sdf.orderBy(groupkey_names + [index_1_col_name])  # type: ignore[arg-type]
+
+        sdf = sdf.select(
+            *[F.col(col) for col in groupkey_names + numeric_col_names],
+            *[
+                F.get(F.lit(numeric_col_names), F.col(index_1_col_name)).alias(auxiliary_col_name),
+                F.monotonically_increasing_id().alias(NATURAL_ORDER_COLUMN_NAME),
+            ],
+        )
+
+        return DataFrame(
+            InternalFrame(
+                spark_frame=sdf,
+                index_spark_columns=[
+                    scol_for(sdf, key) for key in groupkey_names + [auxiliary_col_name]
+                ],
+                index_names=(
+                    [psser._column_label for psser in self._groupkeys]
+                    + self._psdf._internal.index_names
+                ),
+                column_labels=numeric_labels,
+                column_label_names=internal.column_label_names,
+            )
+        )
+
 
 class SeriesGroupBy(GroupBy[Series]):
     @staticmethod
@@ -4408,6 +4616,7 @@ def _test() -> None:
     globs = pyspark.pandas.groupby.__dict__.copy()
     globs["np"] = numpy
     globs["ps"] = pyspark.pandas
+
     spark = (
         SparkSession.builder.master("local[4]")
         .appName("pyspark.pandas.groupby tests")

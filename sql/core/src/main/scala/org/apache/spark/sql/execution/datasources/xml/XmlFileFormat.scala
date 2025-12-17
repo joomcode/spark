@@ -35,17 +35,15 @@ import org.apache.spark.util.SerializableConfiguration
 /**
  * Provides access to XML data from pure SQL statements.
  */
-class XmlFileFormat extends TextBasedFileFormat with DataSourceRegister {
+case class XmlFileFormat() extends TextBasedFileFormat with DataSourceRegister {
 
   override def shortName(): String = "xml"
 
-  def getXmlOptions(
+  private def getXmlOptions(
       sparkSession: SparkSession,
       parameters: Map[String, String]): XmlOptions = {
-    new XmlOptions(parameters,
-      sparkSession.sessionState.conf.sessionLocalTimeZone,
-      sparkSession.sessionState.conf.columnNameOfCorruptRecord,
-      true)
+    val conf = getSqlConf(sparkSession)
+    new XmlOptions(parameters, conf.sessionLocalTimeZone, conf.columnNameOfCorruptRecord, true)
   }
 
   override def isSplitable(
@@ -53,8 +51,7 @@ class XmlFileFormat extends TextBasedFileFormat with DataSourceRegister {
       options: Map[String, String],
       path: Path): Boolean = {
     val xmlOptions = getXmlOptions(sparkSession, options)
-    val xmlDataSource = XmlDataSource(xmlOptions)
-    xmlDataSource.isSplitable && super.isSplitable(sparkSession, options, path)
+    XmlDataSource(xmlOptions).isSplitable && super.isSplitable(sparkSession, options, path)
   }
 
   override def inferSchema(
@@ -102,7 +99,7 @@ class XmlFileFormat extends TextBasedFileFormat with DataSourceRegister {
       options: Map[String, String],
       hadoopConf: Configuration): (PartitionedFile) => Iterator[InternalRow] = {
     val broadcastedHadoopConf =
-      sparkSession.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
+      SerializableConfiguration.broadcast(sparkSession.sparkContext, hadoopConf)
 
     val xmlOptions = getXmlOptions(sparkSession, options)
 
@@ -111,8 +108,6 @@ class XmlFileFormat extends TextBasedFileFormat with DataSourceRegister {
     ExprUtils.verifyColumnNameOfCorruptRecord(dataSchema, columnNameOfCorruptRecord)
     // Don't push any filter which refers to the "virtual" column which cannot present in the input.
     // Such filters will be applied later on the upper layer.
-    val actualFilters =
-      filters.filterNot(_.references.contains(columnNameOfCorruptRecord))
     val actualRequiredSchema = StructType(
       requiredSchema.filterNot(_.name == columnNameOfCorruptRecord))
     if (requiredSchema.length == 1 &&
@@ -123,8 +118,7 @@ class XmlFileFormat extends TextBasedFileFormat with DataSourceRegister {
     (file: PartitionedFile) => {
       val parser = new StaxXmlParser(
         actualRequiredSchema,
-        xmlOptions,
-        actualFilters)
+        xmlOptions)
       XmlDataSource(xmlOptions).readFile(
         broadcastedHadoopConf.value.value,
         file,
@@ -135,11 +129,8 @@ class XmlFileFormat extends TextBasedFileFormat with DataSourceRegister {
 
   override def toString: String = "XML"
 
-  override def hashCode(): Int = getClass.hashCode()
-
-  override def equals(other: Any): Boolean = other.isInstanceOf[XmlFileFormat]
-
   override def supportDataType(dataType: DataType): Boolean = dataType match {
+    case _: VariantType => true
     case _: AtomicType => true
 
     case st: StructType => st.forall { f => supportDataType(f.dataType) }

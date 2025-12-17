@@ -23,7 +23,7 @@ import re
 import inspect
 import warnings
 from collections.abc import Mapping
-from functools import partial, reduce
+from functools import partial, reduce, wraps
 from typing import (
     Any,
     Callable,
@@ -36,6 +36,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    TypeVar,
     Union,
     cast,
     no_type_check,
@@ -54,7 +55,13 @@ from pandas.api.types import (  # type: ignore[attr-defined]
 )
 from pandas.tseries.frequencies import DateOffset
 
-from pyspark.sql import functions as F, Column as PySparkColumn, DataFrame as SparkDataFrame
+from pyspark.sql import (
+    functions as F,
+    Column as PySparkColumn,
+    DataFrame as SparkDataFrame,
+    Window as PySparkWindow,
+)
+from pyspark.sql.internal import InternalFunction as SF
 from pyspark.sql.types import (
     ArrayType,
     BooleanType,
@@ -62,7 +69,6 @@ from pyspark.sql.types import (
     DoubleType,
     FloatType,
     IntegerType,
-    IntegralType,
     LongType,
     NumericType,
     Row,
@@ -71,7 +77,6 @@ from pyspark.sql.types import (
     NullType,
 )
 from pyspark.sql.window import Window
-from pyspark.sql.utils import get_column_class, get_window_class
 from pyspark import pandas as ps  # For running doctests and reference resolution in PyCharm.
 from pyspark.pandas._typing import Axis, Dtype, Label, Name, Scalar, T
 from pyspark.pandas.accessors import PandasOnSparkSeriesMethods
@@ -99,7 +104,9 @@ from pyspark.pandas.internal import (
 from pyspark.pandas.missing.series import MissingPandasLikeSeries
 from pyspark.pandas.plot import PandasOnSparkPlotAccessor
 from pyspark.pandas.utils import (
+    ansi_mode_context,
     combine_frames,
+    is_ansi_mode_enabled,
     is_name_like_tuple,
     is_name_like_value,
     name_like_string,
@@ -114,7 +121,6 @@ from pyspark.pandas.utils import (
     log_advice,
 )
 from pyspark.pandas.datetimes import DatetimeMethods
-from pyspark.pandas.spark import functions as SF
 from pyspark.pandas.spark.accessors import SparkSeriesMethods
 from pyspark.pandas.strings import StringMethods
 from pyspark.pandas.typedef import (
@@ -138,6 +144,18 @@ if TYPE_CHECKING:
 # pattern every time it is used in _repr_ in Series.
 # This pattern basically seeks the footer string from pandas'
 REPR_PATTERN = re.compile(r"Length: (?P<length>[0-9]+)")
+
+FuncT = TypeVar("FuncT", bound=Callable[..., Any])
+
+
+def with_ansi_mode_context(f: FuncT) -> FuncT:
+    @wraps(f)
+    def _with_ansi_mode_context(self: "Series", *args: Any, **kwargs: Any) -> Any:
+        with ansi_mode_context(self._internal.spark_frame.sparkSession):
+            return f(self, *args, **kwargs)
+
+    return cast(FuncT, _with_ansi_mode_context)
+
 
 _flex_doc_SERIES = """
 Return {desc} of series and other, element-wise (binary operator `{op_name}`).
@@ -366,6 +384,10 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
     pandas-on-Spark Series that corresponds to pandas Series logically. This holds Spark Column
     internally.
 
+    .. versionchanged:: 4.1.0
+        Support construction from a pandas-on-Spark Series input, which can be used with
+        additional parameters index, dtype, and name for overriding the original value.
+
     :ivar _internal: an internal immutable Frame to manage metadata.
     :type _internal: InternalFrame
     :ivar _psdf: Parent's pandas-on-Spark DataFrame
@@ -373,9 +395,10 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
 
     Parameters
     ----------
-    data : array-like, dict, or scalar value, pandas Series
+    data : array-like, dict, or scalar value, pandas Series, pandas-on-Spark Series
         Contains data stored in Series
-        Note that if `data` is a pandas Series, other arguments should not be used.
+        Note that if `data` is a Series, index, dtype, or name can also be
+        specified to override the original value.
     index : array-like or Index (1d)
         Values must be hashable and have the same length as `data`.
         Non-unique index values are allowed. Will default to
@@ -384,6 +407,8 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         dict.
     dtype : numpy.dtype or None
         If None, dtype will be inferred
+    name : str, default None
+        The name to give to the Series.
     copy : boolean, default False
         Copy input data
     """
@@ -393,8 +418,8 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
     ):
         assert data is not None
 
-        self._anchor: DataFrame
-        self._col_label: Label
+        self._anchor: DataFrame  # type: ignore[annotation-unchecked]
+        self._col_label: Label  # type: ignore[annotation-unchecked]
         if isinstance(data, DataFrame):
             assert dtype is None
             assert name is None
@@ -403,6 +428,24 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
 
             self._anchor = data
             self._col_label = index
+
+        elif isinstance(data, Series):
+            assert not copy
+            assert not fastpath
+
+            if name:
+                data = data.rename(name)
+
+            if index:
+                data = data.reindex(index)
+
+            if dtype:
+                data = data.astype(dtype)
+
+            anchor = DataFrame(data)
+            self._anchor = anchor
+            self._col_label = anchor._internal.column_labels[0]
+            object.__setattr__(anchor, "_psseries", {self._column_label: self})
         else:
             if isinstance(data, pd.Series):
                 assert index is None
@@ -703,9 +746,6 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
 
     # create accessor for pandas-on-Spark specific methods.
     pandas_on_spark = CachedAccessor("pandas_on_spark", PandasOnSparkSeriesMethods)
-
-    # keep the name "koalas" for backward compatibility.
-    koalas = CachedAccessor("koalas", PandasOnSparkSeriesMethods)
 
     # Comparison Operators
     def eq(self, other: Any) -> "Series":
@@ -1635,7 +1675,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
 
         >>> from collections import OrderedDict, defaultdict
         >>> s.to_dict(OrderedDict)
-        OrderedDict([(0, 1), (1, 2), (2, 3), (3, 4)])
+        OrderedDict(...)
 
         >>> dd = defaultdict(list)
         >>> s.to_dict(dd)  # doctest: +ELLIPSIS
@@ -1893,7 +1933,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         index: array-like, optional
             New labels / index to conform to, should be specified using keywords.
             Preferably an Index object to avoid duplicating data
-        fill_value : scalar, default np.NaN
+        fill_value : scalar, default np.nan
             Value to use for missing values. Defaults to NaN, but can be any
             "compatible" value.
 
@@ -2061,7 +2101,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         """Fill NA/NaN values.
 
         .. note:: the current implementation of 'method' parameter in fillna uses Spark's Window
-            without specifying partition specification. This leads to moveing all data into
+            without specifying partition specification. This leads to moving all data into
             a single partition in a single machine and could cause serious
             performance degradation. Avoid this method with very large datasets.
 
@@ -2235,6 +2275,12 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         limit_direction: Optional[str] = None,
         limit_area: Optional[str] = None,
     ) -> "Series":
+        if self.dtype == "object":
+            warnings.warn(
+                "Series.interpolate with object dtype is deprecated and will raise in a "
+                "future version. Convert to a specific numeric type before interpolating.",
+                FutureWarning,
+            )
         if method not in ["linear"]:
             raise NotImplementedError("interpolate currently works only for method='linear'")
         if (limit is not None) and (not limit > 0):
@@ -2255,15 +2301,14 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         last_non_null = F.last(scol, True)
         null_index = SF.null_index(scol)
 
-        Window = get_window_class()
-        window_forward = Window.orderBy(NATURAL_ORDER_COLUMN_NAME).rowsBetween(
-            Window.unboundedPreceding, Window.currentRow
+        window_forward = PySparkWindow.orderBy(NATURAL_ORDER_COLUMN_NAME).rowsBetween(
+            PySparkWindow.unboundedPreceding, PySparkWindow.currentRow
         )
         last_non_null_forward = last_non_null.over(window_forward)
         null_index_forward = null_index.over(window_forward)
 
-        window_backward = Window.orderBy(F.desc(NATURAL_ORDER_COLUMN_NAME)).rowsBetween(
-            Window.unboundedPreceding, Window.currentRow
+        window_backward = PySparkWindow.orderBy(F.desc(NATURAL_ORDER_COLUMN_NAME)).rowsBetween(
+            PySparkWindow.unboundedPreceding, PySparkWindow.currentRow
         )
         last_non_null_backward = last_non_null.over(window_backward)
         null_index_backward = null_index.over(window_backward)
@@ -3305,7 +3350,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         the Series and its shifted self.
 
         .. note:: the current implementation of rank uses Spark's Window without
-            specifying partition specification. This leads to moveing all data into
+            specifying partition specification. This leads to moving all data into
             a single partition in a single machine and could cause serious
             performance degradation. Avoid this method with very large datasets.
 
@@ -3365,13 +3410,21 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         else:
             lag_scol = F.lag(scol, lag).over(Window.orderBy(NATURAL_ORDER_COLUMN_NAME))
             lag_col_name = verify_temp_column_name(sdf, "__autocorr_lag_tmp_col__")
-            corr = (
-                sdf.withColumn(lag_col_name, lag_scol)
-                .select(F.corr(scol, F.col(lag_col_name)))
-                .head()[0]
-            )
+
+            sdf_lag = sdf.withColumn(lag_col_name, lag_scol)
+            if is_ansi_mode_enabled(sdf.sparkSession):
+                # Compute covariance between the original and lagged columns.
+                # If the covariance is None or zero (indicating no linear relationship),
+                # return NaN, otherwise, proceeding to compute correlation may raise
+                # DIVIDE_BY_ZERO under ANSI mode.
+                cov_value = sdf_lag.select(F.covar_samp(scol, F.col(lag_col_name))).head()[0]
+                if cov_value is None or cov_value == 0.0:
+                    return np.nan
+            corr = sdf_lag.select(F.corr(scol, F.col(lag_col_name))).head()[0]
+
         return np.nan if corr is None else corr
 
+    @with_ansi_mode_context
     def corr(
         self, other: "Series", method: str = "pearson", min_periods: Optional[int] = None
     ) -> float:
@@ -4061,7 +4114,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         assigned a rank that is the average of the ranks of those values.
 
         .. note:: the current implementation of rank uses Spark's Window without
-            specifying partition specification. This leads to moveing all data into
+            specifying partition specification. This leads to moving all data into
             a single partition in a single machine and could cause serious
             performance degradation. Avoid this method with very large datasets.
 
@@ -4169,11 +4222,10 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         if self._internal.index_level > 1:
             raise NotImplementedError("rank do not support MultiIndex now")
 
-        Column = get_column_class()
         if ascending:
-            asc_func = Column.asc
+            asc_func = PySparkColumn.asc
         else:
-            asc_func = Column.desc
+            asc_func = PySparkColumn.desc
 
         if method == "first":
             window = (
@@ -4240,7 +4292,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         DataFrame (default is the element in the same column of the previous row).
 
         .. note:: the current implementation of diff uses Spark's Window without
-            specifying partition specification. This leads to moveing all data into
+            specifying partition specification. This leads to moving all data into
             a single partition in a single machine and could cause serious
             performance degradation. Avoid this method with very large datasets.
 
@@ -4554,7 +4606,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         C    2
         dtype: int64
 
-        >>> s.pop('A')
+        >>> int(s.pop('A'))
         0
 
         >>> s
@@ -4852,6 +4904,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         return self.index
 
     # TODO: introduce 'in_place'; fully support 'regex'
+    @with_ansi_mode_context
     def replace(
         self,
         to_replace: Optional[Union[Any, List, Tuple, Dict]] = None,
@@ -5077,33 +5130,68 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
                     )
                 )
             to_replace = {k: v for k, v in zip(to_replace, value)}
+
+        spark_session = self._internal.spark_frame.sparkSession
+        ansi_mode = is_ansi_mode_enabled(spark_session)
+        col_type = self.spark.data_type
+
         if isinstance(to_replace, dict):
             is_start = True
             if len(to_replace) == 0:
                 current = self.spark.column
             else:
                 for to_replace_, value in to_replace.items():
-                    cond = (
-                        (F.isnan(self.spark.column) | self.spark.column.isNull())
-                        if pd.isna(to_replace_)
-                        else (self.spark.column == F.lit(to_replace_))
-                    )
+                    if pd.isna(to_replace_):
+                        if ansi_mode and isinstance(col_type, NumericType):
+                            cond = F.isnan(self.spark.column) | self.spark.column.isNull()
+                        else:
+                            cond = self.spark.column.isNull()
+                    else:
+                        to_replace_lit = (
+                            F.lit(to_replace_).try_cast(col_type)
+                            if ansi_mode
+                            else F.lit(to_replace_)
+                        )
+                        cond = self.spark.column == to_replace_lit
+                    value_expr = F.lit(value).try_cast(col_type) if ansi_mode else F.lit(value)
                     if is_start:
-                        current = F.when(cond, value)
+                        current = F.when(cond, value_expr)
                         is_start = False
                     else:
-                        current = current.when(cond, value)
+                        current = current.when(cond, value_expr)
                 current = current.otherwise(self.spark.column)
         else:
             if regex:
                 # to_replace must be a string
                 cond = self.spark.column.rlike(cast(str, to_replace))
             else:
-                cond = self.spark.column.isin(to_replace)
+                if ansi_mode:
+                    to_replace_values = (
+                        [to_replace]
+                        if not is_list_like(to_replace) or isinstance(to_replace, str)
+                        else to_replace
+                    )
+                    to_replace_values = cast(List[Any], to_replace_values)
+                    literals = [F.lit(v).try_cast(col_type) for v in to_replace_values]
+                    cond = self.spark.column.isin(literals)
+                else:
+                    cond = self.spark.column.isin(to_replace)
                 # to_replace may be a scalar
                 if np.array(pd.isna(to_replace)).any():
-                    cond = cond | F.isnan(self.spark.column) | self.spark.column.isNull()
-            current = F.when(cond, value).otherwise(self.spark.column)
+                    if ansi_mode:
+                        if isinstance(col_type, NumericType):
+                            cond = cond | F.isnan(self.spark.column) | self.spark.column.isNull()
+                        else:
+                            cond = cond | self.spark.column.isNull()
+                    else:
+                        cond = cond | F.isnan(self.spark.column) | self.spark.column.isNull()
+
+            if ansi_mode:
+                value_expr = F.lit(value).try_cast(col_type)
+                current = F.when(cond, value_expr).otherwise(self.spark.column.try_cast(col_type))
+
+            else:
+                current = F.when(cond, value).otherwise(self.spark.column)
 
         return self._with_new_scol(current)  # TODO: dtype?
 
@@ -5482,7 +5570,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         Percentage change between the current and a prior element.
 
         .. note:: the current implementation of this API uses Spark's Window without
-            specifying partition specification. This leads to moveing all data into
+            specifying partition specification. This leads to moving all data into
             a single partition in a single machine and could cause serious
             performance degradation. Avoid this method with very large datasets.
 
@@ -5817,7 +5905,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
 
         A scalar `where`.
 
-        >>> s.asof(20)
+        >>> float(s.asof(20))
         2.0
 
         For a sequence `where`, a Series is returned. The first value is
@@ -5832,12 +5920,12 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         Missing values are not considered. The following is ``2.0``, not
         NaN, even though NaN is at the index location for ``30``.
 
-        >>> s.asof(30)
+        >>> float(s.asof(30))
         2.0
 
         >>> s = ps.Series([1, 2, np.nan, 4], index=[10, 30, 20, 40])
         >>> with ps.option_context("compute.eager_check", False):
-        ...     s.asof(20)
+        ...     float(s.asof(20))
         ...
         1.0
         """
@@ -5868,7 +5956,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
                     # then return monotonically_increasing_id. This will let max by
                     # to return last index value, which is the behaviour of pandas
                     else spark_column.isNotNull(),
-                    monotonically_increasing_id_column,
+                    F.col(monotonically_increasing_id_column),
                 ),
             )
             for index in where
@@ -6976,36 +7064,17 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         return psser._cum(F.sum, skipna, part_cols)
 
     def _cumprod(self, skipna: bool, part_cols: Sequence["ColumnOrName"] = ()) -> "Series":
-        if isinstance(self.spark.data_type, BooleanType):
-            scol = self._cum(
-                lambda scol: F.min(F.coalesce(scol, F.lit(True))), skipna, part_cols
-            ).spark.column.cast(LongType())
-        elif isinstance(self.spark.data_type, NumericType):
-            num_zeros = self._cum(
-                lambda scol: F.sum(F.when(scol == 0, 1).otherwise(0)), skipna, part_cols
-            ).spark.column
-            num_negatives = self._cum(
-                lambda scol: F.sum(F.when(scol < 0, 1).otherwise(0)), skipna, part_cols
-            ).spark.column
-            sign = F.when(num_negatives % 2 == 0, 1).otherwise(-1)
-
-            abs_prod = F.exp(
-                self._cum(lambda scol: F.sum(F.log(F.abs(scol))), skipna, part_cols).spark.column
-            )
-
-            scol = F.when(num_zeros > 0, 0).otherwise(sign * abs_prod)
-
-            if isinstance(self.spark.data_type, IntegralType):
-                scol = F.round(scol).cast(LongType())
-        else:
+        psser = self
+        if isinstance(psser.spark.data_type, BooleanType):
+            psser = psser.spark.transform(lambda scol: scol.cast(LongType()))
+        elif not isinstance(psser.spark.data_type, NumericType):
             raise TypeError(
                 "Could not convert {} ({}) to numeric".format(
-                    spark_type_to_pandas_dtype(self.spark.data_type),
-                    self.spark.data_type.simpleString(),
+                    spark_type_to_pandas_dtype(psser.spark.data_type),
+                    psser.spark.data_type.simpleString(),
                 )
             )
-
-        return self._with_new_scol(scol)
+        return psser._cum(lambda c: SF.product(c, skipna), skipna, part_cols)
 
     # ----------------------------------------------------------------------
     # Accessor Methods
@@ -7109,15 +7178,15 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         ----------
         rule : str
             The offset string or object representing target conversion.
-            Currently, supported units are {'Y', 'A', 'M', 'D', 'H',
-            'T', 'MIN', 'S'}.
+            Currently, supported units are {'YE', 'A', 'ME', 'D', 'h',
+            'min', 'MIN', 's'}.
         closed : {{'right', 'left'}}, default None
             Which side of bin interval is closed. The default is 'left'
-            for all frequency offsets except for 'A', 'Y' and 'M' which all
+            for all frequency offsets except for 'A', 'YE' and 'ME' which all
             have a default of 'right'.
         label : {{'right', 'left'}}, default None
             Which bin edge label to label bucket with. The default is 'left'
-            for all frequency offsets except for 'A', 'Y' and 'M' which all
+            for all frequency offsets except for 'A', 'YE' and 'ME' which all
             have a default of 'right'.
         on : Series, optional
             For a DataFrame, column to use instead of index for resampling.
@@ -7356,6 +7425,7 @@ def _test() -> None:
 
     globs = pyspark.pandas.series.__dict__.copy()
     globs["ps"] = pyspark.pandas
+
     spark = (
         SparkSession.builder.master("local[4]").appName("pyspark.pandas.series tests").getOrCreate()
     )

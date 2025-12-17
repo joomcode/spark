@@ -21,19 +21,11 @@ import numpy as np
 import pandas as pd
 
 from pyspark import pandas as ps
-from pyspark.testing.pandasutils import ComparisonTestBase
+from pyspark.testing.pandasutils import PandasOnSparkTestCase
 from pyspark.testing.sqlutils import SQLTestUtils
 
 
 class SeriesStatMixin:
-    @property
-    def pser(self):
-        return pd.Series([1, 2, 3, 4, 5, 6, 7], name="x")
-
-    @property
-    def psser(self):
-        return ps.from_pandas(self.pser)
-
     def test_nunique(self):
         pser = pd.Series([1, 2, 1, np.nan])
         psser = ps.from_pandas(pser)
@@ -614,6 +606,9 @@ class SeriesStatMixin:
         with self.assertRaisesRegex(TypeError, r"lag should be an int; however, got"):
             psser.autocorr(1.0)
 
+        psser = ps.Series([1, 0, 0, 0])
+        self.assertTrue(bool(np.isnan(psser.autocorr())))
+
     def _test_autocorr(self, pdf):
         psdf = ps.from_pandas(pdf)
         for lag in range(-10, 10):
@@ -702,7 +697,11 @@ class SeriesStatMixin:
             ps.Series(["a", "b", "c"]).sem()
 
 
-class SeriesStatTests(SeriesStatMixin, ComparisonTestBase, SQLTestUtils):
+class SeriesStatTests(
+    SeriesStatMixin,
+    PandasOnSparkTestCase,
+    SQLTestUtils,
+):
     pass
 
 

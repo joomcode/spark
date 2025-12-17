@@ -19,7 +19,8 @@ package org.apache.spark.sql.execution.window
 
 import org.apache.spark.{PartitionEvaluator, PartitionEvaluatorFactory}
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, JoinedRow, NamedExpression, SortOrder, SpecificInternalRow, UnsafeProjection, UnsafeRow}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, InterpretedOrdering, JoinedRow, NamedExpression, SortOrder, SpecificInternalRow, UnsafeProjection, UnsafeRow}
+import org.apache.spark.sql.catalyst.util.UnsafeRowUtils
 import org.apache.spark.sql.execution.ExternalAppendOnlyUnsafeRowArray
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.internal.SQLConf
@@ -44,6 +45,7 @@ class WindowEvaluatorFactory(
     private val factories = windowFrameExpressionFactoryPairs.map(_._2).toArray
     private val inMemoryThreshold = conf.windowExecBufferInMemoryThreshold
     private val spillThreshold = conf.windowExecBufferSpillThreshold
+    private val sizeInBytesSpillThreshold = conf.windowExecBufferSpillSizeThreshold
 
     override def eval(
         partitionIndex: Int,
@@ -54,6 +56,14 @@ class WindowEvaluatorFactory(
         // Get all relevant projections.
         val result = createResultProjection(expressions)
         val grouping = UnsafeProjection.create(partitionSpec, childOutput)
+        val groupEqualityCheck =
+          if (partitionSpec.forall(e => UnsafeRowUtils.isBinaryStable(e.dataType))) {
+            (key1: UnsafeRow, key2: UnsafeRow) => key1.equals(key2)
+          } else {
+            val types = partitionSpec.map(_.dataType)
+            val ordering = InterpretedOrdering.forSchema(types)
+            (key1: UnsafeRow, key2: UnsafeRow) => ordering.compare(key1, key2) == 0
+        }
 
         // Manage the stream and the grouping.
         var nextRow: UnsafeRow = null
@@ -73,7 +83,13 @@ class WindowEvaluatorFactory(
 
         // Manage the current partition.
         val buffer: ExternalAppendOnlyUnsafeRowArray =
-          new ExternalAppendOnlyUnsafeRowArray(inMemoryThreshold, spillThreshold)
+          new ExternalAppendOnlyUnsafeRowArray(
+            inMemoryThreshold,
+            // TODO: shall we have a new config to specify the max in-memory buffer size
+            //       of ExternalAppendOnlyUnsafeRowArray?
+            sizeInBytesSpillThreshold,
+            spillThreshold,
+            sizeInBytesSpillThreshold)
 
         var bufferIterator: Iterator[UnsafeRow] = _
 
@@ -88,7 +104,7 @@ class WindowEvaluatorFactory(
           // clear last partition
           buffer.clear()
 
-          while (nextRowAvailable && nextGroup == currentGroup) {
+          while (nextRowAvailable && groupEqualityCheck(nextGroup, currentGroup)) {
             buffer.add(nextRow)
             fetchNextRow()
           }

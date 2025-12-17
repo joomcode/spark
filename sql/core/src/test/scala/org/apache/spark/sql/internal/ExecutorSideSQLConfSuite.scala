@@ -21,12 +21,12 @@ import java.util.UUID
 
 import org.scalatest.Assertions._
 
-import org.apache.spark.{SparkException, SparkFunSuite, TaskContext}
+import org.apache.spark.{SparkFunSuite, SparkNoSuchElementException, TaskContext}
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{Dataset, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
+import org.apache.spark.sql.classic.{Dataset, SparkSession}
 import org.apache.spark.sql.execution.{LeafExecNode, QueryExecution, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.DisableAdaptiveExecution
 import org.apache.spark.sql.execution.debug.codegenStringSeq
@@ -58,7 +58,7 @@ class ExecutorSideSQLConfSuite extends SparkFunSuite with SQLTestUtils {
     }
   }
 
-  override def withSQLConf(pairs: (String, String)*)(f: => Unit): Unit = {
+  override def withSQLConf[T](pairs: (String, String)*)(f: => T): T = {
     pairs.foreach { case (k, v) =>
       SQLConf.get.setConfString(k, v)
     }
@@ -127,8 +127,7 @@ class ExecutorSideSQLConfSuite extends SparkFunSuite with SQLTestUtils {
     }
     val dummyQueryExecution1 = FakeQueryExecution(spark, physicalPlan)
     // Without setting the configs assertions fail
-    val e = intercept[SparkException](dummyQueryExecution1.toRdd.collect())
-    assert(e.getCause.isInstanceOf[NoSuchElementException])
+    intercept[SparkNoSuchElementException](dummyQueryExecution1.toRdd.collect())
   }
 
   test("SPARK-30556 propagate local properties to subquery execution thread") {

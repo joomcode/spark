@@ -21,11 +21,17 @@ import numpy as np
 import pandas as pd
 
 from pyspark import pandas as ps
-from pyspark.testing.pandasutils import ComparisonTestBase
+from pyspark.testing.pandasutils import PandasOnSparkTestCase
 from pyspark.testing.sqlutils import SQLTestUtils
 
 
 class FrameDescribeMixin:
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Some nanosecond->microsecond conversions throw loss of precision errors
+        cls.spark.conf.set("spark.sql.execution.pandas.convertToArrowArraySafely", "false")
+
     @property
     def pdf(self):
         return pd.DataFrame(
@@ -229,7 +235,11 @@ class FrameDescribeMixin:
         )
 
 
-class FrameDescribeTests(FrameDescribeMixin, ComparisonTestBase, SQLTestUtils):
+class FrameDescribeTests(
+    FrameDescribeMixin,
+    PandasOnSparkTestCase,
+    SQLTestUtils,
+):
     pass
 
 

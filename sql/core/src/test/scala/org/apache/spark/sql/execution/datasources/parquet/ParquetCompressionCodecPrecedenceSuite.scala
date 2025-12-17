@@ -18,13 +18,13 @@
 package org.apache.spark.sql.execution.datasources.parquet
 
 import java.io.File
-import java.util.Locale
 
 import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.fs.Path
 import org.apache.parquet.hadoop.ParquetOutputFormat
 
+import org.apache.spark.SparkIllegalArgumentException
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 
@@ -41,29 +41,28 @@ class ParquetCompressionCodecPrecedenceSuite extends ParquetTest with SharedSpar
 
   test("[SPARK-21786] Test Acquiring 'compressionCodecClassName' for parquet in right order.") {
     // When "compression" is configured, it should be the first choice.
-    withSQLConf(SQLConf.PARQUET_COMPRESSION.key ->
-      ParquetCompressionCodec.SNAPPY.name.toLowerCase(Locale.ROOT)) {
+    withSQLConf(
+      SQLConf.PARQUET_COMPRESSION.key -> ParquetCompressionCodec.SNAPPY.lowerCaseName()) {
       val props = Map(
-        "compression" -> ParquetCompressionCodec.UNCOMPRESSED.name.toLowerCase(Locale.ROOT),
-        ParquetOutputFormat.COMPRESSION ->
-          ParquetCompressionCodec.GZIP.name.toLowerCase(Locale.ROOT))
+        "compression" -> ParquetCompressionCodec.UNCOMPRESSED.lowerCaseName(),
+        ParquetOutputFormat.COMPRESSION -> ParquetCompressionCodec.GZIP.lowerCaseName())
       val option = new ParquetOptions(props, spark.sessionState.conf)
       assert(option.compressionCodecClassName == ParquetCompressionCodec.UNCOMPRESSED.name)
     }
 
     // When "compression" is not configured, "parquet.compression" should be the preferred choice.
-    withSQLConf(SQLConf.PARQUET_COMPRESSION.key ->
-      ParquetCompressionCodec.SNAPPY.name.toLowerCase(Locale.ROOT)) {
-      val props = Map(ParquetOutputFormat.COMPRESSION ->
-        ParquetCompressionCodec.GZIP.name.toLowerCase(Locale.ROOT))
+    withSQLConf(
+      SQLConf.PARQUET_COMPRESSION.key -> ParquetCompressionCodec.SNAPPY.lowerCaseName()) {
+      val props =
+        Map(ParquetOutputFormat.COMPRESSION -> ParquetCompressionCodec.GZIP.lowerCaseName())
       val option = new ParquetOptions(props, spark.sessionState.conf)
       assert(option.compressionCodecClassName == ParquetCompressionCodec.GZIP.name)
     }
 
     // When both "compression" and "parquet.compression" are not configured,
     // spark.sql.parquet.compression.codec should be the right choice.
-    withSQLConf(SQLConf.PARQUET_COMPRESSION.key ->
-      ParquetCompressionCodec.SNAPPY.name.toLowerCase(Locale.ROOT)) {
+    withSQLConf(
+      SQLConf.PARQUET_COMPRESSION.key -> ParquetCompressionCodec.SNAPPY.lowerCaseName()) {
       val props = Map.empty[String, String]
       val option = new ParquetOptions(props, spark.sessionState.conf)
       assert(option.compressionCodecClassName == ParquetCompressionCodec.SNAPPY.name)
@@ -122,10 +121,15 @@ class ParquetCompressionCodecPrecedenceSuite extends ParquetTest with SharedSpar
 
   test("Create table with unknown compression") {
     Seq(true, false).foreach { isPartitioned =>
-      val exception = intercept[IllegalArgumentException] {
-        checkCompressionCodec("aa", isPartitioned)
-      }
-      assert(exception.getMessage.contains("Codec [aa] is not available"))
+      checkError(
+        exception = intercept[SparkIllegalArgumentException] {
+          checkCompressionCodec("aa", isPartitioned)
+        },
+        condition = "CODEC_NOT_AVAILABLE.WITH_AVAILABLE_CODECS_SUGGESTION",
+        parameters = Map(
+          "codecName" -> "aa",
+          "availableCodecs" -> ("brotli, uncompressed, lzo, snappy, " +
+            "lz4_raw, none, zstd, lz4, gzip")))
     }
   }
 }

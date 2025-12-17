@@ -19,7 +19,7 @@ package org.apache.spark.sql.catalyst.expressions
 
 import scala.reflect.ClassTag
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkFunSuite, SparkThrowable}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.UTC_OPT
 import org.apache.spark.sql.types._
@@ -44,6 +44,14 @@ class TryCastSuite extends CastWithAnsiOnSuite {
     checkEvaluation(expression, null, inputRow)
   }
 
+  override def checkErrorInExpression[T <: SparkThrowable : ClassTag](
+      expression: => Expression,
+      inputRow: InternalRow,
+      condition: String,
+      parameters: Map[String, String]): Unit = {
+    checkEvaluation(expression, null, inputRow)
+  }
+
   override def checkCastToBooleanError(l: Literal, to: DataType, tryCastResult: Any): Unit = {
     checkEvaluation(cast(l, to), tryCastResult, InternalRow(l.value))
   }
@@ -51,6 +59,15 @@ class TryCastSuite extends CastWithAnsiOnSuite {
   override def checkCastToNumericError(l: Literal, to: DataType,
       expectedDataTypeInErrorMsg: DataType, tryCastResult: Any): Unit = {
     checkEvaluation(cast(l, to), tryCastResult, InternalRow(l.value))
+  }
+
+  override protected def checkInvalidCastFromNumericTypeToBinaryType(): Unit = {
+    // All numeric types: `CAST_WITHOUT_SUGGESTION`
+    Seq(1.toByte, 1.toShort, 1, 1L, 1.0.toFloat, 1.0).foreach { testValue =>
+      val expectedError =
+        createCastMismatch(Literal(testValue).dataType, BinaryType, "CAST_WITHOUT_SUGGESTION")
+      assert(cast(testValue, BinaryType).checkInputDataTypes() == expectedError)
+    }
   }
 
   test("print string") {

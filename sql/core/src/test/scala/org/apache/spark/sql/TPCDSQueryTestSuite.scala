@@ -23,10 +23,11 @@ import java.nio.file.{Files, Paths}
 import scala.jdk.CollectionConverters._
 
 import org.apache.spark.{SparkConf, SparkContext}
-import org.apache.spark.sql.catalyst.util.{fileToString, resourceToString, stringToFile}
+import org.apache.spark.sql.catalyst.util.{resourceToString, stringToFile}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.TestSparkSession
 import org.apache.spark.tags.ExtendedSQLTest
+import org.apache.spark.util.Utils
 
 /**
  * End-to-end tests to check TPCDS query results.
@@ -62,6 +63,7 @@ class TPCDSQueryTestSuite extends QueryTest with TPCDSBase with SQLQueryTestHelp
   // To make output results deterministic
   override protected def sparkConf: SparkConf = super.sparkConf
     .set(SQLConf.SHUFFLE_PARTITIONS.key, "1")
+    .remove("spark.hadoop.fs.file.impl")
 
   protected override def createSparkSession: TestSparkSession = {
     new TestSparkSession(new SparkContext("local[1]", this.getClass.getSimpleName, sparkConf))
@@ -121,14 +123,14 @@ class TPCDSQueryTestSuite extends QueryTest with TPCDSBase with SQLQueryTestHelp
           }
           val parent = goldenFile.getParentFile
           if (!parent.exists()) {
-            assert(parent.mkdirs(), "Could not create directory: " + parent)
+            assert(Utils.createDirectory(parent), "Could not create directory: " + parent)
           }
           stringToFile(goldenFile, goldenOutput)
         }
 
         // Read back the golden file.
         val (expectedSchema, expectedOutput) = {
-          val goldenOutput = fileToString(goldenFile)
+          val goldenOutput = Files.readString(goldenFile.toPath)
           val segments = goldenOutput.split("-- !query.*\n")
 
           // query has 3 segments, plus the header
@@ -139,7 +141,14 @@ class TPCDSQueryTestSuite extends QueryTest with TPCDSBase with SQLQueryTestHelp
           (segments(1).trim, segments(2).replaceAll("\\s+$", ""))
         }
 
-        assertResult(expectedSchema, s"Schema did not match\n$queryString") {
+        val notMatchedSchemaOutput = if (schema == emptySchema) {
+          // There might be exception. See `handleExceptions`.
+          s"Schema did not match\n$queryString\nOutput/Exception: $outputString"
+        } else {
+          s"Schema did not match\n$queryString"
+        }
+
+        assertResult(expectedSchema, notMatchedSchemaOutput) {
           schema
         }
         if (shouldSortResults) {

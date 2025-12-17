@@ -31,12 +31,14 @@ import org.apache.orc.mapred.OrcStruct
 import org.apache.orc.mapreduce._
 
 import org.apache.spark.TaskContext
+import org.apache.spark.memory.MemoryMode
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.execution.datasources._
+import org.apache.spark.sql.internal.SessionStateHelper
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types._
 import org.apache.spark.util.{SerializableConfiguration, Utils}
@@ -47,6 +49,7 @@ import org.apache.spark.util.{SerializableConfiguration, Utils}
 class OrcFileFormat
   extends FileFormat
   with DataSourceRegister
+  with SessionStateHelper
   with Serializable {
 
   override def shortName(): String = "orc"
@@ -69,7 +72,8 @@ class OrcFileFormat
       job: Job,
       options: Map[String, String],
       dataSchema: StructType): OutputWriterFactory = {
-    val orcOptions = new OrcOptions(options, sparkSession.sessionState.conf)
+    val sqlConf = getSqlConf(sparkSession)
+    val orcOptions = new OrcOptions(options, sqlConf)
 
     val conf = job.getConfiguration
 
@@ -78,7 +82,7 @@ class OrcFileFormat
     conf.asInstanceOf[JobConf]
       .setOutputFormat(classOf[org.apache.orc.mapred.OrcOutputFormat[OrcStruct]])
 
-    val batchSize = sparkSession.sessionState.conf.orcVectorizedWriterBatchSize
+    val batchSize = sqlConf.orcVectorizedWriterBatchSize
 
     new OutputWriterFactory {
       override def newInstance(
@@ -100,10 +104,10 @@ class OrcFileFormat
   }
 
   override def supportBatch(sparkSession: SparkSession, schema: StructType): Boolean = {
-    val conf = sparkSession.sessionState.conf
-    conf.orcVectorizedReaderEnabled &&
+    val sqlConf = getSqlConf(sparkSession)
+    sqlConf.orcVectorizedReaderEnabled &&
       schema.forall(s => OrcUtils.supportColumnarReads(
-        s.dataType, sparkSession.sessionState.conf.orcVectorizedReaderNestedColumnEnabled))
+        s.dataType, sqlConf.orcVectorizedReaderNestedColumnEnabled))
   }
 
   override def isSplitable(
@@ -135,7 +139,7 @@ class OrcFileFormat
       hadoopConf: Configuration): (PartitionedFile) => Iterator[InternalRow] = {
 
     val resultSchema = StructType(requiredSchema.fields ++ partitionSchema.fields)
-    val sqlConf = sparkSession.sessionState.conf
+    val sqlConf = getSqlConf(sparkSession)
     val capacity = sqlConf.orcVectorizedReaderBatchSize
 
     // Should always be set by FileSourceScanExec creating this.
@@ -152,12 +156,18 @@ class OrcFileFormat
       assert(supportBatch(sparkSession, resultSchema))
     }
 
+    val memoryMode = if (sqlConf.offHeapColumnVectorEnabled) {
+      MemoryMode.OFF_HEAP
+    } else {
+      MemoryMode.ON_HEAP
+    }
+
     OrcConf.IS_SCHEMA_EVOLUTION_CASE_SENSITIVE.setBoolean(hadoopConf, sqlConf.caseSensitiveAnalysis)
 
     val broadcastedConf =
-      sparkSession.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
-    val isCaseSensitive = sparkSession.sessionState.conf.caseSensitiveAnalysis
-    val orcFilterPushDown = sparkSession.sessionState.conf.orcFilterPushDown
+        SerializableConfiguration.broadcast(sparkSession.sparkContext, hadoopConf)
+    val isCaseSensitive = sqlConf.caseSensitiveAnalysis
+    val orcFilterPushDown = sqlConf.orcFilterPushDown
 
     (file: PartitionedFile) => {
       val conf = broadcastedConf.value.value
@@ -196,7 +206,7 @@ class OrcFileFormat
         val taskAttemptContext = new TaskAttemptContextImpl(taskConf, attemptId)
 
         if (enableVectorizedReader) {
-          val batchReader = new OrcColumnarBatchReader(capacity)
+          val batchReader = new OrcColumnarBatchReader(capacity, memoryMode)
           // SPARK-23399 Register a task completion listener first to call `close()` in all cases.
           // There is a possibility that `initialize` and `initBatch` hit some errors (like OOM)
           // after opening a file.
@@ -205,7 +215,7 @@ class OrcFileFormat
           val requestedDataColIds = requestedColIds ++ Array.fill(partitionSchema.length)(-1)
           val requestedPartitionColIds =
             Array.fill(requiredSchema.length)(-1) ++ Range(0, partitionSchema.length)
-          batchReader.initialize(fileSplit, taskAttemptContext)
+          batchReader.initialize(fileSplit, taskAttemptContext, readerOptions.getOrcTail)
           batchReader.initBatch(
             TypeDescription.fromString(resultSchemaString),
             resultSchema.fields,
@@ -237,6 +247,8 @@ class OrcFileFormat
   }
 
   override def supportDataType(dataType: DataType): Boolean = dataType match {
+    case _: VariantType => false
+
     case _: AtomicType => true
 
     case st: StructType => st.forall { f => supportDataType(f.dataType) }

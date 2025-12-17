@@ -29,6 +29,7 @@ import org.apache.spark.sql.execution.metric.SQLMetrics
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.connector.SupportsMetadata
 import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 trait DataSourceV2ScanExecBase extends LeafExecNode {
@@ -70,7 +71,7 @@ trait DataSourceV2ScanExecBase extends LeafExecNode {
    * Shorthand for calling redact() without specifying redacting rules
    */
   protected def redact(text: String): String = {
-    Utils.redact(session.sessionState.conf.stringRedactionPattern, text)
+    Utils.redact(conf.stringRedactionPattern, text)
   }
 
   override def verboseStringWithOperatorId(): String = {
@@ -198,7 +199,7 @@ trait DataSourceV2ScanExecBase extends LeafExecNode {
 
     val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
     SQLMetrics.postDriverMetricUpdates(sparkContext, executionId,
-      driveSQLMetrics)
+      driveSQLMetrics.toImmutableArraySeq)
   }
 
   override def doExecuteColumnar(): RDD[ColumnarBatch] = {

@@ -18,7 +18,7 @@
 package org.apache.spark.streaming
 
 import java.io.{File, NotSerializableException}
-import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.util.Locale
 import java.util.concurrent.{CountDownLatch, TimeUnit}
 import java.util.concurrent.atomic.AtomicInteger
@@ -26,7 +26,6 @@ import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.mutable.ArrayBuffer
 import scala.collection.mutable.Queue
 
-import org.apache.commons.io.FileUtils
 import org.scalatest.{Assertions, PrivateMethodTester}
 import org.scalatest.concurrent.{Signaler, ThreadSignaler, TimeLimits}
 import org.scalatest.concurrent.Eventually._
@@ -153,7 +152,7 @@ class StreamingContextSuite
     addInputStream(ssc).foreachRDD { rdd =>
       // Refer to this.appName from inside closure so that this closure refers to
       // the instance of StreamingContextSuite, and is therefore not serializable
-      rdd.count() + appName
+      s"${rdd.count()}$appName"
     }
 
     // Test whether start() fails early when checkpointing is enabled
@@ -268,7 +267,7 @@ class StreamingContextSuite
     ssc.start()
     ssc.stop(stopSparkContext = false)
     assert(ssc.getState() === StreamingContextState.STOPPED)
-    assert(sc.makeRDD(1 to 100).collect().size === 100)
+    assert(sc.makeRDD(1 to 100).collect().length === 100)
     sc.stop()
 
     // Implicitly do not stop SparkContext
@@ -278,7 +277,7 @@ class StreamingContextSuite
     addInputStream(ssc).register()
     ssc.start()
     ssc.stop()
-    assert(sc.makeRDD(1 to 100).collect().size === 100)
+    assert(sc.makeRDD(1 to 100).collect().length === 100)
     sc.stop()
   }
 
@@ -286,7 +285,7 @@ class StreamingContextSuite
     ssc = new StreamingContext(master, appName, batchDuration)
     addInputStream(ssc).register()
     ssc.stop(stopSparkContext = false)
-    assert(ssc.sc.makeRDD(1 to 100).collect().size === 100)
+    assert(ssc.sc.makeRDD(1 to 100).collect().length === 100)
     ssc.stop(stopSparkContext = true)
     // Check that the SparkContext is actually stopped:
     intercept[Exception] {
@@ -366,6 +365,8 @@ class StreamingContextSuite
     assert(runningCount > 0)
     assert(runningCount == totalNumRecords)
     Thread.sleep(100)
+    sc.stop()
+    LocalStreamingContext.ensureNoActiveSparkContext()
   }
 
   test ("registering and de-registering of streamingSource") {
@@ -910,7 +911,7 @@ class StreamingContextSuite
   def createCorruptedCheckpoint(): String = {
     val checkpointDirectory = Utils.createTempDir().getAbsolutePath()
     val fakeCheckpointFile = Checkpoint.checkpointFile(checkpointDirectory, Time(1000))
-    FileUtils.write(new File(fakeCheckpointFile.toString()), "blablabla", StandardCharsets.UTF_8)
+    Files.writeString(new File(fakeCheckpointFile.toString()).toPath, "blablabla")
     assert(Checkpoint.getCheckpointFiles(checkpointDirectory).nonEmpty)
     checkpointDirectory
   }
@@ -958,7 +959,7 @@ class SlowTestReceiver(totalRecords: Int, recordsPerSecond: Int)
     val thread = new Thread() {
       override def run(): Unit = {
         logInfo("Receiving started")
-        for(i <- 1 to totalRecords) {
+        for (i <- 1 to totalRecords) {
           Thread.sleep(1000 / recordsPerSecond)
           store(i)
         }

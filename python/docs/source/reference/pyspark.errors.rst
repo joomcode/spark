@@ -38,19 +38,28 @@ Classes
     PySparkAssertionError
     PySparkAttributeError
     PySparkException
+    PySparkKeyError
     PySparkNotImplementedError
     PySparkPicklingError
     PySparkRuntimeError
     PySparkTypeError
     PySparkValueError
+    PySparkImportError
+    PySparkIndexError
     PythonException
+    QueryContext
+    QueryContextType
     QueryExecutionException
+    SessionNotSameException
     SparkRuntimeException
     SparkUpgradeException
+    SparkNoSuchElementException
     StreamingQueryException
+    StreamingPythonRunnerInitializationException
     TempTableAlreadyExistsException
     UnknownException
     UnsupportedOperationException
+    PickleException
 
 
 Methods
@@ -61,6 +70,9 @@ Methods
 .. autosummary::
     :toctree: api/
 
+    PySparkException.getCondition
     PySparkException.getErrorClass
+    PySparkException.getMessage
     PySparkException.getMessageParameters
+    PySparkException.getQueryContext
     PySparkException.getSqlState

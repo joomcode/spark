@@ -29,17 +29,18 @@ class StreamingTestsForeachBatchMixin:
         q = None
 
         def collectBatch(batch_df, batch_id):
-            batch_df.createOrReplaceGlobalTempView("test_view")
+            batch_df.write.format("parquet").saveAsTable("test_table1")
 
         try:
             df = self.spark.readStream.format("text").load("python/test_support/sql/streaming")
             q = df.writeStream.foreachBatch(collectBatch).start()
             q.processAllAvailable()
-            collected = self.spark.sql("select * from global_temp.test_view").collect()
+            collected = self.spark.sql("select * from test_table1").collect()
             self.assertTrue(len(collected), 2)
         finally:
             if q:
                 q.stop()
+            self.spark.sql("DROP TABLE IF EXISTS test_table1")
 
     def test_streaming_foreach_batch_tempview(self):
         q = None
@@ -50,18 +51,19 @@ class StreamingTestsForeachBatchMixin:
             # clone the session which is no longer same with the session used to start the
             # streaming query
             assert len(batch_df.sparkSession.sql("SELECT * FROM updates").collect()) == 2
-            # Write to a global view verify on the repl/client side.
-            batch_df.createOrReplaceGlobalTempView("temp_view")
+            # Write a table to verify on the repl/client side.
+            batch_df.write.format("parquet").saveAsTable("test_table2")
 
         try:
             df = self.spark.readStream.format("text").load("python/test_support/sql/streaming")
             q = df.writeStream.foreachBatch(collectBatch).start()
             q.processAllAvailable()
-            collected = self.spark.sql("SELECT * FROM global_temp.temp_view").collect()
+            collected = self.spark.sql("SELECT * FROM test_table2").collect()
             self.assertTrue(len(collected[0]), 2)
         finally:
             if q:
                 q.stop()
+            self.spark.sql("DROP TABLE IF EXISTS test_table2")
 
     def test_streaming_foreach_batch_propagates_python_errors(self):
         from pyspark.errors import StreamingQueryException
@@ -77,7 +79,10 @@ class StreamingTestsForeachBatchMixin:
             q.processAllAvailable()
             self.fail("Expected a failure")
         except StreamingQueryException as e:
-            self.assertTrue("this should fail" in str(e))
+            err_msg = str(e)
+            self.assertTrue("this should fail" in err_msg)
+            # check for foreachBatch error class
+            self.assertTrue("FOREACH_BATCH_USER_FUNCTION_ERROR" in err_msg)
         finally:
             if q:
                 q.stop()
@@ -94,106 +99,131 @@ class StreamingTestsForeachBatchMixin:
 
     def test_streaming_foreach_batch_spark_session(self):
         table_name = "testTable_foreach_batch"
+        with self.table(table_name):
 
-        def func(df: DataFrame, batch_id: int):
-            if batch_id > 0:  # only process once
-                return
-            spark = df.sparkSession
-            df1 = spark.createDataFrame([("structured",), ("streaming",)])
-            df1.union(df).write.mode("append").saveAsTable(table_name)
+            def func(df: DataFrame, batch_id: int):
+                if batch_id > 0:  # only process once
+                    return
+                spark = df.sparkSession
+                df1 = spark.createDataFrame([("structured",), ("streaming",)])
+                df1.union(df).write.mode("append").saveAsTable(table_name)
 
-        df = self.spark.readStream.format("text").load("python/test_support/sql/streaming")
-        q = df.writeStream.foreachBatch(func).start()
-        q.processAllAvailable()
-        q.stop()
+            df = self.spark.readStream.format("text").load("python/test_support/sql/streaming")
+            q = df.writeStream.foreachBatch(func).start()
+            q.processAllAvailable()
+            q.stop()
 
-        actual = self.spark.read.table(table_name)
-        df = (
-            self.spark.read.format("text")
-            .load(path="python/test_support/sql/streaming/")
-            .union(self.spark.createDataFrame([("structured",), ("streaming",)]))
-        )
-        self.assertEqual(sorted(df.collect()), sorted(actual.collect()))
+            actual = self.spark.read.table(table_name)
+            df = (
+                self.spark.read.format("text")
+                .load(path="python/test_support/sql/streaming/")
+                .union(self.spark.createDataFrame([("structured",), ("streaming",)]))
+            )
+            self.assertEqual(sorted(df.collect()), sorted(actual.collect()))
 
     def test_streaming_foreach_batch_path_access(self):
         table_name = "testTable_foreach_batch_path"
+        with self.table(table_name):
 
-        def func(df: DataFrame, batch_id: int):
-            if batch_id > 0:  # only process once
-                return
-            spark = df.sparkSession
-            df1 = spark.read.format("text").load("python/test_support/sql/streaming")
-            df1.union(df).write.mode("append").saveAsTable(table_name)
+            def func(df: DataFrame, batch_id: int):
+                if batch_id > 0:  # only process once
+                    return
+                spark = df.sparkSession
+                df1 = spark.read.format("text").load("python/test_support/sql/streaming")
+                df1.union(df).write.mode("append").saveAsTable(table_name)
 
-        df = self.spark.readStream.format("text").load("python/test_support/sql/streaming")
-        q = df.writeStream.foreachBatch(func).start()
-        q.processAllAvailable()
-        q.stop()
+            df = self.spark.readStream.format("text").load("python/test_support/sql/streaming")
+            q = df.writeStream.foreachBatch(func).start()
+            q.processAllAvailable()
+            q.stop()
 
-        actual = self.spark.read.table(table_name)
-        df = self.spark.read.format("text").load(path="python/test_support/sql/streaming/")
-        df = df.union(df)
-        self.assertEqual(sorted(df.collect()), sorted(actual.collect()))
+            actual = self.spark.read.table(table_name)
+            df = self.spark.read.format("text").load(path="python/test_support/sql/streaming/")
+            df = df.union(df)
+            self.assertEqual(sorted(df.collect()), sorted(actual.collect()))
 
     @staticmethod
     def my_test_function_2():
         return 2
 
-    def test_streaming_foreach_batch_fuction_calling(self):
+    def test_streaming_foreach_batch_function_calling(self):
         def my_test_function_3():
             return 3
 
         table_name = "testTable_foreach_batch_function"
+        with self.table(table_name):
 
-        def func(df: DataFrame, batch_id: int):
-            if batch_id > 0:  # only process once
-                return
-            spark = df.sparkSession
-            df1 = spark.createDataFrame(
+            def func(df: DataFrame, batch_id: int):
+                if batch_id > 0:  # only process once
+                    return
+                spark = df.sparkSession
+                df1 = spark.createDataFrame(
+                    [
+                        (my_test_function_1(),),
+                        (StreamingTestsForeachBatchMixin.my_test_function_2(),),
+                        (my_test_function_3(),),
+                    ]
+                )
+                df1.write.mode("append").saveAsTable(table_name)
+
+            df = self.spark.readStream.format("rate").load()
+            q = df.writeStream.foreachBatch(func).start()
+            q.processAllAvailable()
+            q.stop()
+
+            actual = self.spark.read.table(table_name)
+            df = self.spark.createDataFrame(
                 [
                     (my_test_function_1(),),
                     (StreamingTestsForeachBatchMixin.my_test_function_2(),),
                     (my_test_function_3(),),
                 ]
             )
-            df1.write.mode("append").saveAsTable(table_name)
-
-        df = self.spark.readStream.format("rate").load()
-        q = df.writeStream.foreachBatch(func).start()
-        q.processAllAvailable()
-        q.stop()
-
-        actual = self.spark.read.table(table_name)
-        df = self.spark.createDataFrame(
-            [
-                (my_test_function_1(),),
-                (StreamingTestsForeachBatchMixin.my_test_function_2(),),
-                (my_test_function_3(),),
-            ]
-        )
-        self.assertEqual(sorted(df.collect()), sorted(actual.collect()))
+            self.assertEqual(sorted(df.collect()), sorted(actual.collect()))
 
     def test_streaming_foreach_batch_import(self):
         import time  # not imported in foreach_batch_worker
 
         table_name = "testTable_foreach_batch_import"
+        with self.table(table_name):
 
-        def func(df: DataFrame, batch_id: int):
-            if batch_id > 0:  # only process once
-                return
-            time.sleep(1)
-            spark = df.sparkSession
-            df1 = spark.read.format("text").load("python/test_support/sql/streaming")
-            df1.write.mode("append").saveAsTable(table_name)
+            def func(df: DataFrame, batch_id: int):
+                if batch_id > 0:  # only process once
+                    return
+                time.sleep(1)
+                spark = df.sparkSession
+                df1 = spark.read.format("text").load("python/test_support/sql/streaming")
+                df1.write.mode("append").saveAsTable(table_name)
 
-        df = self.spark.readStream.format("rate").load()
-        q = df.writeStream.foreachBatch(func).start()
-        q.processAllAvailable()
-        q.stop()
+            df = self.spark.readStream.format("rate").load()
+            q = df.writeStream.foreachBatch(func).start()
+            q.processAllAvailable()
+            q.stop()
 
-        actual = self.spark.read.table(table_name)
-        df = self.spark.read.format("text").load("python/test_support/sql/streaming")
-        self.assertEqual(sorted(df.collect()), sorted(actual.collect()))
+            actual = self.spark.read.table(table_name)
+            df = self.spark.read.format("text").load("python/test_support/sql/streaming")
+            self.assertEqual(sorted(df.collect()), sorted(actual.collect()))
+
+    def test_streaming_foreach_batch_external_column(self):
+        from pyspark.sql import functions as sf
+
+        table_name = "testTable_foreach_batch_external_column"
+        with self.table(table_name):
+            # Define 'col' outside the `func` below, so it'd have to be serialized.
+            col = sf.col("value")
+
+            def func(df: DataFrame, batch_id: int):
+                result_df = df.select(col.alias("result"))
+                result_df.write.mode("append").saveAsTable(table_name)
+
+            df = self.spark.readStream.format("text").load("python/test_support/sql/streaming")
+            q = df.writeStream.foreachBatch(func).start()
+            q.processAllAvailable()
+            q.stop()
+
+            collected = self.spark.sql("select * from " + table_name).collect()
+            results = [row["result"] for row in collected]
+            self.assertEqual(sorted(results), ["hello", "this"])
 
 
 class StreamingTestsForeachBatch(StreamingTestsForeachBatchMixin, ReusedSQLTestCase):

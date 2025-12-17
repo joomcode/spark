@@ -17,12 +17,17 @@
 
 package org.apache.spark.sql.execution.datasources.xml
 
+import java.io.{FileNotFoundException, IOException}
 import java.nio.charset.{Charset, StandardCharsets}
+
+import scala.util.control.NonFatal
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path}
+import org.apache.hadoop.hdfs.BlockMissingException
 import org.apache.hadoop.mapreduce.Job
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat
+import org.apache.hadoop.security.AccessControlException
 
 import org.apache.spark.TaskContext
 import org.apache.spark.input.{PortableDataStream, StreamInputFormat}
@@ -31,16 +36,18 @@ import org.apache.spark.rdd.{BinaryFileRDD, RDD}
 import org.apache.spark.sql.{Dataset, Encoders, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.util.FailureSafeParser
-import org.apache.spark.sql.catalyst.xml.{StaxXmlParser, XmlInferSchema, XmlOptions}
+import org.apache.spark.sql.catalyst.xml.{StaxXmlParser, StaxXMLRecordReader, XmlInferSchema, XmlOptions}
+import org.apache.spark.sql.classic.ClassicConversions.castToImpl
 import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.execution.datasources.text.TextFileFormat
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{StructField, StructType, VariantType}
+import org.apache.spark.util.Utils
 
 /**
  * Common functions for parsing XML files
  */
-abstract class XmlDataSource extends Serializable {
+abstract class XmlDataSource extends Serializable with Logging {
   def isSplitable: Boolean
 
   /**
@@ -59,10 +66,14 @@ abstract class XmlDataSource extends Serializable {
       sparkSession: SparkSession,
       inputPaths: Seq[FileStatus],
       parsedOptions: XmlOptions): Option[StructType] = {
-    if (inputPaths.nonEmpty) {
-      Some(infer(sparkSession, inputPaths, parsedOptions))
-    } else {
-      None
+    parsedOptions.singleVariantColumn match {
+      case Some(columnName) => Some(StructType(Array(StructField(columnName, VariantType))))
+      case None =>
+        if (inputPaths.nonEmpty) {
+          Some(infer(sparkSession, inputPaths, parsedOptions))
+        } else {
+          None
+        }
     }
   }
 
@@ -91,7 +102,9 @@ object TextInputXmlDataSource extends XmlDataSource {
       parser: StaxXmlParser,
       schema: StructType): Iterator[InternalRow] = {
     val lines = {
-      val linesReader = new HadoopFileLinesReader(file, None, conf)
+      val linesReader = Utils.createResourceUninterruptiblyIfInTaskThread(
+        new HadoopFileLinesReader(file, None, conf)
+      )
       Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit](_ => linesReader.close()))
       linesReader.map { line =>
         new String(line.getBytes, 0, line.getLength, parser.options.charset)
@@ -121,7 +134,10 @@ object TextInputXmlDataSource extends XmlDataSource {
   def inferFromDataset(
       xml: Dataset[String],
       parsedOptions: XmlOptions): StructType = {
-    XmlInferSchema.infer(xml.rdd, parsedOptions)
+    SQLExecution.withSQLConfPropagated(xml.sparkSession) {
+      new XmlInferSchema(parsedOptions, xml.sparkSession.sessionState.conf.caseSensitiveAnalysis)
+        .infer(xml.rdd)
+    }
   }
 
   private def createBaseDataset(
@@ -158,26 +174,79 @@ object MultiLineXmlDataSource extends XmlDataSource {
       file: PartitionedFile,
       parser: StaxXmlParser,
       requiredSchema: StructType): Iterator[InternalRow] = {
-    parser.parseStream(
-      CodecStreams.createInputStreamWithCloseResource(conf, file.toPath),
-      requiredSchema)
+    if (parser.options.useLegacyXMLParser) {
+      parser.parseStream(
+        CodecStreams.createInputStreamWithCloseResource(conf, file.toPath),
+        requiredSchema)
+    } else {
+      parser.parseStreamOptimized(
+        () => CodecStreams.createInputStreamWithCloseResource(conf, file.toPath),
+        requiredSchema)
+    }
   }
 
   override def infer(
       sparkSession: SparkSession,
       inputPaths: Seq[FileStatus],
       parsedOptions: XmlOptions): StructType = {
+
+    if (!parsedOptions.useLegacyXMLParser) {
+      return inferOptimized(sparkSession, inputPaths, parsedOptions)
+    }
+
     val xml = createBaseRdd(sparkSession, inputPaths, parsedOptions)
 
-    val tokenRDD = xml.flatMap { portableDataStream =>
-      StaxXmlParser.tokenizeStream(
-        CodecStreams.createInputStreamWithCloseResource(
-          portableDataStream.getConfiguration,
-          new Path(portableDataStream.getPath())),
-        parsedOptions)
-    }
+    val tokenRDD: RDD[String] =
+      xml.flatMap { portableDataStream =>
+        try {
+          StaxXmlParser.tokenizeStream(
+            CodecStreams.createInputStreamWithCloseResource(
+              portableDataStream.getConfiguration,
+              new Path(portableDataStream.getPath())),
+            parsedOptions)
+        } catch {
+          case e: FileNotFoundException if parsedOptions.ignoreMissingFiles =>
+            logWarning("Skipped missing file", e)
+            Iterator.empty[String]
+          case NonFatal(e) =>
+            Utils.getRootCause(e) match {
+              case e @ (_ : AccessControlException | _ : BlockMissingException) => throw e
+              case _: RuntimeException | _: IOException if parsedOptions.ignoreCorruptFiles =>
+                logWarning("Skipped the rest of the content in the corrupted file", e)
+                Iterator.empty[String]
+              case o => throw o
+            }
+        }
+      }
     SQLExecution.withSQLConfPropagated(sparkSession) {
-      val schema = XmlInferSchema.infer(tokenRDD, parsedOptions)
+      val schema =
+        new XmlInferSchema(parsedOptions, sparkSession.sessionState.conf.caseSensitiveAnalysis)
+          .infer(tokenRDD)
+      schema
+    }
+  }
+
+  private def inferOptimized(
+      sparkSession: SparkSession,
+      inputPaths: Seq[FileStatus],
+      parsedOptions: XmlOptions): StructType = {
+
+    val xml = createBaseRdd(sparkSession, inputPaths, parsedOptions)
+
+    val xmlParserRdd: RDD[StaxXMLRecordReader] =
+      xml.flatMap { portableDataStream =>
+        val inputStream = () =>
+          CodecStreams.createInputStreamWithCloseResource(
+            portableDataStream.getConfiguration,
+            new Path(portableDataStream.getPath())
+          )
+        StaxXmlParser.convertStream(inputStream, parsedOptions)(identity)
+      }
+
+    SQLExecution.withSQLConfPropagated(sparkSession) {
+      val schema =
+        new XmlInferSchema(parsedOptions, sparkSession.sessionState.conf.caseSensitiveAnalysis)
+          .inferFromReaders(xmlParserRdd)
       schema
     }
   }

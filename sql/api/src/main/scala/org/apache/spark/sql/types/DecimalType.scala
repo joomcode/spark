@@ -26,9 +26,8 @@ import org.apache.spark.sql.errors.DataTypeErrors
 import org.apache.spark.sql.internal.SqlApiConf
 
 /**
- * The data type representing `java.math.BigDecimal` values.
- * A Decimal that must have fixed precision (the maximum number of digits) and scale (the number
- * of digits on right side of dot).
+ * The data type representing `java.math.BigDecimal` values. A Decimal that must have fixed
+ * precision (the maximum number of digits) and scale (the number of digits on right side of dot).
  *
  * The precision can be up to 38, scale can also be up to 38 (less or equal to precision).
  *
@@ -49,7 +48,8 @@ case class DecimalType(precision: Int, scale: Int) extends FractionalType {
 
   if (precision > DecimalType.MAX_PRECISION) {
     throw DataTypeErrors.decimalPrecisionExceedsMaxPrecisionError(
-      precision, DecimalType.MAX_PRECISION)
+      precision,
+      DecimalType.MAX_PRECISION)
   }
 
   // default constructor for Java
@@ -63,8 +63,8 @@ case class DecimalType(precision: Int, scale: Int) extends FractionalType {
   override def sql: String = typeName.toUpperCase(Locale.ROOT)
 
   /**
-   * Returns whether this DecimalType is wider than `other`. If yes, it means `other`
-   * can be casted into `this` safely without losing any precision or range.
+   * Returns whether this DecimalType is wider than `other`. If yes, it means `other` can be
+   * casted into `this` safely without losing any precision or range.
    */
   private[sql] def isWiderThan(other: DataType): Boolean = isWiderThanInternal(other)
 
@@ -78,8 +78,8 @@ case class DecimalType(precision: Int, scale: Int) extends FractionalType {
   }
 
   /**
-   * Returns whether this DecimalType is tighter than `other`. If yes, it means `this`
-   * can be casted into `other` safely without losing any precision or range.
+   * Returns whether this DecimalType is tighter than `other`. If yes, it means `this` can be
+   * casted into `other` safely without losing any precision or range.
    */
   private[sql] def isTighterThan(other: DataType): Boolean = other match {
     case dt: DecimalType =>
@@ -94,8 +94,8 @@ case class DecimalType(precision: Int, scale: Int) extends FractionalType {
   }
 
   /**
-   * The default size of a value of the DecimalType is 8 bytes when precision is at most 18,
-   * and 16 bytes otherwise.
+   * The default size of a value of the DecimalType is 8 bytes when precision is at most 18, and
+   * 16 bytes otherwise.
    */
   override def defaultSize: Int = if (precision <= Decimal.MAX_LONG_DIGITS) 8 else 16
 
@@ -103,7 +103,6 @@ case class DecimalType(precision: Int, scale: Int) extends FractionalType {
 
   private[spark] override def asNullable: DecimalType = this
 }
-
 
 /**
  * Extra factory methods and pattern matchers for Decimals.
@@ -146,6 +145,18 @@ object DecimalType extends AbstractDataType {
     DecimalType(min(precision, MAX_PRECISION), min(scale, MAX_SCALE))
   }
 
+  private[sql] def boundedPreferIntegralDigits(precision: Int, scale: Int): DecimalType = {
+    if (precision <= MAX_PRECISION) {
+      DecimalType(precision, scale)
+    } else {
+      // If we have to reduce the precision, we should retain the digits in the integral part first,
+      // as they are more significant to the value. Here we reduce the scale as well to drop the
+      // digits in the fractional part.
+      val diff = precision - MAX_PRECISION
+      DecimalType(MAX_PRECISION, math.max(0, scale - diff))
+    }
+  }
+
   private[sql] def checkNegativeScale(scale: Int): Unit = {
     if (scale < 0 && !SqlApiConf.get.allowNegativeScaleOfDecimalEnabled) {
       throw DataTypeErrors.negativeScaleNotAllowedError(scale)
@@ -155,10 +166,11 @@ object DecimalType extends AbstractDataType {
   /**
    * Scale adjustment implementation is based on Hive's one, which is itself inspired to
    * SQLServer's one. In particular, when a result precision is greater than
-   * {@link #MAX_PRECISION}, the corresponding scale is reduced to prevent the integral part of a
+   * {@link #MAX_PRECISION} , the corresponding scale is reduced to prevent the integral part of a
    * result from being truncated.
    *
-   * This method is used only when `spark.sql.decimalOperations.allowPrecisionLoss` is set to true.
+   * This method is used only when `spark.sql.decimalOperations.allowPrecisionLoss` is set to
+   * true.
    */
   private[sql] def adjustPrecisionScale(precision: Int, scale: Int): DecimalType = {
     // Assumptions:

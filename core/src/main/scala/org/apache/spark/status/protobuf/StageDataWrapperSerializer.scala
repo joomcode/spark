@@ -21,12 +21,11 @@ import java.util.Date
 
 import scala.jdk.CollectionConverters._
 
-import org.apache.commons.collections4.MapUtils
-
 import org.apache.spark.status.StageDataWrapper
 import org.apache.spark.status.api.v1.{ExecutorMetricsDistributions, ExecutorPeakMetricsDistributions, InputMetricDistributions, InputMetrics, OutputMetricDistributions, OutputMetrics, ShufflePushReadMetricDistributions, ShufflePushReadMetrics, ShuffleReadMetricDistributions, ShuffleReadMetrics, ShuffleWriteMetricDistributions, ShuffleWriteMetrics, SpeculationStageSummary, StageData, TaskData, TaskMetricDistributions, TaskMetrics}
 import org.apache.spark.status.protobuf.Utils._
 import org.apache.spark.util.Utils.weakIntern
+import org.apache.spark.util.collection.Utils.isNotEmpty
 
 private[protobuf] class StageDataWrapperSerializer extends ProtobufSerDe[StageDataWrapper] {
 
@@ -382,7 +381,7 @@ private[protobuf] class StageDataWrapperSerializer extends ProtobufSerDe[StageDa
     new StageDataWrapper(
       info = info,
       jobIds = binary.getJobIdsList.asScala.map(_.toInt).toSet,
-      locality = binary.getLocalityMap.asScala.mapValues(_.toLong).toMap
+      locality = binary.getLocalityMap.asScala.toMap.transform((_, v) => v.toLong)
     )
   }
 
@@ -397,13 +396,13 @@ private[protobuf] class StageDataWrapperSerializer extends ProtobufSerDe[StageDa
     val failureReason = getOptional(binary.hasFailureReason, binary.getFailureReason)
     val description = getOptional(binary.hasDescription, binary.getDescription)
     val accumulatorUpdates = AccumulableInfoSerializer.deserialize(binary.getAccumulatorUpdatesList)
-    val tasks = if (MapUtils.isNotEmpty(binary.getTasksMap)) {
+    val tasks = if (isNotEmpty(binary.getTasksMap)) {
       Some(binary.getTasksMap.asScala.map(
         entry => (entry._1.toLong, deserializeTaskData(entry._2))).toMap)
     } else None
-    val executorSummary = if (MapUtils.isNotEmpty(binary.getExecutorSummaryMap)) {
-      Some(binary.getExecutorSummaryMap.asScala.mapValues(
-        ExecutorStageSummarySerializer.deserialize).toMap)
+    val executorSummary = if (isNotEmpty(binary.getExecutorSummaryMap)) {
+      Some(binary.getExecutorSummaryMap.asScala.toMap
+        .transform((_, v) => ExecutorStageSummarySerializer.deserialize(v)))
     } else None
     val speculationSummary =
       getOptional(binary.hasSpeculationSummary,
@@ -475,7 +474,8 @@ private[protobuf] class StageDataWrapperSerializer extends ProtobufSerDe[StageDa
       tasks = tasks,
       executorSummary = executorSummary,
       speculationSummary = speculationSummary,
-      killedTasksSummary = binary.getKilledTasksSummaryMap.asScala.mapValues(_.toInt).toMap,
+      killedTasksSummary =
+        binary.getKilledTasksSummaryMap.asScala.toMap.transform((_, v) => v.toInt),
       resourceProfileId = binary.getResourceProfileId,
       peakExecutorMetrics = peakExecutorMetrics,
       taskMetricsDistributions = taskMetricsDistributions,

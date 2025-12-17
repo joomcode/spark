@@ -110,7 +110,7 @@ private[spark] class LocalSchedulerBackend(
     val totalCores: Int)
   extends SchedulerBackend with ExecutorBackend with Logging {
 
-  private val appId = "local-" + System.currentTimeMillis
+  private val appId = conf.get("spark.test.appId", "local-" + System.currentTimeMillis)
   private var localEndpoint: RpcEndpointRef = null
   private val userClassPath = getUserClasspath(conf)
   private val listenerBus = scheduler.sc.listenerBus
@@ -142,6 +142,7 @@ private[spark] class LocalSchedulerBackend(
         Map.empty)))
     launcherBackend.setAppId(appId)
     launcherBackend.setState(SparkAppHandle.State.RUNNING)
+    reviveOffers()
   }
 
   override def stop(): Unit = {
@@ -153,7 +154,7 @@ private[spark] class LocalSchedulerBackend(
   }
 
   override def defaultParallelism(): Int =
-    scheduler.conf.getInt("spark.default.parallelism", totalCores)
+    scheduler.conf.getInt(config.DEFAULT_PARALLELISM.key, totalCores)
 
   override def killTask(
       taskId: Long, executorId: String, interruptThread: Boolean, reason: String): Unit = {

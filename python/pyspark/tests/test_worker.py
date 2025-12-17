@@ -16,6 +16,7 @@
 # limitations under the License.
 #
 import os
+import signal
 import sys
 import tempfile
 import threading
@@ -226,10 +227,11 @@ class WorkerMemoryTest(unittest.TestCase):
 class WorkerSegfaultTest(ReusedPySparkTestCase):
     @classmethod
     def conf(cls):
-        _conf = super(WorkerSegfaultTest, cls).conf()
+        _conf = super().conf()
         _conf.set("spark.python.worker.faulthandler.enabled", "true")
         return _conf
 
+    @unittest.skipIf(sys.version_info > (3, 12), "SPARK-46130: Flaky with Python 3.12")
     def test_python_segfault(self):
         try:
 
@@ -250,9 +252,24 @@ class WorkerSegfaultTest(ReusedPySparkTestCase):
 class WorkerSegfaultNonDaemonTest(WorkerSegfaultTest):
     @classmethod
     def conf(cls):
-        _conf = super(WorkerSegfaultNonDaemonTest, cls).conf()
+        _conf = super().conf()
         _conf.set("spark.python.use.daemon", "false")
         return _conf
+
+
+class WorkerPoolCrashTest(PySparkTestCase):
+    def test_worker_crash(self):
+        # SPARK-47565: Kill a worker that is currently idling
+        rdd = self.sc.parallelize(range(20), 4)
+        # first ensure that workers are reused
+        worker_pids1 = set(rdd.map(lambda x: os.getpid()).collect())
+        worker_pids2 = set(rdd.map(lambda x: os.getpid()).collect())
+        self.assertEqual(worker_pids1, worker_pids2)
+        for pid in list(worker_pids1)[1:]:  # kill all workers except for one
+            os.kill(pid, signal.SIGTERM)
+        # give things a moment to settle
+        time.sleep(5)
+        rdd.map(lambda x: os.getpid()).collect()
 
 
 if __name__ == "__main__":

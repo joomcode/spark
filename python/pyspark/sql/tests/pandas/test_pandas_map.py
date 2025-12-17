@@ -19,11 +19,14 @@ import shutil
 import tempfile
 import time
 import unittest
+import logging
 from typing import cast
 
 from pyspark.sql import Row
 from pyspark.sql.functions import col, encode, lit
 from pyspark.errors import PythonException
+from pyspark.sql.session import SparkSession
+from pyspark.sql.types import StructType
 from pyspark.testing.sqlutils import (
     ReusedSQLTestCase,
     have_pandas,
@@ -31,7 +34,8 @@ from pyspark.testing.sqlutils import (
     pandas_requirement_message,
     pyarrow_requirement_message,
 )
-from pyspark.testing.utils import QuietTest
+from pyspark.testing.utils import assertDataFrameEqual, eventually
+from pyspark.util import is_remote_only
 
 if have_pandas:
     import pandas as pd
@@ -42,6 +46,8 @@ if have_pandas:
     cast(str, pandas_requirement_message or pyarrow_requirement_message),
 )
 class MapInPandasTestsMixin:
+    spark: SparkSession
+
     @staticmethod
     def identity_dataframes_iter(*columns: str):
         def func(iterator):
@@ -110,7 +116,7 @@ class MapInPandasTestsMixin:
             df = (
                 self.spark.range(10, numPartitions=3)
                 .select(col("id").cast("string").alias("str"))
-                .withColumn("bin", encode(col("str"), "utf8"))
+                .withColumn("bin", encode(col("str"), "utf-8"))
             )
             actual = df.mapInPandas(func, "str string, bin binary").collect()
             expected = df.collect()
@@ -128,6 +134,27 @@ class MapInPandasTestsMixin:
         expected = df.collect()
         self.assertEqual(actual, expected)
 
+    def test_not_null(self):
+        def func(iterator):
+            for _ in iterator:
+                yield pd.DataFrame({"a": [1, 2]})
+
+        schema = "a long not null"
+        df = self.spark.range(1).mapInPandas(func, schema)
+        self.assertEqual(df.schema, StructType.fromDDL(schema))
+        self.assertEqual(df.collect(), [Row(1), Row(2)])
+
+    def test_violate_not_null(self):
+        def func(iterator):
+            for _ in iterator:
+                yield pd.DataFrame({"a": [1, None]})
+
+        schema = "a long not null"
+        df = self.spark.range(1).mapInPandas(func, schema)
+        self.assertEqual(df.schema, StructType.fromDDL(schema))
+        with self.assertRaisesRegex(Exception, "is null"):
+            df.collect()
+
     def test_different_output_length(self):
         def func(iterator):
             for _ in iterator:
@@ -138,7 +165,7 @@ class MapInPandasTestsMixin:
         self.assertEqual(set((r.a for r in actual)), set(range(100)))
 
     def test_other_than_dataframe_iter(self):
-        with QuietTest(self.sc):
+        with self.quiet():
             self.check_other_than_dataframe_iter()
 
     def check_other_than_dataframe_iter(self):
@@ -151,19 +178,19 @@ class MapInPandasTestsMixin:
         with self.assertRaisesRegex(
             PythonException,
             "Return type of the user-defined function should be iterator of pandas.DataFrame, "
-            "but is int.",
+            "but is int",
         ):
             (self.spark.range(10, numPartitions=3).mapInPandas(no_iter, "a int").count())
 
         with self.assertRaisesRegex(
             PythonException,
             "Return type of the user-defined function should be iterator of pandas.DataFrame, "
-            "but is iterator of int.",
+            "but is iterator of int",
         ):
             (self.spark.range(10, numPartitions=3).mapInPandas(bad_iter_elem, "a int").count())
 
     def test_dataframes_with_other_column_names(self):
-        with QuietTest(self.sc):
+        with self.quiet():
             self.check_dataframes_with_other_column_names()
 
     def check_dataframes_with_other_column_names(self):
@@ -185,7 +212,7 @@ class MapInPandasTestsMixin:
             )
 
     def test_dataframes_with_duplicate_column_names(self):
-        with QuietTest(self.sc):
+        with self.quiet():
             self.check_dataframes_with_duplicate_column_names()
 
     def check_dataframes_with_duplicate_column_names(self):
@@ -208,7 +235,7 @@ class MapInPandasTestsMixin:
             )
 
     def test_dataframes_with_less_columns(self):
-        with QuietTest(self.sc):
+        with self.quiet():
             self.check_dataframes_with_less_columns()
 
     def check_dataframes_with_less_columns(self):
@@ -247,20 +274,21 @@ class MapInPandasTestsMixin:
         self.assertEqual(actual, expected)
 
     def test_dataframes_with_incompatible_types(self):
-        with QuietTest(self.sc):
+        with self.quiet():
             self.check_dataframes_with_incompatible_types()
 
     def check_dataframes_with_incompatible_types(self):
-        def func(iterator):
-            for pdf in iterator:
-                yield pdf.assign(id=pdf["id"].apply(str))
-
         for safely in [True, False]:
             with self.subTest(convertToArrowArraySafely=safely), self.sql_conf(
                 {"spark.sql.execution.pandas.convertToArrowArraySafely": safely}
             ):
                 # sometimes we see ValueErrors
                 with self.subTest(convert="string to double"):
+
+                    def func(iterator):
+                        for pdf in iterator:
+                            yield pdf.assign(id="test_string")
+
                     expected = (
                         r"ValueError: Exception thrown when converting pandas.Series "
                         r"\(object\) with name 'id' to Arrow Array \(double\)."
@@ -279,18 +307,31 @@ class MapInPandasTestsMixin:
                             .collect()
                         )
 
-                # sometimes we see TypeErrors
-                with self.subTest(convert="double to string"):
-                    with self.assertRaisesRegex(
-                        PythonException,
-                        r"TypeError: Exception thrown when converting pandas.Series "
-                        r"\(float64\) with name 'id' to Arrow Array \(string\).\n",
-                    ):
-                        (
-                            self.spark.range(10, numPartitions=3)
-                            .select(col("id").cast("double"))
-                            .mapInPandas(self.identity_dataframes_iter("id"), "id string")
-                            .collect()
+                with self.subTest(convert="float to int precision loss"):
+
+                    def func(iterator):
+                        for pdf in iterator:
+                            yield pdf.assign(id=pdf["id"] + 0.1)
+
+                    df = (
+                        self.spark.range(10, numPartitions=3)
+                        .select(col("id").cast("double"))
+                        .mapInPandas(func, "id int")
+                    )
+                    if safely:
+                        expected = (
+                            r"ValueError: Exception thrown when converting pandas.Series "
+                            r"\(float64\) with name 'id' to Arrow Array \(int32\)."
+                            " It can be caused by overflows or other "
+                            "unsafe conversions warned by Arrow. Arrow safe type check "
+                            "can be disabled by using SQL config "
+                            "`spark.sql.execution.pandas.convertToArrowArraySafely`."
+                        )
+                        with self.assertRaisesRegex(PythonException, expected + "\n"):
+                            df.collect()
+                    else:
+                        self.assertEqual(
+                            df.collect(), self.spark.range(10, numPartitions=3).collect()
                         )
 
     def test_empty_iterator(self):
@@ -314,7 +355,7 @@ class MapInPandasTestsMixin:
         self.assertEqual(mapped.count(), 10)
 
     def test_empty_dataframes_with_less_columns(self):
-        with QuietTest(self.sc):
+        with self.quiet():
             self.check_empty_dataframes_with_less_columns()
 
     def check_empty_dataframes_with_less_columns(self):
@@ -339,7 +380,7 @@ class MapInPandasTestsMixin:
         self.assertEqual(mapped.count(), 10)
 
     def test_empty_dataframes_with_other_columns(self):
-        with QuietTest(self.sc):
+        with self.quiet():
             self.check_empty_dataframes_with_other_columns()
 
     def check_empty_dataframes_with_other_columns(self):
@@ -381,6 +422,7 @@ class MapInPandasTestsMixin:
         self.assertEqual(sorted(actual), sorted(expected))
 
     # SPARK-33277
+    @eventually(timeout=180, catch_assertions=True)
     def test_map_in_pandas_with_column_vector(self):
         path = tempfile.mkdtemp()
         shutil.rmtree(path)
@@ -394,11 +436,94 @@ class MapInPandasTestsMixin:
 
             for offheap in ["true", "false"]:
                 with self.sql_conf({"spark.sql.columnVector.offheap.enabled": offheap}):
-                    self.assertEquals(
+                    self.assertEqual(
                         self.spark.read.parquet(path).mapInPandas(func, "id long").head(), Row(0)
                     )
         finally:
             shutil.rmtree(path)
+
+    def test_map_in_pandas_with_barrier_mode(self):
+        df = self.spark.range(10)
+
+        def func1(iterator):
+            from pyspark import TaskContext, BarrierTaskContext
+
+            tc = TaskContext.get()
+            assert tc is not None
+            assert not isinstance(tc, BarrierTaskContext)
+            for batch in iterator:
+                yield batch
+
+        df.mapInPandas(func1, "id long", False).collect()
+
+        def func2(iterator):
+            from pyspark import TaskContext, BarrierTaskContext
+
+            tc = TaskContext.get()
+            assert tc is not None
+            assert isinstance(tc, BarrierTaskContext)
+            for batch in iterator:
+                yield batch
+
+        df.mapInPandas(func2, "id long", True).collect()
+
+    def test_map_in_pandas_type_mismatch(self):
+        def func(iterator):
+            for _ in iterator:
+                yield pd.DataFrame({"id": ["x", "y"]})
+
+        df = self.spark.range(2).mapInPandas(func, "id int")
+        with self.assertRaisesRegex(
+            PythonException,
+            "PySparkValueError: Exception thrown when converting pandas.Series \\(object\\) "
+            "with name 'id' to Arrow Array \\(int32\\)\\.",
+        ):
+            df.collect()
+
+    def test_map_in_pandas_top_level_wrong_order(self):
+        def func(iterator):
+            for _ in iterator:
+                yield pd.DataFrame({"b": [1], "a": [2]})
+
+        df = self.spark.range(1)
+        self.assertEqual([Row(a=2, b=1)], df.mapInPandas(func, "a int, b int").collect())
+
+    @unittest.skipIf(is_remote_only(), "Requires JVM access")
+    def test_map_in_pandas_with_logging(self):
+        import pandas as pd
+
+        def func_with_logging(iterator):
+            logger = logging.getLogger("test_pandas_map")
+            for pdf in iterator:
+                assert isinstance(pdf, pd.DataFrame)
+                logger.warning(f"pandas map: {list(pdf['id'])}")
+                yield pdf
+
+        with self.sql_conf(
+            {
+                "spark.sql.execution.arrow.maxRecordsPerBatch": "3",
+                "spark.sql.pyspark.worker.logging.enabled": "true",
+            }
+        ):
+            assertDataFrameEqual(
+                self.spark.range(9, numPartitions=2).mapInPandas(func_with_logging, "id long"),
+                [Row(id=i) for i in range(9)],
+            )
+
+            logs = self.spark.tvf.python_worker_logs()
+
+            assertDataFrameEqual(
+                logs.select("level", "msg", "context", "logger"),
+                [
+                    Row(
+                        level="WARNING",
+                        msg=f"pandas map: {lst}",
+                        context={"func_name": func_with_logging.__name__},
+                        logger="test_pandas_map",
+                    )
+                    for lst in [[0, 1, 2], [3], [4, 5, 6], [7, 8]]
+                ],
+            )
 
 
 class MapInPandasTests(ReusedSQLTestCase, MapInPandasTestsMixin):

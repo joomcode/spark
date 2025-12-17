@@ -18,15 +18,22 @@
 package org.apache.spark.sql.catalyst.analysis
 
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.expressions.{Cast, Expression, Literal, RuntimeReplaceable, SubqueryExpression, Unevaluable}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Cast, Expression, Literal, SubqueryExpression, Unevaluable}
+import org.apache.spark.sql.catalyst.optimizer.{ComputeCurrentTime, ReplaceExpressions}
+import org.apache.spark.sql.catalyst.plans.logical.{OneRowRelation, Project}
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.types.TimestampType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 sealed trait TimeTravelSpec
 
-case class AsOfTimestamp(timestamp: Long) extends TimeTravelSpec
-case class AsOfVersion(version: String) extends TimeTravelSpec
+case class AsOfTimestamp(timestamp: Long) extends TimeTravelSpec {
+  override def toString: String = s"TIMESTAMP AS OF $timestamp"
+}
+
+case class AsOfVersion(version: String) extends TimeTravelSpec {
+  override def toString: String = s"VERSION AS OF '$version'"
+}
 
 object TimeTravelSpec {
   def create(
@@ -42,14 +49,19 @@ object TimeTravelSpec {
         throw QueryCompilationErrors.invalidTimestampExprForTimeTravel(
           "INVALID_TIME_TRAVEL_TIMESTAMP_EXPR.INPUT", ts)
       }
-      val tsToEval = ts.transform {
-        case r: RuntimeReplaceable => r.replacement
+      val tsToEval = {
+        val fakeProject = Project(Seq(Alias(ts, "ts")()), OneRowRelation())
+        ComputeCurrentTime(ReplaceExpressions(fakeProject)).asInstanceOf[Project]
+          .expressions.head.asInstanceOf[Alias].child
+      }
+      tsToEval.foreach {
         case _: Unevaluable =>
           throw QueryCompilationErrors.invalidTimestampExprForTimeTravel(
             "INVALID_TIME_TRAVEL_TIMESTAMP_EXPR.UNEVALUABLE", ts)
         case e if !e.deterministic =>
           throw QueryCompilationErrors.invalidTimestampExprForTimeTravel(
             "INVALID_TIME_TRAVEL_TIMESTAMP_EXPR.NON_DETERMINISTIC", ts)
+        case _ =>
       }
       val tz = Some(sessionLocalTimeZone)
       // Set `ansiEnabled` to false, so that it can return null for invalid input and we can provide

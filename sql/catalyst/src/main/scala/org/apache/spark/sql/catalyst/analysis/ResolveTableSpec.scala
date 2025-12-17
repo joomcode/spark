@@ -18,11 +18,13 @@
 package org.apache.spark.sql.catalyst.analysis
 
 import org.apache.spark.SparkThrowable
-import org.apache.spark.sql.catalyst.expressions.{Expression, Literal}
+import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.optimizer.ComputeCurrentTime
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.COMMAND
 import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{ArrayType, MapType, StructType}
 
 /**
@@ -34,7 +36,15 @@ import org.apache.spark.sql.types.{ArrayType, MapType, StructType}
  */
 object ResolveTableSpec extends Rule[LogicalPlan] {
   override def apply(plan: LogicalPlan): LogicalPlan = {
-    plan.resolveOperatorsWithPruning(_.containsAnyPattern(COMMAND), ruleId) {
+    val preparedPlan = if (SQLConf.get.legacyEvalCurrentTime && plan.containsPattern(COMMAND)) {
+      AnalysisHelper.allowInvokingTransformsInAnalyzer {
+        ComputeCurrentTime(ResolveTimeZone(plan))
+      }
+    } else {
+      plan
+    }
+
+    preparedPlan.resolveOperatorsWithPruning(_.containsAnyPattern(COMMAND), ruleId) {
       case t: CreateTable =>
         resolveTableSpec(t, t.tableSpec, s => t.copy(tableSpec = s))
       case t: CreateTableAsSelect =>
@@ -51,7 +61,7 @@ object ResolveTableSpec extends Rule[LogicalPlan] {
       input: LogicalPlan,
       tableSpec: TableSpecBase,
       withNewSpec: TableSpecBase => LogicalPlan): LogicalPlan = tableSpec match {
-    case u: UnresolvedTableSpec if u.optionExpression.resolved =>
+    case u: UnresolvedTableSpec if u.childrenResolved =>
       val newOptions: Seq[(String, String)] = u.optionExpression.options.map {
         case (key: String, null) =>
           (key, null)
@@ -76,14 +86,28 @@ object ResolveTableSpec extends Rule[LogicalPlan] {
           }
           (key, newValue)
       }
+
+      u.constraints.foreach {
+        case check: CheckConstraint =>
+          if (!check.child.deterministic) {
+            check.child.failAnalysis(
+              errorClass = "NON_DETERMINISTIC_CHECK_CONSTRAINT",
+              messageParameters = Map("checkCondition" -> check.condition)
+            )
+          }
+        case _ =>
+      }
+
       val newTableSpec = TableSpec(
         properties = u.properties,
         provider = u.provider,
         options = newOptions.toMap,
         location = u.location,
         comment = u.comment,
+        collation = u.collation,
         serde = u.serde,
-        external = u.external)
+        external = u.external,
+        constraints = u.constraints.map(_.toV2Constraint))
       withNewSpec(newTableSpec)
     case _ =>
       input
