@@ -23,11 +23,12 @@ import scala.jdk.CollectionConverters._
 
 import org.scalatest.BeforeAndAfter
 
+import org.apache.spark.SparkRuntimeException
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.{CannotReplaceMissingTableException, TableAlreadyExistsException}
 import org.apache.spark.sql.catalyst.plans.logical.{AppendData, LogicalPlan, OverwriteByExpression, OverwritePartitionsDynamic}
 import org.apache.spark.sql.connector.InMemoryV1Provider
-import org.apache.spark.sql.connector.catalog.{Column => ColumnV2, Identifier, InMemoryTable, InMemoryTableCatalog, TableCatalog}
+import org.apache.spark.sql.connector.catalog.{Column => ColumnV2, Identifier, InMemoryTable, InMemoryTableCatalog, InMemoryTableWithV2Filter, InMemoryTableWithV2FilterCatalog, TableCatalog}
 import org.apache.spark.sql.connector.catalog.CatalogManager.SESSION_CATALOG_NAME
 import org.apache.spark.sql.connector.expressions.{BucketTransform, ClusterByTransform, DaysTransform, FieldReference, HoursTransform, IdentityTransform, LiteralValue, MonthsTransform, YearsTransform}
 import org.apache.spark.sql.execution.QueryExecution
@@ -38,11 +39,13 @@ import org.apache.spark.sql.sources.FakeSourceOne
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{IntegerType, LongType, StringType, StructType, TimestampType}
 import org.apache.spark.sql.util.QueryExecutionListener
+import org.apache.spark.tags.DataSourceV2Test
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
-class DataFrameWriterV2Suite extends QueryTest with SharedSparkSession with BeforeAndAfter {
+@DataSourceV2Test
+class DataFrameWriterV2Suite extends SharedSparkSession with BeforeAndAfter {
   import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
   import org.apache.spark.sql.functions._
   import testImplicits._
@@ -155,6 +158,53 @@ class DataFrameWriterV2Suite extends QueryTest with SharedSparkSession with Befo
       Seq())
   }
 
+  test("SPARK-57223: Append: extra column with special-char name is quoted correctly in error") {
+    spark.sql("CREATE TABLE testcat.table_name (id bigint, data string) USING foo")
+    checkError(
+      exception = intercept[AnalysisException] {
+        spark.table("source").withColumnRenamed("data", "b.c")
+          .writeTo("testcat.table_name").append()
+      },
+      condition = "INCOMPATIBLE_DATA_FOR_TABLE.EXTRA_COLUMNS",
+      parameters = Map(
+        "tableName" -> "`testcat`.`table_name`",
+        "extraColumns" -> "`b.c`")
+    )
+  }
+
+  test("SPARK-57223: by-position insert with extra nested struct field with special-char " +
+    "name is quoted correctly in error") {
+    spark.sql("CREATE TABLE testcat.table_name (id bigint, info struct<a: bigint>) USING foo")
+    checkError(
+      exception = intercept[AnalysisException] {
+        spark.sql("INSERT INTO testcat.table_name " +
+          "SELECT id, named_struct('a', id, 'b.c', id) AS info FROM range(1)")
+      },
+      condition = "INCOMPATIBLE_DATA_FOR_TABLE.EXTRA_STRUCT_FIELDS",
+      parameters = Map(
+        "tableName" -> "`testcat`.`table_name`",
+        "colName" -> "`info`",
+        "extraFields" -> "`b.c`")
+    )
+  }
+
+  test("SPARK-57223: by-position insert with missing nested struct field with special-char " +
+    "name is quoted correctly in error") {
+    spark.sql("CREATE TABLE testcat.table_name " +
+      "(id bigint, info struct<a: bigint, `b.c`: bigint>) USING foo")
+    checkError(
+      exception = intercept[AnalysisException] {
+        spark.sql("INSERT INTO testcat.table_name " +
+          "SELECT id, named_struct('a', id) AS info FROM range(1)")
+      },
+      condition = "INCOMPATIBLE_DATA_FOR_TABLE.STRUCT_MISSING_FIELDS",
+      parameters = Map(
+        "tableName" -> "`testcat`.`table_name`",
+        "colName" -> "`info`",
+        "missingFields" -> "`b.c`")
+    )
+  }
+
   test("Append: fail if table does not exist") {
     val exc = intercept[AnalysisException] {
       spark.table("source").writeTo("testcat.table_name").append()
@@ -230,6 +280,24 @@ class DataFrameWriterV2Suite extends QueryTest with SharedSparkSession with Befo
     checkAnswer(
       spark.table("testcat.table_name"),
       Seq(Row(1L, "a"), Row(2L, "b"), Row(4L, "d"), Row(5L, "e"), Row(6L, "f")))
+  }
+
+  test("SPARK-61504: Overwrite: overwrite by expression on a CHAR column") {
+    spark.conf.set(
+      "spark.sql.catalog.testv2filter", classOf[InMemoryTableWithV2FilterCatalog].getName)
+    val t = "testv2filter.table_name"
+    // the table pads the stored values for the overwrite condition, as a read does
+    spark.sql(s"CREATE TABLE $t (id bigint, dep char(8)) USING foo PARTITIONED BY (dep) " +
+      s"TBLPROPERTIES ('${InMemoryTableWithV2Filter.AcceptCharReadSidePaddingKey}' = 'true')")
+    withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") {
+      spark.sql(s"INSERT INTO $t VALUES (1L, 'hr')")
+    }
+    spark.sql(s"INSERT INTO $t VALUES (2L, 'hr'), (3L, 'software')")
+
+    // the query is not resolved when the command is created, unlike the query of a SQL INSERT
+    Seq((4L, "hr")).toDF("id", "dep").writeTo(t).overwrite($"dep" === "hr")
+
+    checkAnswer(spark.table(t), Seq(Row(3L, "software"), Row(4L, "hr      ")))
   }
 
   test("Overwrite: write to a temp view of v2 relation") {
@@ -412,6 +480,26 @@ class DataFrameWriterV2Suite extends QueryTest with SharedSparkSession with Befo
     }
     assert(exc.getMessage.contains(
       s"Cannot write into v1 table: `$SESSION_CATALOG_NAME`.`default`.`table_name`"))
+  }
+
+  test("SPARK-62100: Append and overwrite check a NOT NULL column against a value " +
+    "made nullable by an outer join") {
+    spark.sql("CREATE TABLE testcat.table_name (id bigint, data bigint NOT NULL) USING foo")
+    val left = Seq(1L, 2L).toDF("id")
+    val right = Seq(2L).toDF("data")
+    // right("data") is non-nullable in `right`, but NULL for id 1 after the left outer join
+    val df = left.join(right, left("id") === right("data"), "left_outer")
+      .select(left("id"), right("data"))
+    Seq[DataFrameWriterV2[Row] => Unit](
+      _.append(),
+      _.overwrite(lit(true)),
+      _.overwritePartitions()).foreach { write =>
+      val e = intercept[SparkRuntimeException] {
+        write(df.writeTo("testcat.table_name"))
+      }
+      assert(e.getCondition == "NOT_NULL_ASSERT_VIOLATION")
+    }
+    checkAnswer(spark.table("testcat.table_name"), Seq.empty)
   }
 
   test("Create: basic behavior") {
@@ -900,5 +988,95 @@ class DataFrameWriterV2Suite extends QueryTest with SharedSparkSession with Befo
     // Caching the DataFrame created from INSERT should not re-execute the command
     insertDF.cache()
     checkAnswer(spark.table("testcat.table_name"), Seq(Row(1, "a"), Row(2, "b")))
+  }
+
+  test("withSchemaEvolution: append evolves the table schema to add a new column") {
+    spark.sql("CREATE TABLE testcat.table_name (id bigint) USING foo")
+    val df = Seq((1L, "a")).toDF("id", "data")
+
+    // Without withSchemaEvolution the extra column is rejected.
+    checkError(
+      exception = intercept[AnalysisException](df.writeTo("testcat.table_name").append()),
+      condition = "INSERT_COLUMN_ARITY_MISMATCH.TOO_MANY_DATA_COLUMNS",
+      parameters = Map(
+        "tableName" -> "`testcat`.`table_name`",
+        "tableColumns" -> "`id`",
+        "dataColumns" -> "`id`, `data`"))
+
+    df.writeTo("testcat.table_name").withSchemaEvolution().append()
+
+    assert(spark.table("testcat.table_name").schema ===
+      new StructType().add("id", LongType).add("data", StringType))
+    checkAnswer(spark.table("testcat.table_name"), Seq(Row(1L, "a")))
+  }
+
+  test("withSchemaEvolution: overwrite evolves the table schema to add a new column") {
+    spark.sql("CREATE TABLE testcat.table_name (id bigint) USING foo")
+    val df = Seq((1L, "a")).toDF("id", "data")
+
+    df.writeTo("testcat.table_name").withSchemaEvolution().overwrite(lit(true))
+
+    assert(spark.table("testcat.table_name").schema ===
+      new StructType().add("id", LongType).add("data", StringType))
+    checkAnswer(spark.table("testcat.table_name"), Seq(Row(1L, "a")))
+  }
+
+  test("withSchemaEvolution: overwritePartitions evolves the table schema to add a new column") {
+    spark.sql("CREATE TABLE testcat.table_name (id bigint) USING foo PARTITIONED BY (id)")
+    val df = Seq((1L, "a")).toDF("id", "data")
+
+    df.writeTo("testcat.table_name").withSchemaEvolution().overwritePartitions()
+
+    assert(spark.table("testcat.table_name").schema ===
+      new StructType().add("id", LongType).add("data", StringType))
+    checkAnswer(spark.table("testcat.table_name"), Seq(Row(1L, "a")))
+  }
+
+  test("withSchemaEvolution: fails if the table does not support automatic schema evolution") {
+    spark.sql(
+      """CREATE TABLE testcat.table_name (id bigint) USING foo
+        |TBLPROPERTIES ('auto-schema-evolution' = 'false')""".stripMargin)
+    val df = Seq((1L, "a")).toDF("id", "data")
+
+    // With auto-schema-evolution disabled the extra column still fails.
+    checkError(
+      exception = intercept[AnalysisException] {
+        df.writeTo("testcat.table_name").withSchemaEvolution().append()
+      },
+      condition = "INSERT_COLUMN_ARITY_MISMATCH.TOO_MANY_DATA_COLUMNS",
+      parameters = Map(
+        "tableName" -> "`testcat`.`table_name`",
+        "tableColumns" -> "`id`",
+        "dataColumns" -> "`id`, `data`"))
+  }
+
+  test("withSchemaEvolution: create fails with CREATE_TABLE sub-error") {
+    checkError(
+      exception = intercept[AnalysisException] {
+        spark.table("source").writeTo("testcat.new_table").using("foo")
+          .withSchemaEvolution().create()
+      },
+      condition = "UNSUPPORTED_SCHEMA_EVOLUTION.CREATE_TABLE",
+      parameters = Map.empty)
+  }
+
+  test("withSchemaEvolution: replace/createOrReplace fail with REPLACE_TABLE sub-error") {
+    spark.sql("CREATE TABLE testcat.table_name (id bigint, data string) USING foo")
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        spark.table("source").writeTo("testcat.table_name").using("foo")
+          .withSchemaEvolution().replace()
+      },
+      condition = "UNSUPPORTED_SCHEMA_EVOLUTION.REPLACE_TABLE",
+      parameters = Map.empty)
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        spark.table("source").writeTo("testcat.table_name").using("foo")
+          .withSchemaEvolution().createOrReplace()
+      },
+      condition = "UNSUPPORTED_SCHEMA_EVOLUTION.REPLACE_TABLE",
+      parameters = Map.empty)
   }
 }

@@ -28,7 +28,7 @@ import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.catalyst.trees.{TreeNodeTag, TreePattern}
 import org.apache.spark.sql.catalyst.trees.TreePattern._
 import org.apache.spark.sql.catalyst.types._
-import org.apache.spark.sql.catalyst.util.{quoteIfNeeded, METADATA_COL_ATTR_KEY}
+import org.apache.spark.sql.catalyst.util.{quoteIfNeeded, CharVarcharUtils, METADATA_COL_ATTR_KEY}
 import org.apache.spark.sql.connector.catalog.MetadataColumn
 import org.apache.spark.sql.types._
 import org.apache.spark.util.collection.BitSet
@@ -312,7 +312,9 @@ case class AttributeReference(
   override def hashCode: Int = {
     // See http://stackoverflow.com/questions/113511/hash-code-implementation
     var h = 17
-    h = h * 37 + name.hashCode()
+    // Use Objects.hashCode to stay null-safe: an AttributeReference can carry a null name
+    // (e.g. from a StructField built with a null name), and equals already treats name nullably.
+    h = h * 37 + Objects.hashCode(name)
     h = h * 37 + dataType.hashCode()
     h = h * 37 + nullable.hashCode()
     h = h * 37 + metadata.hashCode()
@@ -417,7 +419,7 @@ case class PrettyAttribute(
 
   override def toString: String = name
   override def sql: String = {
-    if (getTagValue(ResolverTag.SINGLE_PASS_IS_LCA).nonEmpty) {
+    if (containsTag(ResolverTag.SINGLE_PASS_IS_LCA)) {
       // For a query like:
       //
       // {{{ select 1 as a, a + 1 }}}
@@ -461,6 +463,13 @@ case class OuterReference(e: NamedExpression)
   extends LeafExpression with NamedExpression with Unevaluable {
   override def dataType: DataType = e.dataType
   override def nullable: Boolean = e.nullable
+  // Forward only the raw CHAR/VARCHAR type when aliased. Other keys are not forwarded; some,
+  // such as the SQL UDF parameter and auto-generated alias markers, must not leak.
+  override lazy val metadata: Metadata = CharVarcharUtils.getRawTypeString(e.metadata) match {
+    case Some(rawType) => new MetadataBuilder()
+      .putString(CharVarcharUtils.CHAR_VARCHAR_TYPE_STRING_METADATA_KEY, rawType).build()
+    case None => Metadata.empty
+  }
   override def prettyName: String = "outer"
 
   override def sql: String =
@@ -544,12 +553,57 @@ object OuterReference {
    * single-pass implementation (first we extract the [[OuterReference]] and then assign the name -
    * in bottom-up manner).
    *
-   * In order to make single-pass and fixed-point implementations compatible use earlier computed
-   * name (if defined) for [[OuterReference]] (defined in
-   * `AggregateExpressionResolver.handleOuterAggregateExpression`).
+   * For example, for a query like:
+   * {{{
+   *  SELECT col1 AS alias
+   *  FROM values(1)
+   *  GROUP BY col1
+   *  HAVING (
+   *    SELECT col1 = 1
+   *  )
+   * }}}
+   *
+   * Fixed-point analyzer will output:
+   *
+   * Filter cast(scalar-subquery#x [alias#x] as boolean)
+   * :  +- Project [(outer(alias#x) = 1) AS (outer(col1) = 1)#x]
+   * :     +- OneRowRelation
+   * +- Aggregate [col1#x], [col1#x AS alias#x]
+   *    +- LocalRelation [col1#x]
+   *
+   * Notice that the expression in the subquery is `(outer(alias#x) = 1) AS (outer(col1) = 1)`.
+   * This is because the initial underlying expression is `outer(col1) = 1` which we alias, but
+   * we later update the actual outer reference to `outer(alias)`.
    */
   val SINGLE_PASS_SQL_STRING_OVERRIDE =
     TreeNodeTag[String]("single_pass_sql_string_override")
+
+  /**
+   * In fixed-point [[OuterReference]] is extracted in [[UpdateOuterReferences]] which is invoked
+   * after the alias assignment ([[ResolveAliases]]) which is opposite of how it is done in the
+   * single-pass implementation (first we extract the [[OuterReference]] and then assign the name -
+   * in bottom-up manner).
+   *
+   * For example, in a query like:
+   * {{{
+   *   SELECT t1a
+   *   FROM t1
+   *   WHERE t1a IN (
+   *                 SELECT t2a
+   *                 FROM t2
+   *                 WHERE EXISTS (SELECT min(t2a) FROM t3)
+   *                 )
+   * }}}
+   *
+   * In the subquery, the `min(t2c)` expression is going to be resolved to `outer(min(t2c))`. In
+   * fixed-point analyzer, the alias of this expression will be `min(outer(t2c))`, because alias
+   * resolution is triggered before [[UpdateOuterReference]]. However, in single-pass analyzer, we
+   * first resolve the expression to `outer(min(t2c))` and then assign an alias name. This causes
+   * inconsistencies between analyzer results. In order to mitigate this issue, we save the alias
+   * name before updating outer reference.
+   */
+  val SINGLE_PASS_OUTER_AGGREGATE_ALIAS_NAME_OVERRIDE =
+    TreeNodeTag[String]("single_pass_outer_aggregate_alias_name_override")
 }
 
 object VirtualColumn {
@@ -560,8 +614,8 @@ object VirtualColumn {
 }
 
 /**
- * The internal representation of the MetadataAttribute,
- * it sets `__metadata_col` to `true` in AttributeReference metadata
+ * The internal representation of the MetadataAttribute. It stores the metadata column's logical
+ * name under `__metadata_col` in AttributeReference metadata.
  * - apply() will create a metadata attribute reference
  * - unapply() will check if an attribute reference is the metadata attribute reference
  */
@@ -635,8 +689,9 @@ object MetadataStructFieldWithLogicalName {
 }
 
 /**
- * The internal representation of the FileSourceMetadataAttribute, it sets `__metadata_col`
- * and `__file_source_metadata_col` to `true` in AttributeReference's metadata.
+ * The internal representation of the FileSourceMetadataAttribute. It stores the metadata column's
+ * logical name under `__metadata_col` and sets `__file_source_metadata_col` to `true` in
+ * AttributeReference metadata.
  * This is a super type of [[FileSourceConstantMetadataAttribute]] and
  * [[FileSourceGeneratedMetadataAttribute]].
  *
@@ -682,14 +737,20 @@ object FileSourceMetadataAttribute {
    *
    * The set of supported types is limited by [[ColumnVectorUtils.populate]], which the constant
    * file metadata implementation relies on. In general, types that can be partition columns are
-   * supported (including most primitive types). Notably unsupported types include [[ObjectType]],
-   * [[UserDefinedType]], and the complex types ([[StructType]], [[MapType]], [[ArrayType]]).
+   * supported (including most primitive types), plus the complex types [[ArrayType]],
+   * [[MapType]], and [[StructType]] (recursively, as long as their element types are supported).
+   * Notably unsupported types include [[ObjectType]] and [[UserDefinedType]].
    */
-  def isSupportedType(dataType: DataType): Boolean = PhysicalDataType(dataType) match {
-    // PhysicalPrimitiveType covers: Boolean, Byte, Double, Float, Integer, Long, Null, Short
-    case _: PhysicalPrimitiveType | _: PhysicalDecimalType => true
-    case PhysicalBinaryType | PhysicalStringType(_) | PhysicalCalendarIntervalType => true
-    case _ => false
+  def isSupportedType(dataType: DataType): Boolean = dataType match {
+    case ArrayType(elementType, _) => isSupportedType(elementType)
+    case MapType(keyType, valueType, _) => isSupportedType(keyType) && isSupportedType(valueType)
+    case st: StructType => st.fields.forall(f => isSupportedType(f.dataType))
+    case _ => PhysicalDataType(dataType) match {
+      // PhysicalPrimitiveType covers: Boolean, Byte, Double, Float, Integer, Long, Null, Short
+      case _: PhysicalPrimitiveType | _: PhysicalDecimalType => true
+      case PhysicalBinaryType | PhysicalStringType(_) | PhysicalCalendarIntervalType => true
+      case _ => false
+    }
   }
 
   /** Returns the type unchanged if valid; otherwise throws [[IllegalArgumentException]]. */

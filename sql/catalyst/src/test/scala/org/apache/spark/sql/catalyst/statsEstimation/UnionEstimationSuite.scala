@@ -17,9 +17,10 @@
 
 package org.apache.spark.sql.catalyst.statsEstimation
 
-import org.apache.spark.sql.catalyst.expressions.{AttributeMap, AttributeReference}
+import org.apache.spark.sql.catalyst.expressions.{AttributeMap, AttributeReference, EqualTo}
+import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.logical
-import org.apache.spark.sql.catalyst.plans.logical.{ColumnStat, Union}
+import org.apache.spark.sql.catalyst.plans.logical.{ColumnStat, Join, JoinHint, LogicalPlan, Union}
 import org.apache.spark.sql.types._
 
 class UnionEstimationSuite extends StatsEstimationTestBase {
@@ -154,8 +155,10 @@ class UnionEstimationSuite extends StatsEstimationTestBase {
       rowCount = Some(4),
       attributeStats = AttributeMap(
         Seq(
-          attrInt -> ColumnStat(min = Some(1), max = Some(6), nullCount = Some(2)),
-          attrDouble -> ColumnStat(min = Some(2.0), max = Some(7.0), nullCount = Some(4)),
+          attrInt -> ColumnStat(
+            distinctCount = Some(2), min = Some(1), max = Some(6), nullCount = Some(2)),
+          attrDouble -> ColumnStat(
+            distinctCount = Some(2), min = Some(2.0), max = Some(7.0), nullCount = Some(4)),
           attrShort -> ColumnStat(min = Some(s1), max = Some(s4)),
           attrLong -> ColumnStat(min = Some(1L), max = Some(6L)),
           attrByte -> ColumnStat(min = Some(b1), max = Some(b4)),
@@ -206,12 +209,12 @@ class UnionEstimationSuite extends StatsEstimationTestBase {
 
     val union = Union(Seq(child1, child2))
 
-    // Only null count is present in the attribute stats
+    // Only nullCount and distinctCount are present (no min/max since child2 lacks them)
     val expectedStats = logical.Statistics(
       sizeInBytes = 2 * 1024,
       rowCount = Some(4),
       attributeStats = AttributeMap(
-        Seq(attrInt -> ColumnStat(nullCount = Some(0)))))
+        Seq(attrInt -> ColumnStat(distinctCount = Some(2), nullCount = Some(0)))))
     assert(union.stats === expectedStats)
   }
 
@@ -252,12 +255,135 @@ class UnionEstimationSuite extends StatsEstimationTestBase {
 
     val union = Union(Seq(child1, child2))
 
-    // Null count should not present in the stats.
+    // nullCount should not be present (child2 lacks it), but distinctCount and min/max should.
     val expectedStats = logical.Statistics(
       sizeInBytes = 2 * 1024,
       rowCount = Some(4),
       attributeStats = AttributeMap(
-        Seq(attrInt -> ColumnStat(min = Some(1), max = Some(4), nullCount = None))))
+        Seq(attrInt -> ColumnStat(
+          distinctCount = Some(2), min = Some(1), max = Some(4), nullCount = None))))
     assert(union.stats === expectedStats)
+  }
+
+  test("SPARK-56047: distinctCount propagated as max across children") {
+    val sz = Some(BigInt(1024))
+    val attrInt = AttributeReference("cint", IntegerType)()
+    val columnInfo = AttributeMap(Seq(
+      attrInt -> ColumnStat(distinctCount = Some(100), min = Some(1), max = Some(200),
+        nullCount = Some(0))))
+    val columnInfo1 = AttributeMap(Seq(
+      AttributeReference("cint1", IntegerType)() -> ColumnStat(
+        distinctCount = Some(200), min = Some(1), max = Some(300), nullCount = Some(0))))
+
+    val child1 = StatsTestPlan(
+      outputList = columnInfo.keys.toSeq, rowCount = 500,
+      attributeStats = columnInfo, size = sz)
+    val child2 = StatsTestPlan(
+      outputList = columnInfo1.keys.toSeq, rowCount = 500,
+      attributeStats = columnInfo1, size = sz)
+
+    val union = Union(Seq(child1, child2))
+    val unionStats = union.stats
+    val keyStat = unionStats.attributeStats(union.output.head)
+    assert(keyStat.distinctCount === Some(200),
+      "distinctCount should be max(100, 200) = 200")
+  }
+
+  test("SPARK-56047: distinctCount omitted when one child lacks it") {
+    val sz = Some(BigInt(1024))
+    val attrInt = AttributeReference("cint", IntegerType)()
+    val columnInfo = AttributeMap(Seq(
+      attrInt -> ColumnStat(distinctCount = Some(100), min = Some(1), max = Some(200),
+        nullCount = Some(0))))
+    // No distinctCount
+    val columnInfo1 = AttributeMap(Seq(
+      AttributeReference("cint1", IntegerType)() -> ColumnStat(
+        min = Some(1), max = Some(300), nullCount = Some(0))))
+
+    val child1 = StatsTestPlan(
+      outputList = columnInfo.keys.toSeq, rowCount = 500,
+      attributeStats = columnInfo, size = sz)
+    val child2 = StatsTestPlan(
+      outputList = columnInfo1.keys.toSeq, rowCount = 500,
+      attributeStats = columnInfo1, size = sz)
+
+    val union = Union(Seq(child1, child2))
+    val unionStats = union.stats
+    val keyStat = unionStats.attributeStats(union.output.head)
+    assert(keyStat.distinctCount.isEmpty,
+      "distinctCount should be None when one child lacks it")
+  }
+
+  test("SPARK-56047: distinctCount capped by rowCount") {
+    val sz = Some(BigInt(1024))
+    val attrInt = AttributeReference("cint", IntegerType)()
+    // distinctCount (500) > rowCount of union (6)
+    val columnInfo = AttributeMap(Seq(
+      attrInt -> ColumnStat(distinctCount = Some(500), min = Some(1), max = Some(1000),
+        nullCount = Some(0))))
+    val columnInfo1 = AttributeMap(Seq(
+      AttributeReference("cint1", IntegerType)() -> ColumnStat(
+        distinctCount = Some(300), min = Some(1), max = Some(1000), nullCount = Some(0))))
+
+    val child1 = StatsTestPlan(
+      outputList = columnInfo.keys.toSeq, rowCount = 3,
+      attributeStats = columnInfo, size = sz)
+    val child2 = StatsTestPlan(
+      outputList = columnInfo1.keys.toSeq, rowCount = 3,
+      attributeStats = columnInfo1, size = sz)
+
+    val union = Union(Seq(child1, child2))
+    val unionStats = union.stats
+    assert(unionStats.rowCount === Some(6))
+    val keyStat = unionStats.attributeStats(union.output.head)
+    assert(keyStat.distinctCount === Some(6),
+      "distinctCount should be capped at rowCount=6, not max(500,300)=500")
+  }
+
+  test("SPARK-56047: hasCountStats is true when both distinctCount and nullCount propagated") {
+    val sz = Some(BigInt(1024))
+    val attrInt = AttributeReference("cint", IntegerType)()
+    val columnInfo = AttributeMap(Seq(
+      attrInt -> ColumnStat(distinctCount = Some(10), min = Some(1), max = Some(20),
+        nullCount = Some(1))))
+    val columnInfo1 = AttributeMap(Seq(
+      AttributeReference("cint1", IntegerType)() -> ColumnStat(
+        distinctCount = Some(15), min = Some(1), max = Some(30), nullCount = Some(2))))
+
+    val child1 = StatsTestPlan(
+      outputList = columnInfo.keys.toSeq, rowCount = 100,
+      attributeStats = columnInfo, size = sz)
+    val child2 = StatsTestPlan(
+      outputList = columnInfo1.keys.toSeq, rowCount = 100,
+      attributeStats = columnInfo1, size = sz)
+
+    val union = Union(Seq(child1, child2))
+    val unionStats = union.stats
+    val keyStat = unionStats.attributeStats(union.output.head)
+    assert(keyStat.hasCountStats,
+      "hasCountStats should be true when both distinctCount and nullCount are defined")
+    assert(keyStat.distinctCount === Some(15))
+    assert(keyStat.nullCount === Some(3))
+  }
+
+  test("SPARK-61724: join on a union of TIMESTAMP_NTZ or ANSI interval columns") {
+    // The union keeps the min/max of these types, and a join on its output uses them.
+    Seq[(DataType, Int => Any)](
+      (TimestampNTZType, _.toLong),
+      (YearMonthIntervalType(), identity),
+      (DayTimeIntervalType(), _.toLong)).foreach { case (dt, value) =>
+      def child(min: Int, max: Int): LogicalPlan = {
+        val key = AttributeReference("k", dt)()
+        StatsTestPlan(Seq(key), rowCount = 5, AttributeMap(Seq(key -> ColumnStat(
+          distinctCount = Some(5), min = Some(value(min)), max = Some(value(max)),
+          nullCount = Some(0)))))
+      }
+      val union = Union(Seq(child(1, 5), child(6, 10)))
+      val other = child(1, 5)
+      val join = Join(union, other, Inner, Some(EqualTo(union.output.head, other.output.head)),
+        JoinHint.NONE)
+      // 10 x 5 rows with 5 distinct values on each side.
+      assert(join.stats.rowCount.contains(BigInt(10)), dt)
+    }
   }
 }

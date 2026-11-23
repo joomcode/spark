@@ -27,7 +27,7 @@ import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.tags.SlowSQLTest
 
 @SlowSQLTest
-class OptimizeMetadataOnlyQuerySuite extends QueryTest with SharedSparkSession {
+class OptimizeMetadataOnlyQuerySuite extends SharedSparkSession {
   import testImplicits._
 
   override def beforeAll(): Unit = {
@@ -56,7 +56,7 @@ class OptimizeMetadataOnlyQuerySuite extends QueryTest with SharedSparkSession {
     val localRelations = df.queryExecution.optimizedPlan.collect {
       case l: LocalRelation => l
     }
-    assert(localRelations.size == 0)
+    assert(localRelations.isEmpty)
   }
 
   private def testMetadataOnly(name: String, sqls: String*): Unit = {

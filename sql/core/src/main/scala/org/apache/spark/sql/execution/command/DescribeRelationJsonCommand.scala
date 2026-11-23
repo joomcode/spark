@@ -27,14 +27,14 @@ import org.json4s.jackson.JsonMethods._
 
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.analysis.{ResolvedPersistentView, ResolvedTable, ResolvedTempView}
-import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogTableType, SessionCatalog}
+import org.apache.spark.sql.catalyst.catalog.{CatalogTable, SessionCatalog}
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.util.{quoteIfNeeded, DateTimeUtils, TimestampFormatter}
 import org.apache.spark.sql.classic.ClassicConversions.castToImpl
+import org.apache.spark.sql.connector.catalog.{V1Table, V1View}
 import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
-import org.apache.spark.sql.connector.catalog.V1Table
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.util.PartitioningUtils
@@ -71,10 +71,19 @@ case class DescribeRelationJsonCommand(
         if (partitionSpec.nonEmpty) {
           throw QueryCompilationErrors.descPartitionNotAllowedOnView(v.identifier.name())
         }
+        // Resolve `v.info` to a `CatalogTable` so the JSON renderer below can read v1-shaped
+        // fields uniformly. Session-catalog views carry the original `CatalogTable` inside
+        // `V1View`; non-session v2 views carry a plain `View` and are projected to a
+        // `CatalogTable` via `V1Table.toCatalogTable`, the same conversion the
+        // `CreateTableLike` strategy case in `DataSourceV2Strategy` uses.
+        val metadata = v.info match {
+          case v1Info: V1View => v1Info.v1Table
+          case info => V1Table.toCatalogTable(v.catalog, v.identifier, info)
+        }
         describeIdentifier(v.identifier.toQualifiedNameParts(v.catalog), jsonMap)
-        describeColsJson(v.metadata.schema, jsonMap)
-        describeFormattedTableInfoJson(v.metadata, jsonMap)
-        describeViewSqlConfsJson(v.metadata, jsonMap)
+        describeColsJson(metadata.schema, jsonMap)
+        describeFormattedTableInfoJson(metadata, jsonMap)
+        describeViewSqlConfsJson(metadata, jsonMap)
 
       case ResolvedTable(catalog, identifier, V1Table(metadata), _) =>
         describeIdentifier(identifier.toQualifiedNameParts(catalog), jsonMap)
@@ -152,91 +161,7 @@ case class DescribeRelationJsonCommand(
    * Differs from `json` in DataType.scala by providing additional fields for some types.
    */
   private def jsonType(dataType: DataType): JValue = {
-    dataType match {
-      case arrayType: ArrayType =>
-        JObject(
-          "name" -> JString("array"),
-          "element_type" -> jsonType(arrayType.elementType),
-          "element_nullable" -> JBool(arrayType.containsNull)
-        )
-
-      case mapType: MapType =>
-        JObject(
-          "name" -> JString("map"),
-          "key_type" -> jsonType(mapType.keyType),
-          "value_type" -> jsonType(mapType.valueType),
-          "value_nullable" -> JBool(mapType.valueContainsNull)
-        )
-
-      case structType: StructType =>
-        val fieldsJson = structType.fields.map { field =>
-          val baseJson = List(
-            "name" -> JString(field.name),
-            "type" -> jsonType(field.dataType),
-            "nullable" -> JBool(field.nullable)
-          )
-          val commentJson = field.getComment().map(comment => "comment" -> JString(comment)).toList
-          val defaultJson =
-            field.getCurrentDefaultValue().map(default => "default" -> JString(default)).toList
-
-          JObject(baseJson ++ commentJson ++ defaultJson: _*)
-        }.toList
-
-        JObject(
-          "name" -> JString("struct"),
-          "fields" -> JArray(fieldsJson)
-        )
-
-      case decimalType: DecimalType =>
-        JObject(
-          "name" -> JString("decimal"),
-          "precision" -> JInt(decimalType.precision),
-          "scale" -> JInt(decimalType.scale)
-        )
-
-      case varcharType: VarcharType =>
-        JObject(
-          "name" -> JString("varchar"),
-          "length" -> JInt(varcharType.length)
-        )
-
-      case charType: CharType =>
-        JObject(
-          "name" -> JString("char"),
-          "length" -> JInt(charType.length)
-        )
-
-      // Only override TimestampType; TimestampType_NTZ type is already timestamp_ntz
-      case _: TimestampType =>
-        JObject("name" -> JString("timestamp_ltz"))
-
-      case yearMonthIntervalType: YearMonthIntervalType =>
-        def getFieldName(field: Byte): String = YearMonthIntervalType.fieldToString(field)
-
-        JObject(
-          "name" -> JString("interval"),
-          "start_unit" -> JString(getFieldName(yearMonthIntervalType.startField)),
-          "end_unit" -> JString(getFieldName(yearMonthIntervalType.endField))
-        )
-
-      case dayTimeIntervalType: DayTimeIntervalType =>
-        def getFieldName(field: Byte): String = DayTimeIntervalType.fieldToString(field)
-
-        JObject(
-          "name" -> JString("interval"),
-          "start_unit" -> JString(getFieldName(dayTimeIntervalType.startField)),
-          "end_unit" -> JString(getFieldName(dayTimeIntervalType.endField))
-        )
-
-      case stringType: StringType =>
-        JObject(
-          "name" -> JString("string"),
-          "collation" -> JString(stringType.collationName)
-        )
-
-      case _ =>
-        JObject("name" -> JString(dataType.simpleString))
-    }
+    DescribeRelationJsonCommand.jsonType(dataType)
   }
 
   private def describeColsJson(
@@ -300,7 +225,7 @@ case class DescribeRelationJsonCommand(
       catalog: SessionCatalog,
       metadata: CatalogTable,
       jsonMap: mutable.LinkedHashMap[String, JValue]): Unit = {
-    if (metadata.tableType == CatalogTableType.VIEW) {
+    if (metadata.isViewLike) {
       throw QueryCompilationErrors.descPartitionNotAllowedOnView(metadata.identifier.identifier)
     }
 
@@ -341,5 +266,77 @@ case class DescribeRelationJsonCommand(
 
   override protected def withNewChildInternal(newChild: LogicalPlan): LogicalPlan = {
     copy(child = newChild)
+  }
+}
+
+object DescribeRelationJsonCommand {
+  /** Same JSON type object as `DESCRIBE TABLE EXTENDED AS JSON` `columns[].type`. */
+  private[sql] def jsonType(dataType: DataType): JValue = {
+    dataType match {
+      case arrayType: ArrayType =>
+        JObject(
+          "name" -> JString("array"),
+          "element_type" -> jsonType(arrayType.elementType),
+          "element_nullable" -> JBool(arrayType.containsNull)
+        )
+      case mapType: MapType =>
+        JObject(
+          "name" -> JString("map"),
+          "key_type" -> jsonType(mapType.keyType),
+          "value_type" -> jsonType(mapType.valueType),
+          "value_nullable" -> JBool(mapType.valueContainsNull)
+        )
+      case structType: StructType =>
+        val fieldsJson = structType.fields.map { field =>
+          val baseJson = List(
+            "name" -> JString(field.name),
+            "type" -> jsonType(field.dataType),
+            "nullable" -> JBool(field.nullable)
+          )
+          val commentJson = field.getComment().map(comment => "comment" -> JString(comment)).toList
+          val defaultJson =
+            field.getCurrentDefaultValue().map(default => "default" -> JString(default)).toList
+          JObject(baseJson ++ commentJson ++ defaultJson: _*)
+        }.toList
+        JObject(
+          "name" -> JString("struct"),
+          "fields" -> JArray(fieldsJson)
+        )
+      case decimalType: DecimalType =>
+        JObject(
+          "name" -> JString("decimal"),
+          "precision" -> JInt(decimalType.precision),
+          "scale" -> JInt(decimalType.scale)
+        )
+      case varcharType: VarcharType =>
+        JObject("name" -> JString("varchar"), "length" -> JInt(varcharType.length))
+      case charType: CharType =>
+        JObject("name" -> JString("char"), "length" -> JInt(charType.length))
+      case _: TimestampType =>
+        JObject("name" -> JString("timestamp_ltz"))
+      case yearMonthIntervalType: YearMonthIntervalType =>
+        JObject(
+          "name" -> JString("interval"),
+          "start_unit" -> JString(
+            YearMonthIntervalType.fieldToString(yearMonthIntervalType.startField)),
+          "end_unit" -> JString(
+            YearMonthIntervalType.fieldToString(yearMonthIntervalType.endField))
+        )
+      case dayTimeIntervalType: DayTimeIntervalType =>
+        JObject(
+          "name" -> JString("interval"),
+          "start_unit" -> JString(
+            DayTimeIntervalType.fieldToString(dayTimeIntervalType.startField)),
+          "end_unit" -> JString(
+            DayTimeIntervalType.fieldToString(dayTimeIntervalType.endField))
+        )
+      case stringType: StringType =>
+        JObject(
+          "name" -> JString("string"),
+          "collation" -> JString(stringType.collationName)
+        )
+      case _ =>
+        JObject("name" -> JString(dataType.simpleString))
+    }
   }
 }

@@ -25,6 +25,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{SpecificInternalRow, UnsafeArrayData}
 import org.apache.spark.sql.catalyst.util._
 import org.apache.spark.sql.catalyst.util.ResolveDefaultColumns._
+import org.apache.spark.sql.execution.datasources.orc.types.ops.OrcTypeOps
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
@@ -37,6 +38,8 @@ class OrcDeserializer(
 
   private val resultRow = new SpecificInternalRow(requiredSchema.map(_.dataType))
 
+  private val existenceDefaultValues = ResolveDefaultColumns.existenceDefaultValues(requiredSchema)
+
   private lazy val bitmask = ResolveDefaultColumns.existenceDefaultsBitmask(requiredSchema)
 
   // `fieldWriters(index)` is
@@ -48,14 +51,13 @@ class OrcDeserializer(
     // ADD COLUMN c DEFAULT <value>" on the Orc table, this adds one field to the Catalyst schema.
     // Then if we query the old files with the new Catalyst schema, we should only apply the
     // existence default value to the columns whose IDs are not explicitly requested.
-    val existingValues = ResolveDefaultColumns.existenceDefaultValues(requiredSchema)
-    if (ResolveDefaultColumns.hasExistenceDefaultValues(requiredSchema)) {
-      for (i <- 0 until existingValues.length) {
+    if (existenceDefaultValues.exists(_ != null)) {
+      for (i <- 0 until existenceDefaultValues.length) {
         bitmask(i) =
           if (requestedColIds(i) != -1) {
             false
           } else {
-            existingValues(i) != null
+            existenceDefaultValues(i) != null
           }
       }
     }
@@ -84,7 +86,7 @@ class OrcDeserializer(
       }
       targetColumnIndex += 1
     }
-    applyExistenceDefaultValuesToRow(requiredSchema, resultRow, bitmask)
+    applyExistenceDefaultValuesToRow(existenceDefaultValues, resultRow, bitmask)
     resultRow
   }
 
@@ -101,7 +103,7 @@ class OrcDeserializer(
       }
       targetColumnIndex += 1
     }
-    applyExistenceDefaultValuesToRow(requiredSchema, resultRow, bitmask)
+    applyExistenceDefaultValuesToRow(existenceDefaultValues, resultRow, bitmask)
     resultRow
   }
 
@@ -126,7 +128,7 @@ class OrcDeserializer(
       case IntegerType | _: YearMonthIntervalType => (ordinal, value) =>
         updater.setInt(ordinal, value.asInstanceOf[IntWritable].get)
 
-      case LongType | _: DayTimeIntervalType | _: TimestampNTZType | _: TimeType =>
+      case LongType | _: DayTimeIntervalType | _: TimestampNTZType =>
         (ordinal, value) => updater.setLong(ordinal, value.asInstanceOf[LongWritable].get)
 
       case FloatType => (ordinal, value) =>
@@ -135,7 +137,7 @@ class OrcDeserializer(
       case DoubleType => (ordinal, value) =>
         updater.setDouble(ordinal, value.asInstanceOf[DoubleWritable].get)
 
-      case StringType => (ordinal, value) =>
+      case _: StringType => (ordinal, value) =>
         updater.set(ordinal, UTF8String.fromBytes(value.asInstanceOf[Text].copyBytes))
 
       case BinaryType => (ordinal, value) =>
@@ -149,6 +151,11 @@ class OrcDeserializer(
 
       case TimestampType => (ordinal, value) =>
         updater.setLong(ordinal, DateTimeUtils.fromJavaTimestamp(value.asInstanceOf[OrcTimestamp]))
+
+      // Framework types (TimeType, nanosecond timestamps) provide their own ORC row reader. The
+      // setter callbacks decouple the ops sub-package from the sealed CatalystDataUpdater trait.
+      case OrcTypeOps(ops) =>
+        ops.makeDeserializer(updater.setLong, updater.set)
 
       case DecimalType.Fixed(precision, scale) => (ordinal, value) =>
         val v = OrcShimUtils.getDecimal(value)

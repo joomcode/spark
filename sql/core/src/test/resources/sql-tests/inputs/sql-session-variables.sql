@@ -83,6 +83,19 @@ DROP TEMPORARY VARIABLE var1;
 SET VARIABLE title = 'Test variable in aggregate';
 SELECT (SELECT MAX(id) FROM RANGE(10) WHERE id < title) FROM VALUES 1, 2 AS t(title);
 
+SET VARIABLE title = 'Dropped struct variable -- field access vs qualified name';
+-- `session.a` is ambiguous: (a) 2-part qualified variable, or (b) field `a` of a 1-part
+-- variable `session`. Variable resolution tries (a) first via longest match, falls back to
+-- (b). With `session` declared as a struct, (b) succeeds. After the variable is dropped,
+-- both interpretations fail and the SELECT falls through to column resolution, which
+-- reports `UNRESOLVED_COLUMN`. Because either interpretation could have been intended,
+-- the variable error path (when reached) must dump the full SQL path -- see
+-- `VariableResolution.searchPathEntriesForError`.
+DECLARE OR REPLACE VARIABLE session STRUCT<a INT> = NAMED_STRUCT('a', 1);
+SELECT session.a;
+DROP TEMPORARY VARIABLE session;
+SELECT session.a;
+
 SET VARIABLE title = 'Test qualifiers - fail';
 DECLARE OR REPLACE VARIABLE builtin.var1 INT;
 DECLARE OR REPLACE VARIABLE system.sesion.var1 INT;
@@ -294,6 +307,10 @@ SET VARIABLE var1 = 'hello3';
 SET VARIABLE var1 = DEFAULT, var2 = DEFAULT, var3 = DEFAULT;
 SELECT var1 AS `default1`, var2 AS `default2`, var3 AS `default3`;
 
+SET VARIABLE var1 = 'changed1', var2 = 'changed2', var3 = 'changed3';
+SET VARIABLE (var1, var2, var3) = (VALUES(DEFAULT, DEFAULT, DEFAULT));
+SELECT var1 AS `default1`, var2 AS `default2`, var3 AS `default3`;
+
 SET VARIABLE var1 = 'hello';
 SET VARIABLE (var1) = (SELECT DEFAULT FROM VALUES(1) AS T(c1));
 SELECT var1 AS `default`;
@@ -315,6 +332,41 @@ SET VARIABLE (var1) = (SELECT DEFAULT FROM VALUES(1),(2),(3) AS T(c1) OFFSET 1);
 SELECT var1 AS `default`;
 
 SET VARIABLE var1 = 'hello';
+SET VARIABLE (var1) =
+  (SELECT DEFAULT FROM VALUES(2),(1) AS T(c1) ORDER BY c1 LIMIT 1);
+SELECT var1 AS `default`;
+
+SET VARIABLE var1 = 'hello';
+SET VARIABLE (var1) = (SELECT * FROM VALUES(DEFAULT) AS T(c1));
+SELECT var1 AS `default`;
+
+SET VARIABLE var1 = 'hello';
+SET VARIABLE (var1) = (SELECT max(c1) FROM VALUES(DEFAULT) AS T(c1));
+SELECT var1 AS `default`;
+
+SET VARIABLE (var1) =
+  (SELECT * FROM VALUES(DEFAULT) AS T(c1) ORDER BY c1);
+
+SET VARIABLE (var1) = (SELECT (SELECT DEFAULT));
+
+SET VARIABLE var1 = 'hello';
+SET VARIABLE (var1) =
+  (SELECT (SELECT DEFAULT) FROM VALUES('outer-value') AS T(default));
+SELECT var1 AS `outer-value`;
+
+DECLARE OR REPLACE VARIABLE default STRING DEFAULT 'variable-value';
+
+SET VARIABLE var1 = default;
+SELECT var1 AS `variable-value`;
+
+SET VARIABLE var1 = session.default;
+SELECT var1 AS `qualified-variable-value`;
+
+DROP TEMPORARY VARIABLE default;
+
+SET VARIABLE (var1) = (SELECT DEFAULT, 1);
+
+SET VARIABLE var1 = 'hello';
 SET VARIABLE (var1) = (WITH v1(c1) AS (VALUES(1) AS T(c1)) SELECT DEFAULT FROM VALUES(1),(2),(3) AS T(c1));
 SELECT var1 AS `default`;
 
@@ -322,6 +374,12 @@ SELECT var1 AS `default`;
 SET VARIABLE var1 = 'Hello' || DEFAULT;
 
 SET VARIABLE (var1) = (VALUES(DEFAULT));
+
+DECLARE OR REPLACE VARIABLE default_int INT DEFAULT 7;
+SET VARIABLE (default_int) = (VALUES(DEFAULT + 1));
+DROP TEMPORARY VARIABLE default_int;
+
+SET VARIABLE (var1) = (VALUES(DEFAULT, 1));
 
 SET VARIABLE (var1) = (WITH v1(c1) AS (VALUES(1) AS T(c1)) SELECT DEFAULT + 1 FROM VALUES(1),(2),(3) AS T(c1));
 

@@ -200,9 +200,17 @@ object OffsetSeqMetadata extends Logging {
     STATE_STORE_PROVIDER_CLASS, STREAMING_MULTIPLE_WATERMARK_POLICY,
     FLATMAPGROUPSWITHSTATE_STATE_FORMAT_VERSION, STREAMING_AGGREGATION_STATE_FORMAT_VERSION,
     STREAMING_JOIN_STATE_FORMAT_VERSION, STATE_STORE_COMPRESSION_CODEC,
-    STATE_STORE_ROCKSDB_FORMAT_VERSION, STATEFUL_OPERATOR_USE_STRICT_DISTRIBUTION,
+    STATE_STORE_ROCKSDB_FORMAT_VERSION, STATE_STORE_ROCKSDB_MERGE_OPERATOR_VERSION,
+    STATEFUL_OPERATOR_USE_STRICT_DISTRIBUTION,
     PRUNE_FILTERS_CAN_PRUNE_STREAMING_SUBPLAN, STREAMING_STATE_STORE_ENCODING_FORMAT,
-    STATE_STORE_ROW_CHECKSUM_ENABLED
+    STATE_STORE_ROW_CHECKSUM_ENABLED, PROTOBUF_EXTENSIONS_SUPPORT_ENABLED,
+    ENABLE_STREAMING_SOURCE_EVOLUTION,
+    STATEFUL_OPERATOR_ALWAYS_NULLABLE_OUTPUT,
+    DROP_DUPLICATES_DETERMINISTIC_KEY_ORDER,
+    ALLOW_EXCEPT_ON_STREAMING_DATAFRAME,
+    REGEX_PATTERN_COST_ESTIMATE_VERSION,
+    AVOID_DOUBLE_FILTER_EVAL,
+    AVOID_DOUBLE_FILTER_EVAL_FOR_PYTHON_UDF
   )
 
   /**
@@ -228,6 +236,26 @@ object OffsetSeqMetadata extends Logging {
     rebindSQLConfsSessionToOffsetLog.map { case (k, v) => (v, k) }.toMap
 
   /**
+   * Builds the configuration map persisted in offset metadata.
+   *
+   * Re-bound session configurations are written using their legacy offset-log
+   * keys for checkpoint compatibility.
+   */
+  private[checkpointing] def confsForOffsetLog(
+      sessionConf: RuntimeConfig): Map[String, String] = {
+    val relevantConfs = relevantSQLConfs.map { conf =>
+      conf.key -> sessionConf.get(conf.key)
+    }.toMap
+
+    val reboundConfs = rebindSQLConfsSessionToOffsetLog.map {
+      case (confInSession, confInOffsetLog) =>
+        confInOffsetLog.key -> sessionConf.get(confInSession.key)
+    }.toMap
+
+    relevantConfs ++ reboundConfs
+  }
+
+  /**
    * Default values of relevant configurations that are used for backward compatibility.
    * As new configurations are added to the metadata, existing checkpoints may not have those
    * confs. The values in this list ensures that the confs without recovered values are
@@ -249,8 +277,37 @@ object OffsetSeqMetadata extends Logging {
     STATEFUL_OPERATOR_USE_STRICT_DISTRIBUTION.key -> "false",
     PRUNE_FILTERS_CAN_PRUNE_STREAMING_SUBPLAN.key -> "true",
     STREAMING_STATE_STORE_ENCODING_FORMAT.key -> "unsaferow",
-    STATE_STORE_ROW_CHECKSUM_ENABLED.key -> "false"
+    STATE_STORE_ROW_CHECKSUM_ENABLED.key -> "false",
+    STATE_STORE_ROCKSDB_MERGE_OPERATOR_VERSION.key -> "1",
+    PROTOBUF_EXTENSIONS_SUPPORT_ENABLED.key -> "false",
+    ENABLE_STREAMING_SOURCE_EVOLUTION.key -> "false",
+    STATEFUL_OPERATOR_ALWAYS_NULLABLE_OUTPUT.key -> "false",
+    DROP_DUPLICATES_DETERMINISTIC_KEY_ORDER.key -> "false",
+    ALLOW_EXCEPT_ON_STREAMING_DATAFRAME.key -> "true",
+    REGEX_PATTERN_COST_ESTIMATE_VERSION.key -> "0",
+    AVOID_DOUBLE_FILTER_EVAL_FOR_PYTHON_UDF.key -> "false"
   )
+
+  /**
+   * Returns the value to use for a relevant configuration missing in the given metadata, if any.
+   *
+   * `AVOID_DOUBLE_FILTER_EVAL` cannot be in `relevantSQLConfDefaultValues` because its absence has
+   * two meanings. Before Spark 4.2 the behavior was always that of `false`. Spark 4.2 and 4.3 used
+   * the session value, `true` by default, without recording it. Forcing `false` on the latter could
+   * move a filter under a stateful operator, so that the rows already in the state skip it. Forcing
+   * `true` on the former could change the state schema. They are told apart by
+   * `ENABLE_STREAMING_SOURCE_EVOLUTION`, which is recorded since Spark 4.2.
+   */
+  private def defaultValueForMissingConf(
+      metadata: OffsetSeqMetadataBase,
+      confKey: String): Option[String] = {
+    if (confKey == AVOID_DOUBLE_FILTER_EVAL.key &&
+        !metadata.conf.contains(ENABLE_STREAMING_SOURCE_EVOLUTION.key)) {
+      Some("false")
+    } else {
+      relevantSQLConfDefaultValues.get(confKey)
+    }
+  }
 
   def readValue[T](metadataLog: OffsetSeqMetadataBase, confKey: ConfigEntry[T]): String = {
     readValueOpt(metadataLog, confKey).getOrElse(confKey.defaultValueString)
@@ -263,7 +320,8 @@ object OffsetSeqMetadata extends Logging {
       rebindSQLConfsSessionToOffsetLog(confKey)
     } else confKey
 
-    metadataLog.conf.get(actualKey.key).orElse(relevantSQLConfDefaultValues.get(actualKey.key))
+    metadataLog.conf.get(actualKey.key)
+      .orElse(defaultValueForMissingConf(metadataLog, actualKey.key))
   }
 
   def apply(json: String): OffsetSeqMetadata = Serialization.read[OffsetSeqMetadata](json)
@@ -272,12 +330,35 @@ object OffsetSeqMetadata extends Logging {
       batchWatermarkMs: Long,
       batchTimestampMs: Long,
       sessionConf: RuntimeConfig): OffsetSeqMetadata = {
-    val confs = relevantSQLConfs.map { conf => conf.key -> sessionConf.get(conf.key) }.toMap
-    val confsFromRebind = rebindSQLConfsSessionToOffsetLog.map {
-      case (confInSession, confInOffsetLog) =>
-        confInOffsetLog.key -> sessionConf.get(confInSession.key)
-    }.toMap
-    OffsetSeqMetadata(batchWatermarkMs, batchTimestampMs, confs++ confsFromRebind)
+    OffsetSeqMetadata(batchWatermarkMs, batchTimestampMs, confsForOffsetLog(sessionConf))
+  }
+
+  /**
+   * Adds the stateful shuffle partitions to offset metadata if missing. The value
+   * is written with the legacy offset-log key so that the regular session configuration
+   * rebinding path can restore it.
+   */
+  private[sql] def withStatefulShufflePartitions(
+      metadata: OffsetSeqMetadataV2,
+      numPartitions: Int): OffsetSeqMetadataV2 = {
+    val conf = metadata.conf.updated(SHUFFLE_PARTITIONS.key, numPartitions.toString)
+    metadata.copy(conf = conf)
+  }
+
+  /**
+   * Sets the values of the metadata in `conf`, as `setSessionConf` does, without logging them: for
+   * a copy of the configuration of a query, which `setSessionConf` sets with them later.
+   */
+  def setConfWithoutLogging(metadata: OffsetSeqMetadataBase, conf: SQLConf): Unit = {
+    val keys = relevantSQLConfs.map(entry => entry.key -> entry.key) ++
+      rebindSQLConfsOffsetLogToSession.map { case (inOffsetLog, inSession) =>
+        inOffsetLog.key -> inSession.key
+      }
+    keys.foreach { case (keyInOffsetLog, keyInSession) =>
+      metadata.conf.get(keyInOffsetLog)
+        .orElse(defaultValueForMissingConf(metadata, keyInOffsetLog))
+        .foreach(conf.setConfString(keyInSession, _))
+    }
   }
 
   /** Set the SparkSession configuration with the values in the metadata */
@@ -297,9 +378,9 @@ object OffsetSeqMetadata extends Logging {
 
         case None =>
           // For backward compatibility, if a config was not recorded in the offset log,
-          // then either inject a default value (if specified in `relevantSQLConfDefaultValues`) or
+          // then either inject a default value (if `defaultValueForMissingConf` returns one) or
           // let the existing conf value in SparkSession prevail.
-          relevantSQLConfDefaultValues.get(confKeyInOffsetLog) match {
+          defaultValueForMissingConf(metadata, confKeyInOffsetLog) match {
 
             case Some(defaultValue) =>
               sessionConf.setConfString(confKeyInSession, defaultValue)
@@ -362,6 +443,47 @@ object OffsetSeqControlBatchInfo {
 }
 
 /**
+ * An offset type for Sequential Union operations, stored directly in the offset log.
+ * Sequential Union enables seamless backfill-to-live streaming scenarios by processing multiple
+ * sources sequentially rather than concurrently.
+ *
+ * This is stored as an entry in the offset map (just like source offsets), allowing multiple
+ * sequential unions per query to each track their own state.
+ *
+ * All source tracking is name-based (not index-based) to ensure stability across query restarts
+ * and to integrate with the query evolution feature.
+ *
+ * @param activeSourceName The name of the currently active source being processed.
+ * @param allSourceNames All source names in the order they should be processed.
+ * @param completedSourceNames Set of source names that have finished processing.
+ */
+case class SequentialUnionOffset(
+    activeSourceName: String,
+    allSourceNames: Seq[String],
+    completedSourceNames: Set[String]) extends OffsetV2 {
+
+  // Validate on construction
+  require(allSourceNames.nonEmpty, "allSourceNames must not be empty")
+  require(allSourceNames.contains(activeSourceName),
+    s"activeSourceName '$activeSourceName' must be in allSourceNames: " +
+      s"${allSourceNames.mkString(", ")}")
+  require(completedSourceNames.subsetOf(allSourceNames.toSet),
+    s"completedSourceNames must be a subset of allSourceNames")
+  require(!completedSourceNames.contains(activeSourceName),
+    s"activeSourceName '$activeSourceName' cannot be in completedSourceNames")
+
+  override def json(): String = Serialization.write(this)(SequentialUnionOffset.format)
+}
+
+object SequentialUnionOffset {
+  private implicit val format: Formats = Serialization.formats(NoTypeHints)
+
+  def apply(json: String): SequentialUnionOffset = {
+    Serialization.read[SequentialUnionOffset](json)
+  }
+}
+
+/**
  * Contains metadata associated with a [[OffsetMap]]. This information is
  * persisted to the offset log in the checkpoint location via the [[OffsetMap]] metadata field.
  *
@@ -403,9 +525,10 @@ object OffsetSeqMetadataV2 {
       batchWatermarkMs: Long,
       batchTimestampMs: Long,
       sessionConf: RuntimeConfig): OffsetSeqMetadataV2 = {
-    val confs = OffsetSeqMetadata.relevantSQLConfs.map {
-      conf => conf.key -> sessionConf.get(conf.key)
-    }.toMap
-    OffsetSeqMetadataV2(batchWatermarkMs, batchTimestampMs, confs)
+    OffsetSeqMetadataV2(
+      batchWatermarkMs,
+      batchTimestampMs,
+      OffsetSeqMetadata.confsForOffsetLog(sessionConf)
+    )
   }
 }

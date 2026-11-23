@@ -17,19 +17,16 @@
 
 package org.apache.spark.sql.catalyst.util
 
-import org.apache.spark.SparkException
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.analysis.Analyzer
-import org.apache.spark.sql.catalyst.expressions.{Alias, Cast, Expression}
-import org.apache.spark.sql.catalyst.parser.{CatalystSqlParser, ParseException}
-import org.apache.spark.sql.catalyst.plans.logical.{LocalRelation, Project}
-import org.apache.spark.sql.catalyst.trees.TreePattern.PLAN_EXPRESSION
-import org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.BuiltInFunctionCatalog
-import org.apache.spark.sql.connector.catalog.{CatalogManager, Identifier, TableCatalog, TableCatalogCapability}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, V2ExpressionUtils}
+import org.apache.spark.sql.catalyst.plans.logical.{ColumnDefinition, LogicalPlan}
+import org.apache.spark.sql.catalyst.util.TypeUtils.toSQLId
+import org.apache.spark.sql.connector.catalog.{Column, GenerationExpression, Identifier, Table,
+  TableCapability, TableCatalog, TableCatalogCapability}
 import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{DataType, StructField, StructType}
-import org.apache.spark.sql.util.SchemaUtils
+import org.apache.spark.sql.types.{Metadata, MetadataBuilder, StructField, StructType}
 
 /**
  * This object contains utility methods and values for Generated Columns
@@ -42,22 +39,40 @@ object GeneratedColumn {
    */
   val GENERATION_EXPRESSION_METADATA_KEY = "GENERATION_EXPRESSION"
 
-  /** Parser for parsing generation expression SQL strings */
-  private lazy val parser = new CatalystSqlParser()
+  /**
+   * The metadata key marking a generated column in a write target's output as one whose value
+   * Spark computed from the generation expression, so that it is not validated against the
+   * expression that produced it. Only set while resolving a write.
+   */
+  val AUTO_FILLED_GENERATED_COLUMN_METADATA_KEY = "__auto_filled_generated_column"
 
   /**
    * Whether the given `field` is a generated column
    */
   def isGeneratedColumn(field: StructField): Boolean = {
-    field.metadata.contains(GENERATION_EXPRESSION_METADATA_KEY)
+    isGeneratedColumn(field.metadata)
+  }
+
+  /**
+   * Whether the given metadata indicates a generated column
+   */
+  def isGeneratedColumn(metadata: Metadata): Boolean = {
+    metadata.contains(GENERATION_EXPRESSION_METADATA_KEY)
   }
 
   /**
    * Returns the generation expression stored in the column metadata if it exists
    */
   def getGenerationExpression(field: StructField): Option[String] = {
-    if (isGeneratedColumn(field)) {
-      Some(field.metadata.getString(GENERATION_EXPRESSION_METADATA_KEY))
+    getGenerationExpression(field.metadata)
+  }
+
+  /**
+   * Returns the generation expression stored in the metadata if it exists
+   */
+  def getGenerationExpression(metadata: Metadata): Option[String] = {
+    if (isGeneratedColumn(metadata)) {
+      Some(metadata.getString(GENERATION_EXPRESSION_METADATA_KEY))
     } else {
       None
     }
@@ -71,139 +86,173 @@ object GeneratedColumn {
   }
 
   /**
-   * Parse and analyze `expressionStr` and perform verification. This means:
-   * - The expression cannot reference itself
-   * - The expression cannot reference other generated columns
-   * - No user-defined expressions
-   * - The expression must be deterministic
-   * - The expression data type can be safely up-cast to the destination column data type
-   * - No subquery expressions
-   *
-   * Throws an [[AnalysisException]] if the expression cannot be converted or is an invalid
-   * generation expression according to the above rules.
+   * Check if the table catalog supports generated columns.
+   * This is called from DataSourceV2Strategy for CREATE/REPLACE TABLE commands.
    */
-  private def analyzeAndVerifyExpression(
-      expressionStr: String,
-      fieldName: String,
-      dataType: DataType,
-      schema: StructType,
-      statementType: String): Unit = {
-    def unsupportedExpressionError(reason: String): AnalysisException = {
-      new AnalysisException(
-        errorClass = "UNSUPPORTED_EXPRESSION_GENERATED_COLUMN",
-        messageParameters = Map(
-          "fieldName" -> fieldName,
-          "expressionStr" -> expressionStr,
-          "reason" -> reason))
-    }
-
-    // Parse the expression string
-    val parsed: Expression = try {
-      parser.parseExpression(expressionStr)
-    } catch {
-      case ex: ParseException =>
-        // Shouldn't be possible since we check that the expression is a valid catalyst expression
-        // during parsing
-        throw SparkException.internalError(
-          s"Failed to execute $statementType command because the column $fieldName has " +
-            s"generation expression $expressionStr which fails to parse as a valid expression:" +
-            s"\n${ex.getMessage}")
-    }
-    // Don't allow subquery expressions
-    if (parsed.containsPattern(PLAN_EXPRESSION)) {
-      throw unsupportedExpressionError("subquery expressions are not allowed for generated columns")
-    }
-    // Analyze the parsed result
-    val allowedBaseColumns = schema
-      .filterNot(_.name == fieldName) // Can't reference itself
-      .filterNot(isGeneratedColumn) // Can't reference other generated columns
-    val relation = LocalRelation(
-      CharVarcharUtils.replaceCharVarcharWithStringInSchema(StructType(allowedBaseColumns)))
-    val plan = try {
-      val analyzer: Analyzer = GeneratedColumnAnalyzer
-      val analyzed = analyzer.execute(Project(Seq(Alias(parsed, fieldName)()), relation))
-      analyzer.checkAnalysis(analyzed)
-      analyzed
-    } catch {
-      case ex: AnalysisException =>
-        // Improve error message if possible
-        if (ex.getCondition == "UNRESOLVED_COLUMN.WITH_SUGGESTION") {
-          ex.messageParameters.get("objectName").foreach { unresolvedCol =>
-            val resolver = SQLConf.get.resolver
-            // Whether `col` = `unresolvedCol` taking into account case-sensitivity
-            def isUnresolvedCol(col: String) =
-              resolver(unresolvedCol, QueryCompilationErrors.toSQLId(col))
-            // Check whether the unresolved column is this column
-            if (isUnresolvedCol(fieldName)) {
-              throw unsupportedExpressionError("generation expression cannot reference itself")
-            }
-            // Check whether the unresolved column is another generated column in the schema
-            if (schema.exists(col => isGeneratedColumn(col) && isUnresolvedCol(col.name))) {
-              throw unsupportedExpressionError(
-                "generation expression cannot reference another generated column")
-            }
-          }
-        }
-        if (ex.getCondition == "UNRESOLVED_ROUTINE") {
-          // Cannot resolve function using built-in catalog
-          ex.messageParameters.get("routineName").foreach { fnName =>
-            throw unsupportedExpressionError(s"failed to resolve $fnName to a built-in function")
-          }
-        }
-        throw ex
-    }
-    val analyzed = plan.collectFirst {
-      case Project(Seq(a: Alias), _: LocalRelation) => a.child
-    }.get
-    if (!analyzed.deterministic) {
-      throw unsupportedExpressionError("generation expression is not deterministic")
-    }
-    if (!Cast.canUpCast(analyzed.dataType, dataType)) {
-      throw unsupportedExpressionError(
-        s"generation expression data type ${analyzed.dataType.simpleString} " +
-        s"is incompatible with column data type ${dataType.simpleString}")
-    }
-    if (analyzed.exists(e => SchemaUtils.hasNonUTF8BinaryCollation(e.dataType))) {
-      throw unsupportedExpressionError(
-        "generation expression cannot contain non utf8 binary collated string type")
-    }
-  }
-
-  /**
-   * For any generated columns in `schema`, parse, analyze and verify the generation expression.
-   */
-  private def verifyGeneratedColumns(schema: StructType, statementType: String): Unit = {
-    schema.foreach { field =>
-      getGenerationExpression(field).foreach { expressionStr =>
-        analyzeAndVerifyExpression(expressionStr, field.name, field.dataType, schema, statementType)
-      }
-    }
-  }
-
-  /**
-   * If `schema` contains any generated columns:
-   * 1) Check whether the table catalog supports generated columns. Otherwise throw an error.
-   * 2) Parse, analyze and verify the generation expressions for any generated columns.
-   */
-  def validateGeneratedColumns(
-      schema: StructType,
+  def validateCatalogForGeneratedColumn(
+      columns: Seq[ColumnDefinition],
       catalog: TableCatalog,
-      ident: Identifier,
-      statementType: String): Unit = {
-    if (hasGeneratedColumns(schema)) {
+      ident: Identifier): Unit = {
+    if (columns.exists(_.generationExpression.isDefined)) {
       if (!catalog.capabilities().contains(
         TableCatalogCapability.SUPPORTS_CREATE_TABLE_WITH_GENERATED_COLUMNS)) {
         throw QueryCompilationErrors.unsupportedTableOperationError(
           catalog, ident, "generated columns")
       }
-      GeneratedColumn.verifyGeneratedColumns(schema, statementType)
     }
   }
-}
 
-/**
- * Analyzer for processing generated column expressions using built-in functions only.
- */
-object GeneratedColumnAnalyzer extends Analyzer(
-  new CatalogManager(BuiltInFunctionCatalog, BuiltInFunctionCatalog.v1Catalog)) {
+  /**
+   * Whether the table wants Spark to auto-fill generated column values and enforce generated
+   * column constraints during writes (the
+   * [[TableCapability.GENERATE_COLUMN_VALUES_ON_WRITE]] capability). Without it, the connector is
+   * responsible for handling generated column values.
+   */
+  def supportsGeneratedColumnsOnWrite(table: Table): Boolean = {
+    table.capabilities().contains(TableCapability.GENERATE_COLUMN_VALUES_ON_WRITE)
+  }
+
+  /**
+   * Returns the generation expression of the V2 column `col`, if it is a generated column. A
+   * connector can implement only the legacy SQL getter [[Column.generationExpression]], which
+   * auto-fill reads as well, so fall back to it. Also retain that SQL when the new getter provides
+   * only a modeled expression.
+   */
+  def columnGenerationExpression(col: Column): Option[GenerationExpression] = {
+    Option(col.columnGenerationExpression())
+      .map { expression =>
+        if (expression.getSql != null) {
+          expression
+        } else {
+          Option(col.generationExpression())
+            .map(sql => new GenerationExpression(sql, expression.getExpression))
+            .getOrElse(expression)
+        }
+      }
+      .orElse(Option(col.generationExpression()).map(new GenerationExpression(_)))
+  }
+
+  /**
+   * Whether the table supports generated columns on write (see
+   * [[supportsGeneratedColumnsOnWrite]]) and the given columns include at least one generated
+   * column.
+   */
+  def supportsGeneratedColumnsOnWrite(
+      table: Table,
+      columns: Array[Column]): Boolean = {
+    supportsGeneratedColumnsOnWrite(table) &&
+      columns.exists(columnGenerationExpression(_).isDefined)
+  }
+
+  /**
+   * Reads a generation expression for both auto-fill and validation. Convert the modeled expression
+   * once, falling back to SQL text when it is absent or cannot be converted, as defaults and CHECK
+   * constraints do. Conversion is deferred so presence checks do not read either form.
+   */
+  private[sql] class ExpressionReader(
+      relation: DataSourceV2Relation,
+      colName: String,
+      genExpr: GenerationExpression) {
+    private lazy val modeledExpression = Option(genExpr.getExpression).flatMap { expression =>
+      SQLConf.withExistingConf(StoredExpressionText.fixedConf(SQLConf.get)) {
+        V2ExpressionUtils.toCatalyst(expression)
+      }
+    }
+
+    def toCatalyst(readSql: String => Expression = StoredExpressionText.parse): Expression = {
+      modeledExpression.orElse(Option(genExpr.getSql).map(readSql))
+        .getOrElse {
+          val operation = s"a value for the generated column ${toSQLId(colName)}, because " +
+            s"Spark cannot convert its expression ${genExpr.getExpression}"
+          // A relation of a TableProvider has no catalog and no identifier.
+          throw ((relation.catalog, relation.identifier) match {
+            case (Some(catalog), Some(ident)) =>
+              QueryCompilationErrors.unsupportedTableOperationError(catalog, ident, operation)
+            case _ =>
+              QueryCompilationErrors.unsupportedTableOperationError(relation.table, operation)
+          })
+        }
+    }
+
+    def sql: String = modeledExpression.map(_.sql).getOrElse(genExpr.getSql)
+
+    /**
+     * Only SQL text may fall back to analysis under the writing session's settings. The CHAR and
+     * VARCHAR types of the table are added to `input`, so that a string literal compared with a
+     * CHAR column is padded as the stored values are.
+     */
+    def analyze[E <: Expression](
+        expr: E,
+        inSession: => E,
+        input: Seq[Attribute],
+        analyzer: LogicalPlan => LogicalPlan): E = {
+      val inputWithTypes = CharVarcharUtils.withCharVarcharTypes(input, relation.table.columns())
+      if (modeledExpression.isEmpty) {
+        StoredExpressionText.analyze(expr, inSession, inputWithTypes, analyzer)
+      } else {
+        try {
+          StoredExpressionText.analyzeStrict(expr, inputWithTypes, analyzer)
+        } catch {
+          case error: AnalysisException =>
+            val tableName = (relation.catalog, relation.identifier) match {
+              case (Some(catalog), Some(ident)) =>
+                toSQLId(Seq(catalog.name) ++ ident.namespace.toSeq :+ ident.name)
+              case _ => toSQLId(relation.table.name())
+            }
+            throw new AnalysisException(
+              errorClass = "INVALID_GENERATED_COLUMN_EXPRESSION",
+              messageParameters = Map(
+                "tableName" -> tableName,
+                "columnName" -> toSQLId(colName),
+                "expression" -> sql,
+                "reason" -> error.getMessage),
+              cause = Some(error))
+        }
+      }
+    }
+  }
+
+  /**
+   * When a write supplies its own value for a generated column, that value must agree with the
+   * generation expression, so ResolveTableConstraints validates it with a CheckInvariant, the same
+   * way it enforces a table's CHECK constraints. In contrast, values computed by Spark from the
+   * generation expression pass that check by construction, so this mark is what tells the rule to
+   * skip them.
+   *
+   * Returns a write target's `output` with the generated columns named in `autoFilled` marked as
+   * computed by Spark, so that it can skip CheckInvariant validation.
+   *
+   * Columns are left unmarked by default, so a value that did not come from the generation
+   * expression is always validated.
+   */
+  def markAutoFilledGeneratedColumns(
+      output: Seq[AttributeReference],
+      autoFilled: Set[String]): Seq[AttributeReference] = {
+    output.map { attr =>
+      if (autoFilled.contains(attr.name)) {
+        withMetadataEntry(attr, AUTO_FILLED_GENERATED_COLUMN_METADATA_KEY, "true")
+      } else {
+        attr
+      }
+    }
+  }
+
+  /**
+   * Whether `attr` is a generated column whose value Spark computed from the generation
+   * expression (see [[markAutoFilledGeneratedColumns]]).
+   */
+  def isAutoFilledGeneratedColumn(attr: Attribute): Boolean = {
+    attr.metadata.contains(AUTO_FILLED_GENERATED_COLUMN_METADATA_KEY)
+  }
+
+  private def withMetadataEntry(
+      attr: AttributeReference,
+      key: String,
+      value: String): AttributeReference = {
+    val metadata = new MetadataBuilder()
+      .withMetadata(attr.metadata)
+      .putString(key, value)
+      .build()
+    attr.withMetadata(metadata).asInstanceOf[AttributeReference]
+  }
 }

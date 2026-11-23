@@ -20,16 +20,14 @@ package org.apache.spark.sql.execution.python
 import java.io.{BufferedInputStream, BufferedOutputStream, DataInputStream, DataOutputStream, InputStream, IOException}
 import java.nio.ByteBuffer
 import java.nio.channels.SelectionKey
-import java.util.HashMap
-import java.util.concurrent.TimeUnit
 
 import scala.jdk.CollectionConverters._
 
 import net.razorvine.pickle.Pickler
 
 import org.apache.spark.{JobArtifactSet, SparkEnv, SparkException}
-import org.apache.spark.api.python.{BasePythonRunner, PythonFunction, PythonWorker, PythonWorkerException, PythonWorkerUtils, SpecialLengths}
-import org.apache.spark.internal.{Logging, LogKeys}
+import org.apache.spark.api.python.{BasePythonRunner, PythonFunction, PythonWorker, PythonWorkerHandle, PythonWorkerUtils, SpecialLengths}
+import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.BUFFER_SIZE
 import org.apache.spark.internal.config.Python._
 import org.apache.spark.sql.classic.SparkSession
@@ -43,6 +41,8 @@ abstract class PythonPlannerRunner[T](func: PythonFunction) extends Logging {
   import BasePythonRunner._
 
   protected val workerModule: String
+
+  protected def runnerConf: Map[String, String] = Map.empty
 
   protected def writeToPython(dataOut: DataOutputStream, pickler: Pickler): Unit
 
@@ -61,6 +61,7 @@ abstract class PythonPlannerRunner[T](func: PythonFunction) extends Logging {
     val killWorkerOnFlushFailure: Boolean = SQLConf.get.pythonUDFDaemonKillWorkerOnFlushFailure
     val hideTraceback: Boolean = SQLConf.get.pysparkHideTraceback
     val simplifiedTraceback: Boolean = SQLConf.get.pysparkSimplifiedTraceback
+    val tracebackWithLocals: Boolean = SQLConf.get.pysparkTracebackWithLocals
     val workerMemoryMb = SQLConf.get.pythonPlannerExecMemory
 
     val jobArtifactUUID = JobArtifactSet.getCurrentJobArtifactState.map(_.uuid)
@@ -71,7 +72,9 @@ abstract class PythonPlannerRunner[T](func: PythonFunction) extends Logging {
       }
     }
 
-    val envVars = new HashMap[String, String](func.envVars)
+    // Installed at worker launch, the same as the execution-side runners, so a planning
+    // worker sees the environment the session holds when planning runs.
+    val envVars = PythonWorkerEnvironment.mergeValidated(func.envVars, SQLConf.get)
     val pythonExec = func.pythonExec
     val pythonVer = func.pythonVer
     val pythonIncludes = func.pythonIncludes.asScala.toSet
@@ -87,6 +90,9 @@ abstract class PythonPlannerRunner[T](func: PythonFunction) extends Logging {
     }
     if (simplifiedTraceback) {
       envVars.put("SPARK_SIMPLIFIED_TRACEBACK", "1")
+    }
+    if (tracebackWithLocals) {
+      envVars.put("SPARK_TRACEBACK_WITH_LOCALS", "1")
     }
     workerMemoryMb.foreach { memoryMb =>
       envVars.put("PYSPARK_PLANNER_MEMORY_MB", memoryMb.toString)
@@ -107,14 +113,14 @@ abstract class PythonPlannerRunner[T](func: PythonFunction) extends Logging {
     sessionUUID.foreach { uuid =>
       envVars.put("PYSPARK_SPARK_SESSION_UUID", uuid)
     }
+    envVars.put("SPARK_PYTHON_RUNTIME", "PYTHON_WORKER")
 
     EvaluatePython.registerPicklers()
     val pickler = new Pickler(/* useMemo = */ true,
       /* valueCompare = */ false)
 
-    val (worker: PythonWorker, handle: Option[ProcessHandle]) =
+    val (worker: PythonWorker, handle: Option[PythonWorkerHandle]) =
       env.createPythonWorker(pythonExec, workerModule, envVars.asScala.toMap, useDaemon)
-    val pid = handle.map(_.pid.toInt)
     var releasedOrClosed = false
     val bufferStream = new DirectByteBufferOutputStream()
     try {
@@ -123,6 +129,7 @@ abstract class PythonPlannerRunner[T](func: PythonFunction) extends Logging {
       PythonWorkerUtils.writePythonVersion(pythonVer, dataOut)
       PythonWorkerUtils.writeSparkFiles(jobArtifactUUID, pythonIncludes, dataOut)
       PythonWorkerUtils.writeBroadcasts(broadcastVars, worker, env, dataOut)
+      PythonWorkerUtils.writeConf(runnerConf, dataOut)
 
       writeToPython(dataOut, pickler)
 
@@ -132,7 +139,7 @@ abstract class PythonPlannerRunner[T](func: PythonFunction) extends Logging {
       val dataIn = new DataInputStream(new BufferedInputStream(
         new WorkerInputStream(
           worker, bufferStream.toByteBuffer, handle,
-          faultHandlerEnabled, idleTimeoutSeconds, killOnIdleTimeout),
+          idleTimeoutSeconds, killOnIdleTimeout),
         bufferSize))
 
       val res = receiveFromPython(dataIn)
@@ -158,11 +165,8 @@ abstract class PythonPlannerRunner[T](func: PythonFunction) extends Logging {
             "the better Python traceback.", e)
 
       case e: IOException =>
-        val base = "Python worker exited unexpectedly (crashed)"
-        val msg = tryReadFaultHandlerLog(faultHandlerEnabled, pid)
-          .map(error => s"$base: $error")
-          .getOrElse(base)
-        throw new SparkException(msg, e)
+        throw new SparkException(
+          withTerminationDiagnostics("Python worker exited unexpectedly (crashed)", handle), e)
     } finally {
       try {
         bufferStream.close()
@@ -186,8 +190,7 @@ abstract class PythonPlannerRunner[T](func: PythonFunction) extends Logging {
   private class WorkerInputStream(
       worker: PythonWorker,
       buffer: ByteBuffer,
-      handle: Option[ProcessHandle],
-      faultHandlerEnabled: Boolean,
+      handle: Option[PythonWorkerHandle],
       idleTimeoutSeconds: Long,
       killOnIdleTimeout: Boolean) extends InputStream {
 
@@ -203,49 +206,22 @@ abstract class PythonPlannerRunner[T](func: PythonFunction) extends Logging {
       }
     }
 
-    private[this] val idleTimeoutMillis: Long = TimeUnit.SECONDS.toMillis(idleTimeoutSeconds)
-    private[this] var pythonWorkerKilled: Boolean = false
+    private[this] val idleTimeoutHandler = new IdleTimeoutHandler(
+      worker, handle, idleTimeoutSeconds, killOnIdleTimeout, None, logName,
+      workerName = "Python planner worker")
 
     override def read(b: Array[Byte], off: Int, len: Int): Int = {
       val buf = ByteBuffer.wrap(b, off, len)
       var n = 0
       while (n == 0) {
-        val start = System.currentTimeMillis()
-        val selected = worker.selector.select(idleTimeoutMillis)
-        val end = System.currentTimeMillis()
-        if (selected == 0
-          // Avoid logging if no timeout or the selector doesn't wait for the idle timeout
-          // as it can return 0 in some case.
-          && idleTimeoutMillis > 0 && (end - start) >= idleTimeoutMillis) {
-          if (pythonWorkerKilled) {
-            logWarning(
-              log"Waiting for Python planner worker process to terminate after idle timeout: " +
-              pythonWorkerStatusMessageWithContext(handle, worker, buffer.hasRemaining))
-          } else {
-            logWarning(
-              log"Idle timeout reached for Python planner worker (timeout: " +
-              log"${MDC(LogKeys.PYTHON_WORKER_IDLE_TIMEOUT, idleTimeoutSeconds)} seconds). " +
-              log"No data received from the worker process: " +
-              pythonWorkerStatusMessageWithContext(handle, worker, buffer.hasRemaining))
-            if (killOnIdleTimeout) {
-              handle.foreach { handle =>
-                if (handle.isAlive) {
-                  logWarning(
-                    log"Terminating Python planner worker process due to idle timeout (timeout: " +
-                    log"${MDC(LogKeys.PYTHON_WORKER_IDLE_TIMEOUT, idleTimeoutSeconds)} seconds)")
-                  pythonWorkerKilled = handle.destroy()
-                }
-              }
-            }
-          }
-        }
+        idleTimeoutHandler.select(buffer.hasRemaining)
         if (worker.selectionKey.isReadable) {
-          n = worker.channel.read(buf)
+          n = idleTimeoutHandler.read(buf)
         }
         if (worker.selectionKey.isWritable) {
           var acceptsInput = true
           while (acceptsInput && buffer.hasRemaining) {
-            val n = worker.channel.write(buffer)
+            val n = idleTimeoutHandler.write(buffer)
             acceptsInput = n > 0
           }
           if (!buffer.hasRemaining) {
@@ -253,14 +229,6 @@ abstract class PythonPlannerRunner[T](func: PythonFunction) extends Logging {
             worker.selectionKey.interestOps(SelectionKey.OP_READ)
           }
         }
-      }
-      if (n == -1 && pythonWorkerKilled) {
-        val base = "Python worker process terminated due to idle timeout " +
-          s"(timeout: $idleTimeoutSeconds seconds)"
-        val msg = tryReadFaultHandlerLog(faultHandlerEnabled, handle.map(_.pid.toInt))
-          .map(error => s"$base: $error")
-          .getOrElse(base)
-        throw new PythonWorkerException(msg)
       }
       n
     }

@@ -50,7 +50,7 @@ import org.apache.spark.storage.StorageLevel
  */
 private[regression] trait AFTSurvivalRegressionParams extends PredictorParams
   with HasMaxIter with HasTol with HasFitIntercept with HasAggregationDepth
-  with HasMaxBlockSizeInMB with Logging {
+  with HasMaxBlockSizeInMB with HasIntermediateStorageLevel with Logging {
 
   /**
    * Param for censor column name.
@@ -111,14 +111,14 @@ private[regression] trait AFTSurvivalRegressionParams extends PredictorParams
   protected def validateAndTransformSchema(
       schema: StructType,
       fitting: Boolean): StructType = {
-    SchemaUtils.checkColumnType(schema, $(featuresCol), new VectorUDT)
+    SchemaUtils.checkColumnType(schema, $(featuresCol), SQLDataTypes.VectorType)
     if (fitting) {
       SchemaUtils.checkNumericType(schema, $(censorCol))
       SchemaUtils.checkNumericType(schema, $(labelCol))
     }
 
     val schemaWithQuantilesCol = if (hasQuantilesCol) {
-      SchemaUtils.appendColumn(schema, $(quantilesCol), new VectorUDT)
+      SchemaUtils.appendColumn(schema, $(quantilesCol), SQLDataTypes.VectorType)
     } else schema
 
     SchemaUtils.appendColumn(schemaWithQuantilesCol, $(predictionCol), DoubleType)
@@ -199,12 +199,17 @@ class AFTSurvivalRegression @Since("1.6.0") (@Since("1.6.0") override val uid: S
   @Since("3.1.0")
   def setMaxBlockSizeInMB(value: Double): this.type = set(maxBlockSizeInMB, value)
 
+  /** @group expertSetParam */
+  @Since("4.4.0")
+  def setIntermediateStorageLevel(value: String): this.type = set(intermediateStorageLevel, value)
+
   override protected def train(
       dataset: Dataset[_]): AFTSurvivalRegressionModel = instrumented { instr =>
     instr.logPipelineStage(this)
     instr.logDataset(dataset)
     instr.logParams(this, labelCol, featuresCol, censorCol, predictionCol, quantilesCol,
-      fitIntercept, maxIter, tol, aggregationDepth, maxBlockSizeInMB)
+      fitIntercept, maxIter, tol, aggregationDepth, maxBlockSizeInMB,
+      intermediateStorageLevel)
     instr.logNamedValue("quantileProbabilities.size", $(quantileProbabilities).length)
 
     if (dataset.storageLevel != StorageLevel.NONE) {
@@ -304,7 +309,7 @@ class AFTSurvivalRegression @Since("1.6.0") (@Since("1.6.0") override val uid: S
 
     val maxMemUsage = (actualBlockSizeInMB * 1024L * 1024L).ceil.toLong
     val blocks = InstanceBlock.blokifyWithMaxMemUsage(scaled, maxMemUsage)
-      .persist(StorageLevel.MEMORY_AND_DISK)
+      .persist(StorageLevel.fromString($(intermediateStorageLevel)))
       .setName(s"training blocks (blockSizeInMB=$actualBlockSizeInMB)")
 
     val getAggregatorFunc = new AFTBlockAggregator(bcScaledMean, $(fitIntercept))(_)
@@ -408,23 +413,13 @@ class AFTSurvivalRegressionModel private[ml] (
     }
   }
 
-  private def lambda2Quantiles(lambda: Double): Vector = {
-    val quantiles = _quantiles.copy
-    BLAS.scal(lambda, quantiles)
-    quantiles
-  }
+  @Since("2.0.0")
+  def predictQuantiles(features: Vector): Vector =
+    AFTSurvivalRegressionModel.predictQuantiles(features, coefficients, intercept, _quantiles)
 
   @Since("2.0.0")
-  def predictQuantiles(features: Vector): Vector = {
-    // scale parameter for the Weibull distribution of lifetime
-    val lambda = predict(features)
-    lambda2Quantiles(lambda)
-  }
-
-  @Since("2.0.0")
-  def predict(features: Vector): Double = {
-    math.exp(BLAS.dot(coefficients, features) + intercept)
-  }
+  def predict(features: Vector): Double =
+    AFTSurvivalRegressionModel.predict(features, coefficients, intercept)
 
   @Since("2.0.0")
   override def transform(dataset: Dataset[_]): DataFrame = {
@@ -432,19 +427,29 @@ class AFTSurvivalRegressionModel private[ml] (
 
     var predictionColNames = Seq.empty[String]
     var predictionColumns = Seq.empty[Column]
+    val localCoefficients = coefficients
+    val localIntercept = intercept
 
     if ($(predictionCol).nonEmpty) {
-      val predCol = udf(predict _).apply(col($(featuresCol)))
+      val predCol = udf((features: Vector) =>
+        AFTSurvivalRegressionModel.predict(features, localCoefficients, localIntercept))
+        .apply(col($(featuresCol)))
       predictionColNames :+= $(predictionCol)
       predictionColumns :+= predCol
         .as($(predictionCol), outputSchema($(predictionCol)).metadata)
     }
 
     if (hasQuantilesCol) {
+      val localQuantiles = _quantiles
       val quanCol = if ($(predictionCol).nonEmpty) {
-        udf(lambda2Quantiles _).apply(predictionColumns.head)
+        udf((lambda: Double) =>
+          AFTSurvivalRegressionModel.lambda2Quantiles(lambda, localQuantiles))
+          .apply(predictionColumns.head)
       } else {
-        udf(predictQuantiles _).apply(col($(featuresCol)))
+        udf((features: Vector) =>
+          AFTSurvivalRegressionModel.predictQuantiles(
+            features, localCoefficients, localIntercept, localQuantiles)
+        ).apply(col($(featuresCol)))
       }
       predictionColNames :+= $(quantilesCol)
       predictionColumns :+= quanCol
@@ -500,6 +505,23 @@ class AFTSurvivalRegressionModel private[ml] (
 @Since("1.6.0")
 object AFTSurvivalRegressionModel extends MLReadable[AFTSurvivalRegressionModel] {
   private[ml] case class Data(coefficients: Vector, intercept: Double, scale: Double)
+
+  private def lambda2Quantiles(lambda: Double, quantiles: Vector): Vector = {
+    val scaledQuantiles = quantiles.copy
+    BLAS.scal(lambda, scaledQuantiles)
+    scaledQuantiles
+  }
+
+  private def predict(features: Vector, coefficients: Vector, intercept: Double): Double =
+    math.exp(BLAS.dot(coefficients, features) + intercept)
+
+  private def predictQuantiles(
+      features: Vector,
+      coefficients: Vector,
+      intercept: Double,
+      quantiles: Vector): Vector = {
+    lambda2Quantiles(predict(features, coefficients, intercept), quantiles)
+  }
 
   private[ml] def serializeData(data: Data, dos: DataOutputStream): Unit = {
     import ReadWriteUtils._

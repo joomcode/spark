@@ -14,24 +14,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import datetime
+import decimal
 import unittest
 
+from pyspark.errors import AnalysisException
 from pyspark.sql import Row
 from pyspark.sql import functions as sf
-from pyspark.errors import AnalysisException
-from pyspark.testing.sqlutils import (
-    ReusedSQLTestCase,
+from pyspark.testing import assertDataFrameEqual
+from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import (
     have_pandas,
     have_pyarrow,
     pandas_requirement_message,
     pyarrow_requirement_message,
 )
-from pyspark.testing import assertDataFrameEqual
 
 
 class GroupTestsMixin:
-    @unittest.skipIf(not have_pandas, pandas_requirement_message)  # type: ignore
-    @unittest.skipIf(not have_pyarrow, pyarrow_requirement_message)  # type: ignore
+    @unittest.skipIf(not have_pandas, pandas_requirement_message)
+    @unittest.skipIf(not have_pyarrow, pyarrow_requirement_message)
     def test_agg_func(self):
         data = [Row(key=1, value=10), Row(key=1, value=20), Row(key=1, value=30)]
         df = self.spark.createDataFrame(data)
@@ -70,8 +72,8 @@ class GroupTestsMixin:
         # test deprecated countDistinct
         self.assertEqual(100, g.agg(functions.countDistinct(df.value)).first()[0])
 
-    @unittest.skipIf(not have_pandas, pandas_requirement_message)  # type: ignore
-    @unittest.skipIf(not have_pyarrow, pyarrow_requirement_message)  # type: ignore
+    @unittest.skipIf(not have_pandas, pandas_requirement_message)
+    @unittest.skipIf(not have_pyarrow, pyarrow_requirement_message)
     def test_group_by_ordinal(self):
         spark = self.spark
         df = spark.createDataFrame(
@@ -86,7 +88,7 @@ class GroupTestsMixin:
             ["a", "b"],
         )
 
-        with self.tempView("v"):
+        with self.temp_view("v"):
             df.createOrReplaceTempView("v")
 
             # basic case
@@ -142,8 +144,8 @@ class GroupTestsMixin:
 
         self.assertEqual([["a", 3], ["b", 5]], [list(r) for r in res])
 
-    @unittest.skipIf(not have_pandas, pandas_requirement_message)  # type: ignore
-    @unittest.skipIf(not have_pyarrow, pyarrow_requirement_message)  # type: ignore
+    @unittest.skipIf(not have_pandas, pandas_requirement_message)
+    @unittest.skipIf(not have_pyarrow, pyarrow_requirement_message)
     def test_order_by_ordinal(self):
         spark = self.spark
         df = spark.createDataFrame(
@@ -158,7 +160,7 @@ class GroupTestsMixin:
             ["a", "b"],
         )
 
-        with self.tempView("v"):
+        with self.temp_view("v"):
             df.createOrReplaceTempView("v")
 
             df1 = spark.sql("select * from v order by 1 desc;")
@@ -192,6 +194,26 @@ class GroupTestsMixin:
             with self.assertRaises(IndexError):
                 df.orderBy(-3)
 
+    def test_pivot_values_with_null_date_and_decimal(self):
+        # SPARK-60279: pivot values can be None, date or Decimal
+        df = self.spark.createDataFrame(
+            [(1, "a", datetime.date(2020, 1, 1), 10), (2, None, datetime.date(2020, 1, 2), 20)],
+            "k int, s string, d date, v int",
+        ).withColumn("dec", sf.col("v").cast("decimal(10,1)"))
+
+        values = [r.s for r in df.select("s").distinct().sort("s").collect()]
+        res = df.groupBy("k").pivot("s", values).sum("v")
+        self.assertEqual(res.columns, ["k", "null", "a"])
+        assertDataFrameEqual(res, [Row(k=1, null=None, a=10), Row(k=2, null=20, a=None)])
+
+        res = df.groupBy("k").pivot("d", [datetime.date(2020, 1, 1)]).sum("v")
+        self.assertEqual(res.columns, ["k", "2020-01-01"])
+        assertDataFrameEqual(res, [Row(1, 10), Row(2, None)])
+
+        res = df.groupBy("k").pivot("dec", [decimal.Decimal("10.0")]).sum("v")
+        self.assertEqual(res.columns, ["k", "10.0"])
+        assertDataFrameEqual(res, [Row(1, 10), Row(2, None)])
+
     def test_pivot_exceed_max_values(self):
         with self.assertRaises(AnalysisException):
             self.spark.range(100001).groupBy(sf.lit(1)).pivot("id").count().show()
@@ -202,13 +224,6 @@ class GroupTests(GroupTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.sql.tests.test_group import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

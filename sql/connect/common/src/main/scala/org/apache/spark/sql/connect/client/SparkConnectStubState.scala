@@ -19,6 +19,7 @@ package org.apache.spark.sql.connect.client
 import io.grpc.ManagedChannel
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys.TIMEOUT
 
 // This is common state shared between the blocking and non-blocking stubs.
 //
@@ -26,14 +27,25 @@ import org.apache.spark.internal.Logging
 // that the same stub instance is used for all requests from the same client. In addition,
 // this class provides access to the commonly configured retry policy and exception conversion
 // logic.
-class SparkConnectStubState(channel: ManagedChannel, retryPolicies: Seq[RetryPolicy])
+class SparkConnectStubState(
+    channel: ManagedChannel,
+    val configuration: SparkConnectClient.Configuration)
     extends Logging {
 
+  val rpcDeadlines: RpcDeadlines = configuration.rpcDeadlines
+
+  if (log.isInfoEnabled) {
+    logInfo(log"Spark Connect RPC deadlines: ${MDC(TIMEOUT, rpcDeadlines)}")
+  }
+
   // Manages the retry handler logic used by the stubs.
-  lazy val retryHandler = new GrpcRetryHandler(retryPolicies)
+  lazy val retryHandler = new GrpcRetryHandler(
+    configuration.retryPolicies,
+    maxRetryExceptionElapsedTime = configuration.maxRetryExceptionElapsedTime)
 
   // Responsible to convert the GRPC Status exceptions into Spark exceptions.
-  lazy val exceptionConverter: GrpcExceptionConverter = new GrpcExceptionConverter(channel)
+  lazy val exceptionConverter: GrpcExceptionConverter =
+    new GrpcExceptionConverter(channel, configuration.rpcDeadlines.fetchErrorDetails)
 
   // Provides a helper for validating the responses processed by the stub.
   lazy val responseValidator = new ResponseValidator()

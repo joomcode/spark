@@ -19,7 +19,7 @@ package org.apache.spark.launcher;
 
 /**
  * This helper class is used to place some JVM runtime options(eg: `--add-opens`)
- * required by Spark when using Java 17. `DEFAULT_MODULE_OPTIONS` has added
+ * required by Spark when using Java 21. `DEFAULT_MODULE_OPTIONS` has added
  * `-XX:+IgnoreUnrecognizedVMOptions` to be robust.
  *
  * @since 3.3.0
@@ -43,10 +43,10 @@ public class JavaModuleOptions {
       "--add-opens=java.base/sun.security.action=ALL-UNNAMED",
       "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED",
       "--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED",
-      "-Djdk.reflect.useDirectMethodHandle=false",
       "-Dio.netty.tryReflectionSetAccessible=true",
       "-Dio.netty.allocator.type=pooled",
       "-Dio.netty.handler.ssl.defaultEndpointVerificationAlgorithm=NONE",
+      "--sun-misc-unsafe-memory-access=allow",
       "--enable-native-access=ALL-UNNAMED"};
 
     /**

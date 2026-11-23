@@ -17,102 +17,186 @@
 __all__ = [
     "ChannelBuilder",
     "DefaultChannelBuilder",
+    "RpcDeadlines",
     "SparkConnectClient",
 ]
 
 import atexit
-
-from pyspark.sql.connect.utils import check_dependencies
-
-check_dependencies(__name__)
-
-import logging
-import threading
-import os
+import concurrent.futures
 import copy
+import logging
+import os
+import pickle
 import platform
+import sys
+import threading
+import time
+import traceback
 import urllib.parse
 import uuid
-import sys
-import time
+import weakref
+from dataclasses import dataclass, fields
 from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
     Iterable,
     Iterator,
-    Optional,
-    Any,
-    Union,
     List,
-    Tuple,
-    Dict,
-    Set,
-    NoReturn,
     Mapping,
-    cast,
-    TYPE_CHECKING,
+    NoReturn,
+    Optional,
+    Set,
+    Tuple,
     Type,
-    Sequence,
+    Union,
+    cast,
 )
-
-import pandas as pd
-import pyarrow as pa
 
 import google.protobuf.message
-from grpc_status import rpc_status
 import grpc
-from google.protobuf import text_format, any_pb2
+import pandas as pd
+import pyarrow as pa
+from google.protobuf import any_pb2, text_format
 from google.rpc import error_details_pb2
+from grpc_status import rpc_status
 
-from pyspark.util import is_remote_only
-from pyspark.accumulators import SpecialAccumulatorIds
-from pyspark.version import __version__
-from pyspark.resource.information import ResourceInformation
-from pyspark.sql.metrics import MetricValue, PlanMetrics, ExecutionInfo, ObservedMetrics
-from pyspark.sql.connect.client.artifact import ArtifactManager
-from pyspark.sql.connect.logging import logger
-from pyspark.sql.connect.profiler import ConnectProfilerCollector
-from pyspark.sql.connect.client.reattach import ExecutePlanResponseReattachableIterator
-from pyspark.sql.connect.client.retries import RetryPolicy, Retrying, DefaultPolicy
-from pyspark.sql.connect.conversion import (
-    storage_level_to_proto,
-    proto_to_storage_level,
-    proto_to_remote_cached_dataframe,
-)
+import pyspark
 import pyspark.sql.connect.proto as pb2
 import pyspark.sql.connect.proto.base_pb2_grpc as grpc_lib
 import pyspark.sql.connect.types as types
+from pyspark.accumulators import SpecialAccumulatorIds, specialAccumulatorSer
+from pyspark.errors import (
+    PySparkAssertionError,
+    PySparkNotImplementedError,
+    PySparkValueError,
+)
 from pyspark.errors.exceptions.connect import (
-    convert_exception,
     SparkConnectException,
     SparkConnectGrpcException,
+    convert_exception,
+    convert_observation_errors,
+)
+from pyspark.resource.information import ResourceInformation
+from pyspark.sql.connect.client.artifact import ArtifactManager
+from pyspark.sql.connect.client.reattach import ExecutePlanResponseReattachableIterator
+from pyspark.sql.connect.client.retries import (
+    DEFAULT_MAX_RETRY_EXCEPTION_ELAPSED_TIME,
+    DefaultPolicy,
+    Retrying,
+    RetryPolicy,
+)
+from pyspark.sql.connect.conversion import (
+    proto_to_storage_level,
+    storage_level_to_proto,
 )
 from pyspark.sql.connect.expressions import (
-    LiteralExpression,
-    PythonUDF,
     CommonInlineUserDefinedFunction,
     JavaUDF,
+    LiteralExpression,
+    PythonUDF,
 )
-from pyspark.sql.connect.plan import (
-    CommonInlineUserDefinedTableFunction,
-    CommonInlineUserDefinedDataSource,
-    PythonUDTF,
-    PythonDataSource,
-)
+from pyspark.sql.connect.logging import logger
 from pyspark.sql.connect.observation import Observation
-from pyspark.sql.connect.utils import get_python_ver
-from pyspark.sql.pandas.types import from_arrow_schema
-from pyspark.sql.pandas.conversion import _convert_arrow_table_to_pandas
-from pyspark.sql.types import DataType, StructType
-from pyspark.util import PythonEvalType
-from pyspark.storagelevel import StorageLevel
-from pyspark.errors import PySparkValueError, PySparkAssertionError, PySparkNotImplementedError
+from pyspark.sql.connect.plan import (
+    CommonInlineUserDefinedDataSource,
+    CommonInlineUserDefinedTableFunction,
+    PythonDataSource,
+    PythonUDTF,
+)
+from pyspark.sql.connect.profiler import ConnectProfilerCollector
+from pyspark.sql.connect.proto.base_pb2 import FetchErrorDetailsResponse
 from pyspark.sql.connect.shell.progress import Progress, ProgressHandler, from_proto
+from pyspark.sql.connect.utils import get_python_ver
+from pyspark.sql.metrics import ExecutionInfo, MetricValue, ObservedMetrics, PlanMetrics
+from pyspark.sql.pandas.conversion import _convert_arrow_table_to_pandas
+from pyspark.sql.pandas.types import from_arrow_schema
+from pyspark.sql.types import DataType, StructType
+from pyspark.storagelevel import StorageLevel
+from pyspark.traceback_utils import CallSite
+from pyspark.util import PythonEvalType, disable_gc, is_remote_only
+from pyspark.version import __version__
 
 if TYPE_CHECKING:
     from google.rpc.error_details_pb2 import ErrorInfo
     from google.rpc.status_pb2 import Status
+
     from pyspark.sql.connect._typing import DataTypeOrString
     from pyspark.sql.connect.session import SparkSession
     from pyspark.sql.datasource import DataSource
+
+
+PYSPARK_ROOT = os.path.dirname(pyspark.__file__)
+_OPERATION_ID_METADATA_KEY = "spark-connect-operation-id"
+
+
+@dataclass(frozen=True)
+class RpcDeadlines:
+    """Per-RPC timeout configuration for :class:`SparkConnectClient`.
+
+    Each field controls the timeout (in seconds as a float) for one gRPC call type. Set a field to
+    ``None`` to disable the per-RPC timeout for that call. Use :meth:`RpcDeadlines.disabled` to
+    create an instance with all timeouts disabled.
+
+    Note on ``reattachable_execute_plan`` and ``reattach_execute``: these timeouts apply to each
+    individual gRPC stream segment, not to the overall query execution lifetime. When a deadline
+    fires, the server-side operation continues running; the client opens a new ReattachExecute
+    stream to resume receiving results. Non-reattachable query ExecutePlan calls have no deadline
+    because a timeout there would kill the execution with no recovery path.
+
+    Note on ``release_relation``: the RemoveRemoteCachedRelation cleanup command is sent over a
+    blocking, non-reattachable ExecutePlan call issued from
+    :meth:`CachedRemoteRelation.__del__`. Unlike a query ExecutePlan, a timeout here does not kill
+    any recoverable execution -- it only abandons a best-effort cache eviction that the server also
+    performs independently -- so this call is given a bounded deadline. Without it the finalizer
+    can block forever if the release response is never delivered, which (on the foreachBatch
+    Connect path) stalls the streaming query indefinitely.
+    """
+
+    reattachable_execute_plan: Optional[float] = 10 * 60  # 10 min
+    reattach_execute: Optional[float] = 10 * 60  # 10 min
+    analyze_plan: Optional[float] = 60 * 60  # 1 hour
+    add_artifacts: Optional[float] = 60 * 60  # 1 hour
+    config: Optional[float] = 10 * 60  # 10 min
+    interrupt: Optional[float] = 10 * 60  # 10 min
+    release_session: Optional[float] = 10 * 60  # 10 min
+    artifact_status: Optional[float] = 10 * 60  # 10 min
+    clone_session: Optional[float] = 10 * 60  # 10 min
+    get_status: Optional[float] = 10 * 60  # 10 min
+    fetch_error_details: Optional[float] = 10 * 60  # 10 min
+    release_relation: Optional[float] = 60  # 1 min; short: per-batch finalizer
+
+    def __post_init__(self) -> None:
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if value is not None and value <= 0:
+                raise PySparkValueError(
+                    message=(
+                        f"RpcDeadlines.{field.name} must be a positive number or None, "
+                        f"got {value!r}"
+                    ),
+                )
+
+    @classmethod
+    def disabled(cls) -> "RpcDeadlines":
+        """Create an :class:`RpcDeadlines` with all per-RPC timeouts disabled.
+
+        Use this when you want to rely solely on server-side or network-layer timeouts.
+        """
+        return cls(
+            reattachable_execute_plan=None,
+            reattach_execute=None,
+            analyze_plan=None,
+            add_artifacts=None,
+            config=None,
+            interrupt=None,
+            release_session=None,
+            artifact_status=None,
+            clone_session=None,
+            get_status=None,
+            fetch_error_details=None,
+            release_relation=None,
+        )
 
 
 def _import_zstandard_if_available() -> Optional[Any]:
@@ -141,8 +225,22 @@ class ChannelBuilder:
     PARAM_USER_ID = "user_id"
     PARAM_USER_AGENT = "user_agent"
     PARAM_SESSION_ID = "session_id"
+    PARAM_GRPC_KEEPALIVE_ENABLED = "grpc_keepalive_enabled"
+    PARAM_GRPC_KEEPALIVE_TIME_MS = "grpc_keepalive_time_ms"
+    PARAM_GRPC_KEEPALIVE_TIMEOUT_MS = "grpc_keepalive_timeout_ms"
+    PARAM_GRPC_KEEPALIVE_WITHOUT_CALLS = "grpc_keepalive_without_calls"
 
     GRPC_MAX_MESSAGE_LENGTH_DEFAULT = 128 * 1024 * 1024
+
+    # Detects a silently-dead connection (e.g. a NAT gateway/load balancer dropping an idle
+    # connection mapping without sending a TCP RST/FIN) via gRPC/HTTP2 keepalive PINGs, so a
+    # blocked RPC (such as streaming query awaitTermination()) surfaces as UNAVAILABLE instead
+    # of hanging forever. Mirrors the JVM client's defaults (SparkConnectClient.scala). See
+    # SPARK-58094.
+    GRPC_DEFAULT_KEEPALIVE_ENABLED = True
+    GRPC_DEFAULT_KEEPALIVE_TIME_MS = 60 * 1000
+    GRPC_DEFAULT_KEEPALIVE_TIMEOUT_MS = 20 * 1000
+    GRPC_DEFAULT_KEEPALIVE_WITHOUT_CALLS = True
 
     GRPC_DEFAULT_OPTIONS = [
         ("grpc.max_send_message_length", GRPC_MAX_MESSAGE_LENGTH_DEFAULT),
@@ -210,7 +308,7 @@ class ChannelBuilder:
         raise PySparkNotImplementedError
 
     def _insecure_channel(self, target: Any, **kwargs: Any) -> grpc.Channel:
-        channel = grpc.insecure_channel(target, options=self._channel_options, **kwargs)
+        channel = grpc.insecure_channel(target, options=self._effective_channel_options(), **kwargs)
 
         if len(self._interceptors) > 0:
             logger.debug(f"Applying interceptors ({self._interceptors})")
@@ -218,7 +316,9 @@ class ChannelBuilder:
         return channel
 
     def _secure_channel(self, target: Any, credentials: Any, **kwargs: Any) -> grpc.Channel:
-        channel = grpc.secure_channel(target, credentials, options=self._channel_options, **kwargs)
+        channel = grpc.secure_channel(
+            target, credentials, options=self._effective_channel_options(), **kwargs
+        )
 
         if len(self._interceptors) > 0:
             logger.debug(f"Applying interceptors ({self._interceptors})")
@@ -240,6 +340,74 @@ class ChannelBuilder:
             ChannelBuilder.PARAM_TOKEN, os.environ.get("SPARK_CONNECT_AUTHENTICATE_TOKEN")
         )
 
+    @property
+    def keepalive_enabled(self) -> bool:
+        """
+        Whether the client sends gRPC/HTTP2 keepalive PINGs to detect a silently-dead
+        connection. Enabled by default; can be turned off as an escape hatch, e.g. if it
+        interacts badly with a particular network path, or a client environment is prone to
+        stalls long enough to trip false-positive disconnects.
+        """
+        return (
+            self.getDefault(
+                ChannelBuilder.PARAM_GRPC_KEEPALIVE_ENABLED,
+                str(ChannelBuilder.GRPC_DEFAULT_KEEPALIVE_ENABLED),
+            ).lower()
+            == "true"
+        )
+
+    @property
+    def keepalive_time_ms(self) -> int:
+        """Idle time (in milliseconds) before sending a gRPC/HTTP2 keepalive PING."""
+        return int(
+            self.getDefault(
+                ChannelBuilder.PARAM_GRPC_KEEPALIVE_TIME_MS,
+                ChannelBuilder.GRPC_DEFAULT_KEEPALIVE_TIME_MS,
+            )
+        )
+
+    @property
+    def keepalive_timeout_ms(self) -> int:
+        """Time (in milliseconds) to wait for a keepalive PING ack before failing."""
+        return int(
+            self.getDefault(
+                ChannelBuilder.PARAM_GRPC_KEEPALIVE_TIMEOUT_MS,
+                ChannelBuilder.GRPC_DEFAULT_KEEPALIVE_TIMEOUT_MS,
+            )
+        )
+
+    @property
+    def keepalive_without_calls(self) -> bool:
+        """Whether to keep sending keepalive PINGs when there are no in-flight RPCs."""
+        return (
+            self.getDefault(
+                ChannelBuilder.PARAM_GRPC_KEEPALIVE_WITHOUT_CALLS,
+                str(ChannelBuilder.GRPC_DEFAULT_KEEPALIVE_WITHOUT_CALLS),
+            ).lower()
+            == "true"
+        )
+
+    def _effective_channel_options(self) -> List[Tuple[str, Any]]:
+        """
+        Returns ``self._channel_options`` with the keepalive options
+        (:attr:`keepalive_enabled`/:attr:`keepalive_time_ms`/:attr:`keepalive_timeout_ms`/
+        :attr:`keepalive_without_calls`) applied, unless a caller already set one of those
+        specific keys explicitly via ``channelOptions``/:meth:`setChannelOption`, in which case
+        the explicit value wins.
+        """
+        options = list(self._channel_options)
+        if not self.keepalive_enabled:
+            return options
+        existing_keys = {k for k, _ in options}
+        for key, value in (
+            ("grpc.keepalive_time_ms", self.keepalive_time_ms),
+            ("grpc.keepalive_timeout_ms", self.keepalive_timeout_ms),
+            ("grpc.keepalive_permit_without_calls", 1 if self.keepalive_without_calls else 0),
+        ):
+            if key not in existing_keys:
+                options.append((key, value))
+        return options
+
     def metadata(self) -> Iterable[Tuple[str, str]]:
         """
         Builds the GRPC specific metadata list to be injected into the request. All
@@ -259,6 +427,10 @@ class ChannelBuilder:
                 ChannelBuilder.PARAM_USER_ID,
                 ChannelBuilder.PARAM_USER_AGENT,
                 ChannelBuilder.PARAM_SESSION_ID,
+                ChannelBuilder.PARAM_GRPC_KEEPALIVE_ENABLED,
+                ChannelBuilder.PARAM_GRPC_KEEPALIVE_TIME_MS,
+                ChannelBuilder.PARAM_GRPC_KEEPALIVE_TIMEOUT_MS,
+                ChannelBuilder.PARAM_GRPC_KEEPALIVE_WITHOUT_CALLS,
             ]
         ]
 
@@ -299,7 +471,8 @@ class ChannelBuilder:
         ua_len = len(urllib.parse.quote(user_agent))
         if ua_len > 2048:
             raise SparkConnectException(
-                f"'user_agent' parameter should not exceed 2048 characters, found {len} characters."
+                f"'user_agent' parameter should not exceed 2048 characters after URL "
+                f"escaping, found {ua_len} characters."
             )
         return " ".join(
             [
@@ -327,6 +500,10 @@ class DefaultChannelBuilder(ChannelBuilder):
     >>> cb = DefaultChannelBuilder("sc://localhost/;use_ssl=true;token=aaa")
     ... cb.secure
     True
+
+    >>> cb = DefaultChannelBuilder("sc://localhost/;grpc_keepalive_time_ms=30000")
+    ... cb.keepalive_time_ms
+    30000
     """
 
     @staticmethod
@@ -345,7 +522,7 @@ class DefaultChannelBuilder(ChannelBuilder):
             session = PySparkSession._instantiatedSession
 
             if session is not None:
-                jvm = PySparkSession._instantiatedSession._jvm  # type: ignore[union-attr]
+                jvm = session._jvm
                 return getattr(
                     getattr(
                         jvm,
@@ -517,6 +694,16 @@ class PlanObservedMetrics(ObservedMetrics):
         }
 
 
+_ExecutePlanResponseItem = Union[
+    "pa.RecordBatch",
+    StructType,
+    PlanMetrics,
+    PlanObservedMetrics,
+    Dict[str, Any],
+    any_pb2.Any,
+]
+
+
 class AnalyzeResult:
     def __init__(
         self,
@@ -621,10 +808,23 @@ class ConfigResult:
         )
 
 
+def _is_pyspark_source(filename: str) -> bool:
+    """Check if the given filename is from the pyspark package."""
+    return filename.startswith(PYSPARK_ROOT)
+
+
 class SparkConnectClient(object):
     """
     Conceptually the remote spark session that communicates with the server
     """
+
+    # Thread id currently executing a best-effort ML-cache RPC (clean_cache / delete), or None.
+    # Used to detect re-entrant ML-cache RPCs on the same thread: a CPython finalizer
+    # (RemoteModelRef.__del__ -> del_remote_cache -> _delete_ml_cache) can fire while the GIL is
+    # released inside a blocking ML-cache RPC, issuing a second blocking RPC on the same thread
+    # that deadlocks the gRPC channel and hangs until the test/process timeout. See the guards in
+    # _cleanup_ml_cache / _delete_ml_cache.
+    _ml_cache_rpc_thread: Optional[int] = None
 
     def __init__(
         self,
@@ -636,6 +836,8 @@ class SparkConnectClient(object):
         session_hooks: Optional[list["SparkSession.Hook"]] = None,
         allow_arrow_batch_chunking: bool = True,
         preferred_arrow_chunk_size: Optional[int] = None,
+        rpc_deadlines: Optional[RpcDeadlines] = None,
+        max_retry_exception_elapsed_time: Optional[float] = None,
     ):
         """
         Creates a new SparkSession for the Spark Connect interface.
@@ -683,6 +885,17 @@ class SparkConnectClient(object):
             results.
             The server will attempt to use this size if it is set and within the valid range
             ([1KB, max batch size on server]). Otherwise, the server's maximum batch size is used.
+        rpc_deadlines : RpcDeadlines, optional
+            Per-RPC gRPC call timeouts in seconds (10 min for most RPCs,
+            1 hour for analyze/addArtifacts, none for non-reattachable execute).
+            Use :meth:`RpcDeadlines.disabled` to turn off all deadlines.
+        max_retry_exception_elapsed_time : float, optional
+            Maximum cumulative elapsed time in seconds the client will keep retrying a
+            RetryException (raised internally when a reattach attempt keeps hitting
+            DEADLINE_EXCEEDED, or when the initial ExecutePlan never reached the server) before
+            giving up and raising the underlying error. Defaults to
+            :data:`~pyspark.sql.connect.client.retries.DEFAULT_MAX_RETRY_EXCEPTION_ELAPSED_TIME`
+            (1 hour).
         """
         self.thread_local = threading.local()
 
@@ -692,12 +905,28 @@ class SparkConnectClient(object):
             if isinstance(connection, ChannelBuilder)
             else DefaultChannelBuilder(connection, channel_options)
         )
+        metadata = list(self._builder.metadata())
+        if any(key.lower() == _OPERATION_ID_METADATA_KEY for key, _ in metadata):
+            logger.warning(
+                "Connection option %s is ignored because Spark Connect sets it for each "
+                "ExecutePlan request.",
+                _OPERATION_ID_METADATA_KEY,
+            )
+        artifact_manager_metadata = [
+            (key, value) for key, value in metadata if key.lower() != _OPERATION_ID_METADATA_KEY
+        ]
         self._user_id = None
         self._retry_policies: List[RetryPolicy] = []
 
         retry_policy_args = retry_policy or dict()
         default_policy = DefaultPolicy(**retry_policy_args)
         self.set_retry_policies([default_policy])
+
+        self._max_retry_exception_elapsed_time = (
+            max_retry_exception_elapsed_time
+            if max_retry_exception_elapsed_time is not None
+            else DEFAULT_MAX_RETRY_EXCEPTION_ELAPSED_TIME
+        )
 
         if self._builder.session_id is None:
             # Generate a unique session ID for this client. This UUID must be unique to allow
@@ -718,8 +947,17 @@ class SparkConnectClient(object):
         self._channel = self._builder.toChannel()
         self._closed = False
         self._internal_stub = grpc_lib.SparkConnectServiceStub(self._channel)
+        self._rpc_deadlines: RpcDeadlines = (
+            rpc_deadlines if rpc_deadlines is not None else RpcDeadlines()
+        )
+        logger.info("Spark Connect RPC deadlines: %s", self._rpc_deadlines)
         self._artifact_manager = ArtifactManager(
-            self._user_id, self._session_id, self._channel, self._builder.metadata()
+            self._user_id,
+            self._session_id,
+            self._channel,
+            artifact_manager_metadata,
+            add_artifacts_timeout=self._rpc_deadlines.add_artifacts,
+            artifact_status_timeout=self._rpc_deadlines.artifact_status,
         )
         self._use_reattachable_execute = use_reattachable_execute
         self._allow_arrow_batch_chunking = allow_arrow_batch_chunking
@@ -739,8 +977,13 @@ class SparkConnectClient(object):
         self._plan_compression_threshold: Optional[int] = None  # Will be fetched lazily
         self._plan_compression_algorithm: Optional[str] = None  # Will be fetched lazily
 
-        # cleanup ml cache if possible
-        atexit.register(self._cleanup_ml_cache)
+        self._release_futures: weakref.WeakSet[concurrent.futures.Future] = weakref.WeakSet()
+
+        self._release_session_on_exit = os.getenv(
+            "SPARK_CONNECT_RELEASE_SESSION_ON_EXIT", "false"
+        ).lower() in ("true", "1")
+        # cleanup if possible
+        atexit.register(self._on_exit)
 
         self.global_user_context_extensions: List[Tuple[str, any_pb2.Any]] = []
         self.global_user_context_extensions_lock = threading.Lock()
@@ -788,7 +1031,10 @@ class SparkConnectClient(object):
         self._progress_handlers.remove(handler)
 
     def _retrying(self) -> "Retrying":
-        return Retrying(self._retry_policies)
+        return Retrying(
+            self._retry_policies,
+            max_retry_exception_elapsed_time=self._max_retry_exception_elapsed_time,
+        )
 
     def disable_reattachable_execute(self) -> "SparkConnectClient":
         self._use_reattachable_execute = False
@@ -812,6 +1058,50 @@ class SparkConnectClient(object):
         """
         return list(self._retry_policies)
 
+    @classmethod
+    def _retrieve_stack_frames(cls) -> List[CallSite]:
+        """
+        Return a list of CallSites representing the relevant stack frames in the callstack.
+        """
+        frames = traceback.extract_stack()
+
+        filtered_stack_frames = []
+        for i, frame in enumerate(frames):
+            filename, lineno, func, _ = frame
+            if _is_pyspark_source(filename):
+                # Do not include PySpark internal frames as they are not user application code
+                break
+            if i + 1 < len(frames):
+                _, _, func, _ = frames[i + 1]
+            filtered_stack_frames.append(CallSite(function=func, file=filename, linenum=lineno))
+
+        return filtered_stack_frames
+
+    @classmethod
+    def _build_call_stack_trace(cls) -> Optional[any_pb2.Any]:
+        """
+        Build a call stack trace for the current Spark Connect action
+        Returns
+        -------
+        FetchErrorDetailsResponse.Error: An Error object containing list of stack frames
+        of the user code packed as Any protobuf
+        """
+        if os.getenv("SPARK_CONNECT_DEBUG_CLIENT_CALL_STACK", "false").lower() in ("true", "1"):
+            stack_frames = cls._retrieve_stack_frames()
+            call_stack = FetchErrorDetailsResponse.Error()
+            for call_site in stack_frames:
+                stack_trace_element = pb2.FetchErrorDetailsResponse.StackTraceElement()
+                stack_trace_element.declaring_class = ""  # unknown information
+                stack_trace_element.method_name = call_site.function
+                stack_trace_element.file_name = call_site.file
+                stack_trace_element.line_number = call_site.linenum
+                call_stack.stack_trace.append(stack_trace_element)
+            if len(call_stack.stack_trace) > 0:
+                call_stack_details = any_pb2.Any()
+                call_stack_details.Pack(call_stack)
+                return call_stack_details
+        return None
+
     def register_udf(
         self,
         function: Any,
@@ -819,6 +1109,7 @@ class SparkConnectClient(object):
         name: Optional[str] = None,
         eval_type: int = PythonEvalType.SQL_BATCHED_UDF,
         deterministic: bool = True,
+        buffer_type: Optional["DataType"] = None,
     ) -> str:
         """
         Create a temporary UDF in the session catalog on the other side. We generate a
@@ -834,6 +1125,8 @@ class SparkConnectClient(object):
             eval_type=eval_type,
             func=function,
             python_ver="%d.%d" % sys.version_info[:2],
+            # Set for the incremental aggregator (see pyspark.sql.aggregator).
+            buffer_type=buffer_type,
         )
 
         # construct a CommonInlineUserDefinedFunction
@@ -939,14 +1232,9 @@ class SparkConnectClient(object):
         logger.debug("Fetching the resources")
         cmd = pb2.Command()
         cmd.get_resources_command.SetInParent()
-        (_, properties, _) = self.execute_command(cmd)
+        _, properties, _ = self.execute_command(cmd)
         resources = properties["get_resources_command_result"]
         return resources
-
-    def _build_observed_metrics(
-        self, metrics: Sequence["pb2.ExecutePlanResponse.ObservedMetrics"]
-    ) -> Iterator[PlanObservedMetrics]:
-        return (PlanObservedMetrics(x.name, [v for v in x.values], list(x.keys)) for x in metrics)
 
     def to_table_as_iterator(
         self, plan: pb2.Plan, observations: Dict[str, Observation]
@@ -982,12 +1270,12 @@ class SparkConnectClient(object):
         table, schema, metrics, observed_metrics, _ = self._execute_and_fetch(req, observations)
 
         # Create a query execution object.
-        ei = ExecutionInfo(metrics, observed_metrics)
+        ei = ExecutionInfo(metrics, observed_metrics, req.operation_id)
         assert table is not None
         return table, schema, ei
 
     def to_pandas(
-        self, plan: pb2.Plan, observations: Dict[str, Observation]
+        self, plan: pb2.Plan, observations: Dict[str, Observation], **kwargs: Any
     ) -> Tuple["pd.DataFrame", "ExecutionInfo"]:
         """
         Return given plan as a pandas DataFrame.
@@ -1010,11 +1298,15 @@ class SparkConnectClient(object):
             "spark.sql.execution.arrow.pyspark.selfDestruct.enabled",
         )
 
+        # if pandasStructHandlingMode is explicitly set, override the runtime config
+        if "pandasStructHandlingMode" in kwargs:
+            structHandlingMode = str(kwargs["pandasStructHandlingMode"])
+
         table, schema, metrics, observed_metrics, _ = self._execute_and_fetch(
             req, observations, selfDestruct == "true"
         )
         assert table is not None
-        ei = ExecutionInfo(metrics, observed_metrics)
+        ei = ExecutionInfo(metrics, observed_metrics, req.operation_id)
 
         schema = schema or from_arrow_schema(table.schema, prefer_timestamp_ntz=True)
         assert schema is not None and isinstance(schema, StructType)
@@ -1085,7 +1377,7 @@ class SparkConnectClient(object):
                 if descriptor.type == descriptor.TYPE_MESSAGE:
                     if allowed_recursion_depth == 0:
                         p2.ClearField(field_name)
-                    elif descriptor.label == descriptor.LABEL_REPEATED:
+                    elif descriptor.is_repeated:
                         p2.ClearField(field_name)
                         getattr(p2, field_name).extend(
                             [self._truncate(v, allowed_recursion_depth - 1) for v in value]
@@ -1096,14 +1388,14 @@ class SparkConnectClient(object):
                         )
 
                 elif descriptor.type == descriptor.TYPE_STRING:
-                    if descriptor.label == descriptor.LABEL_REPEATED:
+                    if descriptor.is_repeated:
                         p2.ClearField(field_name)
                         getattr(p2, field_name).extend([truncate_str(v) for v in value])
                     else:
                         setattr(p2, field_name, truncate_str(value))
 
                 elif descriptor.type == descriptor.TYPE_BYTES:
-                    if descriptor.label == descriptor.LABEL_REPEATED:
+                    if descriptor.is_repeated:
                         p2.ClearField(field_name)
                         getattr(p2, field_name).extend([truncate_bytes(v) for v in value])
                     else:
@@ -1152,14 +1444,12 @@ class SparkConnectClient(object):
             # when not at debug log level.
             logger.debug(f"Execute command for command {self._proto_to_string(command, True)}")
         req = self._execute_plan_request_with_metadata()
-        if self._user_id:
-            req.user_context.user_id = self._user_id
         self._set_command_in_plan(req.plan, command)
         data, _, metrics, observed_metrics, properties = self._execute_and_fetch(
             req, observations or {}
         )
         # Create a query execution object.
-        ei = ExecutionInfo(metrics, observed_metrics)
+        ei = ExecutionInfo(metrics, observed_metrics, req.operation_id)
         if data is not None:
             return (data.to_pandas(), properties, ei)
         else:
@@ -1167,9 +1457,11 @@ class SparkConnectClient(object):
 
     def execute_command_as_iterator(
         self, command: pb2.Command, observations: Optional[Dict[str, Observation]] = None
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> Iterator[_ExecutePlanResponseItem]:
         """
-        Execute given command. Similar to execute_command, but the value is returned using yield.
+        Execute given command, yielding each decoded response as it arrives.
+
+        Callers are responsible for handling the response types relevant to their command.
         """
         if logger.isEnabledFor(logging.DEBUG):
             # inside an if statement to not incur a performance cost converting proto to string
@@ -1178,19 +1470,8 @@ class SparkConnectClient(object):
                 f"Execute command as iterator for command {self._proto_to_string(command, True)}"
             )
         req = self._execute_plan_request_with_metadata()
-        if self._user_id:
-            req.user_context.user_id = self._user_id
         self._set_command_in_plan(req.plan, command)
-        for response in self._execute_and_fetch_as_iterator(req, observations or {}):
-            if isinstance(response, dict):
-                yield response
-            else:
-                raise PySparkValueError(
-                    errorClass="UNKNOWN_RESPONSE",
-                    messageParameters={
-                        "response": str(response),
-                    },
-                )
+        yield from self._execute_and_fetch_as_iterator(req, observations or {})
 
     def same_semantics(self, plan: pb2.Plan, other: pb2.Plan) -> bool:
         """
@@ -1212,7 +1493,8 @@ class SparkConnectClient(object):
         """
         Close the channel.
         """
-        ExecutePlanResponseReattachableIterator.shutdown()
+        concurrent.futures.wait(self._release_futures, timeout=10)
+        ExecutePlanResponseReattachableIterator.shutdown_threadpool_if_idle()
         self._channel.close()
         self._closed = True
 
@@ -1277,7 +1559,9 @@ class SparkConnectClient(object):
                 )
             )
         )
-        if operation_id is not None:
+        if operation_id is None:
+            operation_id = str(uuid.uuid4())
+        else:
             try:
                 uuid.UUID(operation_id, version=4)
             except ValueError as ve:
@@ -1285,8 +1569,11 @@ class SparkConnectClient(object):
                     errorClass="INVALID_OPERATION_UUID_ID",
                     messageParameters={"arg_name": "operation_id", "origin": str(ve)},
                 )
-            req.operation_id = operation_id
+        req.operation_id = operation_id
         self._update_request_with_user_context_extensions(req)
+
+        if call_stack_trace := self.__class__._build_call_stack_trace():
+            req.user_context.extensions.append(call_stack_trace)
         return req
 
     def _analyze_plan_request_with_metadata(self) -> pb2.AnalyzePlanRequest:
@@ -1298,6 +1585,8 @@ class SparkConnectClient(object):
         if self._user_id:
             req.user_context.user_id = self._user_id
         self._update_request_with_user_context_extensions(req)
+        if call_stack_trace := self.__class__._build_call_stack_trace():
+            req.user_context.extensions.append(call_stack_trace)
         return req
 
     def _analyze(self, method: str, **kwargs: Any) -> AnalyzeResult:
@@ -1314,11 +1603,13 @@ class SparkConnectClient(object):
         elif method == "explain":
             req.explain.plan.CopyFrom(cast(pb2.Plan, kwargs.get("plan")))
             explain_mode = kwargs.get("explain_mode")
-            if explain_mode not in ["simple", "extended", "codegen", "cost", "formatted"]:
+            allowed_explain_modes = ["simple", "extended", "codegen", "cost", "formatted"]
+            if explain_mode not in allowed_explain_modes:
                 raise PySparkValueError(
-                    errorClass="UNKNOWN_EXPLAIN_MODE",
+                    errorClass="VALUE_NOT_ALLOWED",
                     messageParameters={
-                        "explain_mode": str(explain_mode),
+                        "arg_name": "explain_mode",
+                        "allowed_values": str(allowed_explain_modes),
                     },
                 )
             if explain_mode == "simple":
@@ -1385,7 +1676,11 @@ class SparkConnectClient(object):
         try:
             for attempt in self._retrying():
                 with attempt:
-                    resp = self._stub.AnalyzePlan(req, metadata=self._builder.metadata())
+                    resp = self._stub.AnalyzePlan(
+                        req,
+                        metadata=self._builder_metadata(),
+                        timeout=self._rpc_deadlines.analyze_plan,
+                    )
                     self._verify_response_integrity(resp)
                     return AnalyzeResult.fromProto(resp)
             raise SparkConnectException("Invalid state during retry exception handling.")
@@ -1404,8 +1699,10 @@ class SparkConnectClient(object):
         """
         logger.debug("Execute")
 
+        operation_id = req.operation_id
         for hook in self._session_hooks:
             req = hook.on_execute_plan(req)
+            req.operation_id = operation_id
 
         def handle_response(b: pb2.ExecutePlanResponse) -> None:
             self._verify_response_integrity(b)
@@ -1414,58 +1711,63 @@ class SparkConnectClient(object):
             if self._use_reattachable_execute:
                 # Don't use retryHandler - own retry handling is inside.
                 generator = ExecutePlanResponseReattachableIterator(
-                    req, self._stub, self._retrying, self._builder.metadata()
+                    req,
+                    self._stub,
+                    self._retrying,
+                    self._execute_plan_metadata(req.operation_id),
+                    reattachable_execute_plan_timeout=self._rpc_deadlines.reattachable_execute_plan,
+                    reattach_execute_timeout=self._rpc_deadlines.reattach_execute,
                 )
                 try:
                     for b in generator:
                         handle_response(b)
                 finally:
                     generator.close()
+                    self._release_futures.update(generator.release_futures)
             else:
                 for attempt in self._retrying():
                     with attempt:
-                        for b in self._stub.ExecutePlan(req, metadata=self._builder.metadata()):
-                            handle_response(b)
+                        with disable_gc():
+                            for b in self._stub.ExecutePlan(
+                                req, metadata=self._execute_plan_metadata(req.operation_id)
+                            ):
+                                handle_response(b)
         except Exception as error:
-            self._handle_error(error)
+            self._handle_error(error, req.operation_id)
+
+    def _builder_metadata(self) -> List[Tuple[str, str]]:
+        return [
+            (key, value)
+            for key, value in self._builder.metadata()
+            if key.lower() != _OPERATION_ID_METADATA_KEY
+        ]
+
+    def _execute_plan_metadata(self, operation_id: str) -> List[Tuple[str, str]]:
+        metadata = self._builder_metadata()
+        metadata.append((_OPERATION_ID_METADATA_KEY, operation_id))
+        return metadata
 
     def _execute_and_fetch_as_iterator(
         self,
         req: pb2.ExecutePlanRequest,
         observations: Dict[str, Observation],
         progress: Optional["Progress"] = None,
-    ) -> Iterator[
-        Union[
-            "pa.RecordBatch",
-            StructType,
-            PlanMetrics,
-            PlanObservedMetrics,
-            Dict[str, Any],
-        ]
-    ]:
+    ) -> Iterator[_ExecutePlanResponseItem]:
         if logger.isEnabledFor(logging.DEBUG):
             # inside an if statement to not incur a performance cost converting proto to string
             # when not at debug log level.
             logger.debug(f"ExecuteAndFetchAsIterator. Request: {self._proto_to_string(req)}")
 
+        operation_id = req.operation_id
         for hook in self._session_hooks:
             req = hook.on_execute_plan(req)
-
+            req.operation_id = operation_id
         num_records = 0
         arrow_batch_chunks_to_assemble: List[bytes] = []
 
         def handle_response(
             b: pb2.ExecutePlanResponse,
-        ) -> Iterator[
-            Union[
-                "pa.RecordBatch",
-                StructType,
-                PlanMetrics,
-                PlanObservedMetrics,
-                Dict[str, Any],
-                any_pb2.Any,
-            ]
-        ]:
+        ) -> Iterator[_ExecutePlanResponseItem]:
             nonlocal num_records
             # The session ID is the local session ID and should match what we expect.
             self._verify_response_integrity(b)
@@ -1481,25 +1783,40 @@ class SparkConnectClient(object):
                 yield from self._build_metrics(b.metrics)
             if b.observed_metrics:
                 logger.debug("Received observed metric batch.")
-                for observed_metrics in self._build_observed_metrics(b.observed_metrics):
-                    if observed_metrics.name == "__python_accumulator__":
-                        from pyspark.worker_util import pickleSer
-
-                        for metric in observed_metrics.metrics:
-                            (aid, update) = pickleSer.loads(LiteralExpression._to_value(metric))
-                            if aid == SpecialAccumulatorIds.SQL_UDF_PROFIER:
-                                self._profiler_collector._update(update)
-                    elif observed_metrics.name in observations:
-                        observation_result = observations[observed_metrics.name]._result
-                        assert observation_result is not None
-                        observation_result.update(
-                            {
-                                key: LiteralExpression._to_value(metric)
-                                for key, metric in zip(
-                                    observed_metrics.keys, observed_metrics.metrics
-                                )
-                            }
-                        )
+                for x in b.observed_metrics:
+                    observed_metrics = PlanObservedMetrics(
+                        x.name, [v for v in x.values], list(x.keys)
+                    )
+                    if x.HasField("root_error_idx"):
+                        if x.name in observations:
+                            converted = convert_observation_errors(x.root_error_idx, list(x.errors))
+                            observations[x.name]._set_error(converted)
+                    else:
+                        if observed_metrics.name == "__python_accumulator__":
+                            for metric in observed_metrics.metrics:
+                                try:
+                                    aid, update = specialAccumulatorSer.loads(
+                                        LiteralExpression._to_value(metric)
+                                    )
+                                except pickle.UnpicklingError as e:
+                                    # We found unexpected class/function in the accumulator metric.
+                                    # We will ignore this metric and continue.
+                                    logger.warning(f"Error unpickling accumulator metric: {e}")
+                                    continue
+                                if aid == SpecialAccumulatorIds.SQL_UDF_PROFIER_V2:
+                                    self._profiler_collector._update(update)
+                        elif observed_metrics.name in observations:
+                            observation_result = observations[observed_metrics.name]._result
+                            assert observation_result is not None
+                            observation_result.update(
+                                {
+                                    key: LiteralExpression._to_value(metric)
+                                    for key, metric in zip(
+                                        observed_metrics.keys,
+                                        observed_metrics.metrics,
+                                    )
+                                }
+                            )
                     yield observed_metrics
             if b.HasField("schema"):
                 logger.debug("Received the schema.")
@@ -1604,9 +1921,7 @@ class SparkConnectClient(object):
                 yield {"create_resource_profile_command_result": profile_id}
             if b.HasField("checkpoint_command_result"):
                 yield {
-                    "checkpoint_command_result": proto_to_remote_cached_dataframe(
-                        b.checkpoint_command_result.relation
-                    )
+                    "checkpoint_command_result": (b.checkpoint_command_result.relation.relation_id)
                 }
             if b.HasField("ml_command_result"):
                 yield {"ml_command_result": b.ml_command_result}
@@ -1615,18 +1930,35 @@ class SparkConnectClient(object):
             if self._use_reattachable_execute:
                 # Don't use retryHandler - own retry handling is inside.
                 generator = ExecutePlanResponseReattachableIterator(
-                    req, self._stub, self._retrying, self._builder.metadata()
+                    req,
+                    self._stub,
+                    self._retrying,
+                    self._execute_plan_metadata(req.operation_id),
+                    reattachable_execute_plan_timeout=self._rpc_deadlines.reattachable_execute_plan,
+                    reattach_execute_timeout=self._rpc_deadlines.reattach_execute,
                 )
                 try:
                     for b in generator:
                         yield from handle_response(b)
                 finally:
                     generator.close()
+                    self._release_futures.update(generator.release_futures)
             else:
                 for attempt in self._retrying():
                     with attempt:
-                        for b in self._stub.ExecutePlan(req, metadata=self._builder.metadata()):
-                            yield from handle_response(b)
+                        with disable_gc():
+                            it = iter(
+                                self._stub.ExecutePlan(
+                                    req, metadata=self._execute_plan_metadata(req.operation_id)
+                                )
+                            )
+                        while True:
+                            try:
+                                with disable_gc():
+                                    b = next(it)
+                                yield from handle_response(b)
+                            except StopIteration:
+                                break
         except KeyboardInterrupt as kb:
             logger.debug(f"Interrupt request received for operation={req.operation_id}")
             if progress is not None:
@@ -1634,7 +1966,7 @@ class SparkConnectClient(object):
             self.interrupt_operation(req.operation_id)
             raise kb
         except Exception as error:
-            self._handle_error(error)
+            self._handle_error(error, req.operation_id)
 
     def _execute_and_fetch(
         self,
@@ -1674,7 +2006,7 @@ class SparkConnectClient(object):
                     raise PySparkValueError(
                         errorClass="UNKNOWN_RESPONSE",
                         messageParameters={
-                            "response": response,
+                            "response": str(response),
                         },
                     )
 
@@ -1713,6 +2045,8 @@ class SparkConnectClient(object):
         if self._user_id:
             req.user_context.user_id = self._user_id
         self._update_request_with_user_context_extensions(req)
+        if call_stack_trace := self.__class__._build_call_stack_trace():
+            req.user_context.extensions.append(call_stack_trace)
         return req
 
     def get_configs(self, *keys: str) -> Tuple[Optional[str], ...]:
@@ -1755,7 +2089,12 @@ class SparkConnectClient(object):
         try:
             for attempt in self._retrying():
                 with attempt:
-                    resp = self._stub.Config(req, metadata=self._builder.metadata())
+                    with disable_gc():
+                        resp = self._stub.Config(
+                            req,
+                            metadata=self._builder_metadata(),
+                            timeout=self._rpc_deadlines.config,
+                        )
                     self._verify_response_integrity(resp)
                     return ConfigResult.fromProto(resp)
             raise SparkConnectException("Invalid state during retry exception handling.")
@@ -1797,7 +2136,11 @@ class SparkConnectClient(object):
         try:
             for attempt in self._retrying():
                 with attempt:
-                    resp = self._stub.Interrupt(req, metadata=self._builder.metadata())
+                    resp = self._stub.Interrupt(
+                        req,
+                        metadata=self._builder_metadata(),
+                        timeout=self._rpc_deadlines.interrupt,
+                    )
                     self._verify_response_integrity(resp)
                     return list(resp.interrupted_ids)
             raise SparkConnectException("Invalid state during retry exception handling.")
@@ -1809,7 +2152,11 @@ class SparkConnectClient(object):
         try:
             for attempt in self._retrying():
                 with attempt:
-                    resp = self._stub.Interrupt(req, metadata=self._builder.metadata())
+                    resp = self._stub.Interrupt(
+                        req,
+                        metadata=self._builder_metadata(),
+                        timeout=self._rpc_deadlines.interrupt,
+                    )
                     self._verify_response_integrity(resp)
                     return list(resp.interrupted_ids)
             raise SparkConnectException("Invalid state during retry exception handling.")
@@ -1821,7 +2168,11 @@ class SparkConnectClient(object):
         try:
             for attempt in self._retrying():
                 with attempt:
-                    resp = self._stub.Interrupt(req, metadata=self._builder.metadata())
+                    resp = self._stub.Interrupt(
+                        req,
+                        metadata=self._builder_metadata(),
+                        timeout=self._rpc_deadlines.interrupt,
+                    )
                     self._verify_response_integrity(resp)
                     return list(resp.interrupted_ids)
             raise SparkConnectException("Invalid state during retry exception handling.")
@@ -1837,9 +2188,69 @@ class SparkConnectClient(object):
         try:
             for attempt in self._retrying():
                 with attempt:
-                    resp = self._stub.ReleaseSession(req, metadata=self._builder.metadata())
+                    resp = self._stub.ReleaseSession(
+                        req,
+                        metadata=self._builder_metadata(),
+                        timeout=self._rpc_deadlines.release_session,
+                    )
                     self._verify_response_integrity(resp)
                     return
+            raise SparkConnectException("Invalid state during retry exception handling.")
+        except Exception as error:
+            self._handle_error(error)
+
+    def _get_operation_statuses(
+        self,
+        operation_ids: Optional[List[str]] = None,
+        operation_extensions: Optional[List[any_pb2.Any]] = None,
+        request_extensions: Optional[List[any_pb2.Any]] = None,
+    ) -> "pb2.GetStatusResponse":
+        """
+        Get status of operations in the session.
+
+        Parameters
+        ----------
+        operation_ids : list of str, optional
+            List of operation IDs to get status for.
+            If None or empty, returns status of all operations in the session.
+        operation_extensions : list of google.protobuf.any_pb2.Any, optional
+            Per-operation extension messages to include in the OperationStatusRequest to request
+            additional per-operation information.
+        request_extensions : list of google.protobuf.any_pb2.Any, optional
+            Request-level extension messages to include in the GetStatusRequest.
+
+        Returns
+        -------
+        pb2.GetStatusResponse
+            The full GetStatusResponse, including operation_statuses and any extensions.
+        """
+        req = pb2.GetStatusRequest()
+        req.session_id = self._session_id
+        req.client_type = self._builder.userAgent
+        if self._user_id:
+            req.user_context.user_id = self._user_id
+        if self._server_session_id:
+            req.client_observed_server_side_session_id = self._server_session_id
+
+        req.operation_status.SetInParent()
+
+        if operation_ids:
+            req.operation_status.operation_ids.extend(operation_ids)
+        if operation_extensions:
+            req.operation_status.extensions.extend(operation_extensions)
+        if request_extensions:
+            req.extensions.extend(request_extensions)
+
+        try:
+            for attempt in self._retrying():
+                with attempt:
+                    resp = self._stub.GetStatus(
+                        req,
+                        metadata=self._builder_metadata(),
+                        timeout=self._rpc_deadlines.get_status,
+                    )
+                    self._verify_response_integrity(resp)
+                    return resp
             raise SparkConnectException("Invalid state during retry exception handling.")
         except Exception as error:
             self._handle_error(error)
@@ -1854,7 +2265,9 @@ class SparkConnectClient(object):
         self._throw_if_invalid_tag(tag)
         if not hasattr(self.thread_local, "tags"):
             self.thread_local.tags = set()
-        self.thread_local.tags.remove(tag)
+        # Use discard, not remove: removing an absent tag is a documented no-op
+        # (see SparkSession.removeTag), matching the Classic behavior.
+        self.thread_local.tags.discard(tag)
 
     def get_tags(self) -> Set[str]:
         if not hasattr(self.thread_local, "tags"):
@@ -1872,7 +2285,7 @@ class SparkConnectClient(object):
         spark_job_tags_sep = ","
         if tag is None:
             raise PySparkValueError(
-                errorClass="CANNOT_BE_NONE", message_paramters={"arg_name": "Spark Connect tag"}
+                errorClass="CANNOT_BE_NONE", messageParameters={"arg_name": "Spark Connect tag"}
             )
         if spark_job_tags_sep in tag:
             raise PySparkValueError(
@@ -1920,7 +2333,7 @@ class SparkConnectClient(object):
         with self.global_user_context_extensions_lock:
             self.global_user_context_extensions = list()
 
-    def _handle_error(self, error: Exception) -> NoReturn:
+    def _handle_error(self, error: Exception, operation_id: Optional[str] = None) -> NoReturn:
         """
         Handle errors that occur during RPC calls.
 
@@ -1941,9 +2354,14 @@ class SparkConnectClient(object):
 
         try:
             self.thread_local.inside_error_handling = True
-            if isinstance(error, grpc.RpcError):
-                self._handle_rpc_error(error)
-            raise error
+            try:
+                if isinstance(error, grpc.RpcError):
+                    self._handle_rpc_error(error)
+                raise error
+            except BaseException as handled_error:
+                if operation_id:
+                    handled_error._operation_id = operation_id  # type: ignore[attr-defined]
+                raise
         finally:
             self.thread_local.inside_error_handling = False
 
@@ -1962,7 +2380,11 @@ class SparkConnectClient(object):
             req.user_context.user_id = self._user_id
         self._update_request_with_user_context_extensions(req)
         try:
-            return self._stub.FetchErrorDetails(req, metadata=self._builder.metadata())
+            return self._stub.FetchErrorDetails(
+                req,
+                metadata=self._builder_metadata(),
+                timeout=self._rpc_deadlines.fetch_error_details,
+            )
         except grpc.RpcError:
             return None
 
@@ -2004,6 +2426,17 @@ class SparkConnectClient(object):
         # https://grpc.github.io/grpc/python/grpc.html#grpc.UnaryUnaryMultiCallable.__call__
         error: grpc.Call = cast(grpc.Call, rpc_error)
         status_code: grpc.StatusCode = error.code()
+        if status_code == grpc.StatusCode.DEADLINE_EXCEEDED:
+            raise SparkConnectGrpcException(
+                message=(
+                    f"{error}: RPC deadline exceeded. "
+                    "The client applies per-RPC timeouts to prevent silent hangs "
+                    "on broken connections. Deadlines can be configured via the "
+                    "rpc_deadlines parameter of SparkConnectClient. To disable all "
+                    "deadlines: SparkConnectClient(url, rpc_deadlines=RpcDeadlines.disabled())."
+                ),
+                grpc_status_code=status_code,
+            ) from None
         status: Optional[Status] = rpc_status.from_call(error)
         if status:
             for d in status.details:
@@ -2083,6 +2516,7 @@ class SparkConnectClient(object):
             pb2.AnalyzePlanResponse,
             pb2.FetchErrorDetailsResponse,
             pb2.ReleaseSessionResponse,
+            pb2.GetStatusResponse,
         ],
     ) -> None:
         """
@@ -2117,7 +2551,7 @@ class SparkConnectClient(object):
         logger.debug("Creating the ResourceProfile")
         cmd = pb2.Command()
         cmd.create_resource_profile_command.profile.CopyFrom(profile)
-        (_, properties, _) = self.execute_command(cmd)
+        _, properties, _ = self.execute_command(cmd)
         profile_id = properties["create_resource_profile_command_result"]
         return profile_id
 
@@ -2125,12 +2559,31 @@ class SparkConnectClient(object):
         # try best to delete the cache
         try:
             if len(cache_ids) > 0:
+                # Re-entrancy guard: this is reachable from a RemoteModelRef finalizer
+                # (__del__ -> del_remote_cache), which CPython may run on this thread while the
+                # GIL is released inside another in-flight ML-cache RPC (e.g. _cleanup_ml_cache's
+                # blocking call). Issuing a second blocking RPC re-entrantly can deadlock the gRPC
+                # channel and hang until the test/process timeout. The nested delete is redundant
+                # (the in-flight cleanup/delete is already releasing server-side state, and the
+                # server evicts on session end), so skip it and log so a recurrence in scheduled
+                # jobs is visible instead of a silent multi-minute hang.
+                if self._ml_cache_rpc_thread == threading.get_ident():
+                    logger.warning(
+                        "Skipping re-entrant ML cache delete of %s object ref(s) while another "
+                        "ML-cache RPC is in flight on this thread (avoids a re-entrant gRPC hang).",
+                        len(cache_ids),
+                    )
+                    return []
                 command = pb2.Command()
                 command.ml_command.delete.obj_refs.extend(
                     [pb2.ObjectRef(id=cache_id) for cache_id in cache_ids]
                 )
                 command.ml_command.delete.evict_only = evict_only
-                (_, properties, _) = self.execute_command(command)
+                self._ml_cache_rpc_thread = threading.get_ident()
+                try:
+                    _, properties, _ = self.execute_command(command)
+                finally:
+                    self._ml_cache_rpc_thread = None
 
                 assert properties is not None
 
@@ -2142,18 +2595,50 @@ class SparkConnectClient(object):
         except Exception:
             return []
 
+    def _on_exit(self) -> None:
+        # If the client has already been explicitly closed, skip all cleanup RPCs.
+        # The server-side resources were released by close(); reissuing them here
+        # is wasted work and, if the server has since become unreachable, can
+        # block process exit on the gRPC call.
+        if self._closed:
+            return
+
+        self._cleanup_ml_cache()
+        if self._release_session_on_exit:
+            try:
+                self.release_session()
+            except Exception:
+                pass
+            try:
+                self.close()
+            except Exception:
+                pass
+
     def _cleanup_ml_cache(self) -> None:
         try:
+            # See _delete_ml_cache for the re-entrancy rationale. If a finalizer-driven ML-cache
+            # RPC is already in flight on this thread, skip this nested cleanup rather than risk a
+            # re-entrant gRPC hang; the in-flight RPC plus server-side session eviction cover it.
+            if self._ml_cache_rpc_thread == threading.get_ident():
+                logger.warning(
+                    "Skipping re-entrant ML cache cleanup while another ML-cache RPC is in flight "
+                    "on this thread (avoids a re-entrant gRPC hang)."
+                )
+                return
             command = pb2.Command()
             command.ml_command.clean_cache.SetInParent()
-            self.execute_command(command)
+            self._ml_cache_rpc_thread = threading.get_ident()
+            try:
+                self.execute_command(command)
+            finally:
+                self._ml_cache_rpc_thread = None
         except Exception:
             pass
 
     def _get_ml_cache_info(self) -> List[str]:
         command = pb2.Command()
         command.ml_command.get_cache_info.SetInParent()
-        (_, properties, _) = self.execute_command(command)
+        _, properties, _ = self.execute_command(command)
 
         assert properties is not None
 
@@ -2168,7 +2653,7 @@ class SparkConnectClient(object):
         command.ml_command.get_model_size.CopyFrom(
             pb2.MlCommand.GetModelSize(model_ref=pb2.ObjectRef(id=model_ref_id))
         )
-        (_, properties, _) = self.execute_command(command)
+        _, properties, _ = self.execute_command(command)
 
         assert properties is not None
 
@@ -2315,7 +2800,9 @@ class SparkConnectClient(object):
         for attempt in self._retrying():
             with attempt:
                 response: pb2.CloneSessionResponse = self._stub.CloneSession(
-                    request, metadata=self._builder.metadata()
+                    request,
+                    metadata=self._builder_metadata(),
+                    timeout=self._rpc_deadlines.clone_session,
                 )
 
         # Assert that the returned session ID matches the requested ID if one was provided
@@ -2334,7 +2821,38 @@ class SparkConnectClient(object):
             connection=new_connection,
             user_id=self._user_id,
             use_reattachable_execute=self._use_reattachable_execute,
+            session_hooks=self._session_hooks,
+            rpc_deadlines=self._rpc_deadlines,
         )
         # Ensure the session ID is correctly set from the response
         new_client._session_id = response.new_session_id
         return new_client
+
+    def newSession(self) -> "SparkConnectClient":
+        """
+        Create a new client against the same endpoint with a fresh, independent server-side
+        session that does NOT inherit any state from this client's session. Unlike
+        :meth:`clone`, no state (SQL configurations, temporary views, registered functions,
+        catalog state) is copied over, and no server round-trip is made: the new client is
+        built from a copy of this client's connection configuration with the session ID
+        cleared, so a fresh session ID is generated and the server lazily creates an empty
+        isolated session for it.
+
+        Returns
+        -------
+        SparkConnectClient
+            A new SparkConnectClient instance bound to a fresh, empty session.
+        """
+        # Reuse the same connection configuration (endpoint, channel options, metadata,
+        # user) but drop the session ID so the constructor generates a fresh UUID.
+        new_connection = copy.deepcopy(self._builder)
+        new_connection._params.pop(ChannelBuilder.PARAM_SESSION_ID, None)
+        # Only server-side session state is left behind: client-side behavior such as
+        # registered session hooks and RPC deadlines carries over, as in clone().
+        return SparkConnectClient(
+            connection=new_connection,
+            user_id=self._user_id,
+            use_reattachable_execute=self._use_reattachable_execute,
+            session_hooks=self._session_hooks,
+            rpc_deadlines=self._rpc_deadlines,
+        )

@@ -15,44 +15,47 @@
 # limitations under the License.
 #
 
-import os
+import datetime
 import gc
-import unittest
+import io
+import os
 import shutil
 import tempfile
-import io
+import unittest
 from contextlib import redirect_stdout
-import datetime
 
-from pyspark.util import is_remote_only
-from pyspark.errors import PySparkTypeError, PySparkValueError
+from pyspark.errors import AnalysisException, PySparkTypeError, PySparkValueError
 from pyspark.sql.types import (
-    StructType,
-    StructField,
-    LongType,
-    StringType,
-    IntegerType,
-    MapType,
     ArrayType,
+    CharType,
+    IntegerType,
+    LongType,
+    MapType,
     Row,
+    StringType,
+    StructField,
+    StructType,
+    VarcharType,
 )
-from pyspark.testing.utils import eventually
+from pyspark.testing import assertDataFrameEqual
 from pyspark.testing.connectutils import (
-    should_test_connect,
-    connect_requirement_message,
     ReusedMixedTestCase,
+    connect_requirement_message,
+    should_test_connect,
 )
 from pyspark.testing.pandasutils import PandasOnSparkTestUtils
-
+from pyspark.testing.utils import eventually
+from pyspark.util import is_remote_only
 
 if should_test_connect:
-    from pyspark.sql.connect.proto import ExecutePlanResponse, Expression as ProtoExpression
-    from pyspark.sql.connect.column import Column
-    from pyspark.sql.dataframe import DataFrame
-    from pyspark.sql.connect.dataframe import DataFrame as CDataFrame
+    from pyspark.errors.exceptions.connect import AnalysisException, SparkConnectException
     from pyspark.sql import functions as SF
     from pyspark.sql.connect import functions as CF
-    from pyspark.errors.exceptions.connect import AnalysisException, SparkConnectException
+    from pyspark.sql.connect.column import Column
+    from pyspark.sql.connect.dataframe import DataFrame as CDataFrame
+    from pyspark.sql.connect.proto import ExecutePlanResponse
+    from pyspark.sql.connect.proto import Expression as ProtoExpression
+    from pyspark.sql.dataframe import DataFrame
 
 
 @unittest.skipIf(
@@ -127,6 +130,14 @@ class SparkConnectSQLTestCase(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
 
 class SparkConnectBasicTests(SparkConnectSQLTestCase):
+    def test_toJSON(self):
+        sdf = self.spark.range(10).withColumn("s", SF.col("id").cast("string"))
+        cdf = self.connect.range(10).withColumn("s", CF.col("id").cast("string"))
+
+        str1 = sdf.toJSON().collect()
+        str2 = [row.value for row in cdf.toJSON().collect()]
+        self.assertEqual(str1, str2)
+
     def test_serialization(self):
         from pyspark.cloudpickle import dumps, loads
 
@@ -135,9 +146,19 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
         cdf2 = loads(data)
         self.assertEqual(cdf.collect(), cdf2.collect())
 
-    def test_window_spec_serialization(self):
-        from pyspark.sql.connect.window import Window
+    def test_serialization_II(self):
         from pyspark.serializers import CPickleSerializer
+
+        pickle_ser = CPickleSerializer()
+
+        cdf = self.connect.range(10)
+        data = pickle_ser.dumps(cdf)
+        cdf2 = pickle_ser.loads(data)
+        self.assertEqual(cdf.collect(), cdf2.collect())
+
+    def test_window_spec_serialization(self):
+        from pyspark.serializers import CPickleSerializer
+        from pyspark.sql.connect.window import Window
 
         pickle_ser = CPickleSerializer()
         w = Window.partitionBy("some_string").orderBy("value")
@@ -156,7 +177,19 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
         self.assertEqual(type(sdf._simple_extension), type(cdf._simple_extension))
 
         self.assertTrue(hasattr(cdf, "_simple_extension"))
-        self.assertFalse(hasattr(cdf, "_simple_extension_does_not_exsit"))
+
+        with self.temp_env({"PYSPARK_VALIDATE_COLUMN_NAME_LEGACY": None}):
+            self.assertTrue(hasattr(cdf, "_simple_extension_does_not_exsit"))
+            self.assertIsInstance(getattr(cdf, "_simple_extension_does_not_exsit"), Column)
+            self.assertIsInstance(cdf._simple_extension_does_not_exsit, Column)
+
+            # For name starting with '__', still validate it eagerly
+            self.assertFalse(hasattr(cdf, "__simple_extension_does_not_exsit"))
+
+        with self.temp_env({"PYSPARK_VALIDATE_COLUMN_NAME_LEGACY": "1"}):
+            self.assertFalse(hasattr(cdf, "_simple_extension_does_not_exsit"))
+
+            self.assertFalse(hasattr(cdf, "__simple_extension_does_not_exsit"))
 
     def test_df_get_item(self):
         # SPARK-41779: test __getitem__
@@ -218,8 +251,9 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_INT_OR_LIST_OR_STR_OR_TUPLE",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "Column, int, list, str or tuple",
                 "arg_name": "item",
                 "arg_type": "float",
             },
@@ -230,8 +264,9 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_INT_OR_LIST_OR_STR_OR_TUPLE",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "Column, int, list, str or tuple",
                 "arg_name": "item",
                 "arg_type": "NoneType",
             },
@@ -242,8 +277,9 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_INT_OR_LIST_OR_STR_OR_TUPLE",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "Column, int, list, str or tuple",
                 "arg_name": "item",
                 "arg_type": "DataFrame",
             },
@@ -290,14 +326,12 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
         cdf3 = cdf1.join(cdf2, cdf1["value"] == cdf2["value"])
         sdf3 = sdf1.join(sdf2, sdf1["value"] == sdf2["value"])
 
-        self.assertEqual(cdf3.schema, sdf3.schema)
-        self.assertEqual(cdf3.collect(), sdf3.collect())
+        assertDataFrameEqual(cdf3, sdf3)
 
         cdf4 = cdf1.join(cdf2, cdf1["value"].eqNullSafe(cdf2["value"]))
         sdf4 = sdf1.join(sdf2, sdf1["value"].eqNullSafe(sdf2["value"]))
 
-        self.assertEqual(cdf4.schema, sdf4.schema)
-        self.assertEqual(cdf4.collect(), sdf4.collect())
+        assertDataFrameEqual(cdf4, sdf4)
 
         cdf5 = cdf1.join(
             cdf2, (cdf1["value"] == cdf2["value"]) & (cdf1["value"].eqNullSafe(cdf2["value"]))
@@ -306,20 +340,17 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
             sdf2, (sdf1["value"] == sdf2["value"]) & (sdf1["value"].eqNullSafe(sdf2["value"]))
         )
 
-        self.assertEqual(cdf5.schema, sdf5.schema)
-        self.assertEqual(cdf5.collect(), sdf5.collect())
+        assertDataFrameEqual(cdf5, sdf5)
 
         cdf6 = cdf1.join(cdf2, cdf1["value"] == cdf2["value"]).select(cdf1.value)
         sdf6 = sdf1.join(sdf2, sdf1["value"] == sdf2["value"]).select(sdf1.value)
 
-        self.assertEqual(cdf6.schema, sdf6.schema)
-        self.assertEqual(cdf6.collect(), sdf6.collect())
+        assertDataFrameEqual(cdf6, sdf6)
 
         cdf7 = cdf1.join(cdf2, cdf1["value"] == cdf2["value"]).select(cdf2.value)
         sdf7 = sdf1.join(sdf2, sdf1["value"] == sdf2["value"]).select(sdf2.value)
 
-        self.assertEqual(cdf7.schema, sdf7.schema)
-        self.assertEqual(cdf7.collect(), sdf7.collect())
+        assertDataFrameEqual(cdf7, sdf7)
 
     def test_join_with_cte(self):
         cte_query = "with dt as (select 1 as ida) select ida as id from dt"
@@ -332,8 +363,7 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
         cdf2 = self.connect.sql(cte_query)
         cdf3 = cdf1.join(cdf2, cdf1.id == cdf2.id)
 
-        self.assertEqual(sdf3.schema, cdf3.schema)
-        self.assertEqual(sdf3.collect(), cdf3.collect())
+        assertDataFrameEqual(cdf3, sdf3)
 
     def test_with_columns_renamed(self):
         # SPARK-41312: test DataFrame.withColumnsRenamed()
@@ -459,6 +489,159 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
             self.connect.sql(query).schema,
         )
         self._check_print_schema(query)
+
+    def test_char_varchar_result_schema(self):
+        # SPARK-59276: Python Connect maps first-class CHAR/VARCHAR the same as classic.
+        query = """
+            SELECT
+              CAST('ab' AS CHAR(4)) AS c,
+              CAST('cd' AS VARCHAR(6)) AS v,
+              CAST('ef' AS CHAR(4) COLLATE UTF8_LCASE) AS collated_c,
+              CAST('gh' AS VARCHAR(6) COLLATE UNICODE_CI) AS collated_v
+        """
+        conf = {"spark.sql.charVarchar.standardSemantics.enabled": "true"}
+        with self.both_conf(conf):
+            classic_df = self.spark.sql(query)
+            connect_df = self.connect.sql(query)
+            self.assertEqual(classic_df.schema, connect_df.schema)
+            self.assertEqual(classic_df.schema["c"].dataType, CharType(4))
+            self.assertEqual(classic_df.schema["v"].dataType, VarcharType(6))
+            self.assertEqual(classic_df.schema["collated_c"].dataType, CharType(4, "UTF8_LCASE"))
+            self.assertEqual(classic_df.schema["collated_v"].dataType, VarcharType(6, "UNICODE_CI"))
+            self.assertEqual(classic_df.collect(), connect_df.collect())
+            self.assertEqual(
+                connect_df.collect(),
+                [Row(c="ab  ", v="cd", collated_c="ef  ", collated_v="gh")],
+            )
+
+    def test_create_dataframe_with_char_varchar_schema(self):
+        schema = StructType(
+            [
+                StructField("c", CharType(4)),
+                StructField("explicit_c", CharType(4, "UTF8_BINARY")),
+                StructField("v", VarcharType(3, "UTF8_LCASE")),
+                StructField(
+                    "nested",
+                    StructType(
+                        [
+                            StructField("c", CharType(3, "UTF8_BINARY")),
+                            StructField(
+                                "values",
+                                ArrayType(VarcharType(4, "UNICODE_CI"), containsNull=False),
+                            ),
+                            StructField(
+                                "lookup",
+                                MapType(
+                                    CharType(3, "UTF8_LCASE"),
+                                    VarcharType(4, "UTF8_BINARY"),
+                                    valueContainsNull=False,
+                                ),
+                            ),
+                        ]
+                    ),
+                ),
+            ]
+        )
+        rows = [
+            (
+                "ab",
+                "cd",
+                "ef",
+                Row(c="x", values=["gh", "ij"], lookup={"k": "lm"}),
+            )
+        ]
+        standard_conf = {
+            "spark.sql.charVarchar.standardSemantics.enabled": "true",
+            "spark.sql.legacy.charVarcharAsString": "false",
+        }
+        with self.both_conf(standard_conf):
+            df = self.connect.createDataFrame(rows, schema)
+            self.assertEqual(df.schema, schema)
+            self.assertEqual(
+                df.collect(),
+                [
+                    Row(
+                        c="ab  ",
+                        explicit_c="cd  ",
+                        v="ef",
+                        nested=Row(
+                            c="x  ",
+                            values=["gh", "ij"],
+                            lookup={"k  ": "lm"},
+                        ),
+                    )
+                ],
+            )
+            empty = self.connect.createDataFrame([], schema)
+            self.assertEqual(empty.schema, schema)
+            self.assertEqual(empty.collect(), [])
+
+        legacy_conf = {
+            "spark.sql.charVarchar.standardSemantics.enabled": "false",
+            "spark.sql.legacy.charVarcharAsString": "true",
+        }
+        with self.both_conf(legacy_conf):
+            expected = StructType(
+                [
+                    StructField("c", StringType()),
+                    StructField("explicit_c", StringType("UTF8_BINARY")),
+                    StructField("v", StringType("UTF8_LCASE")),
+                    StructField(
+                        "nested",
+                        StructType(
+                            [
+                                StructField("c", StringType("UTF8_BINARY")),
+                                StructField(
+                                    "values",
+                                    ArrayType(StringType("UNICODE_CI"), containsNull=False),
+                                ),
+                                StructField(
+                                    "lookup",
+                                    MapType(
+                                        StringType("UTF8_LCASE"),
+                                        StringType("UTF8_BINARY"),
+                                        valueContainsNull=False,
+                                    ),
+                                ),
+                            ]
+                        ),
+                    ),
+                ]
+            )
+            df = self.connect.createDataFrame(rows, schema)
+            self.assertEqual(df.schema, expected)
+            self.assertEqual(
+                df.collect(),
+                [
+                    Row(
+                        c="ab",
+                        explicit_c="cd",
+                        v="ef",
+                        nested=Row(
+                            c="x",
+                            values=["gh", "ij"],
+                            lookup={"k": "lm"},
+                        ),
+                    )
+                ],
+            )
+            empty = self.connect.createDataFrame([], schema)
+            self.assertEqual(empty.schema, expected)
+            self.assertEqual(empty.collect(), [])
+
+        default_conf = {
+            "spark.sql.charVarchar.standardSemantics.enabled": "false",
+            "spark.sql.legacy.charVarcharAsString": "false",
+        }
+        with self.both_conf(default_conf):
+            for data in (rows, []):
+                with self.assertRaises(AnalysisException) as ctx:
+                    self.connect.createDataFrame(data, schema).schema
+                self.check_error(
+                    exception=ctx.exception,
+                    errorClass="UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING",
+                    messageParameters={},
+                )
 
     def test_to(self):
         # SPARK-41464: test DataFrame.to()
@@ -769,7 +952,7 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
 
     def test_create_global_temp_view(self):
         # SPARK-41127: test global temp view creation.
-        with self.tempView("view_1"):
+        with self.temp_view("view_1"):
             self.connect.sql("SELECT 1 AS X LIMIT 0").createGlobalTempView("view_1")
             self.connect.sql("SELECT 2 AS X LIMIT 1").createOrReplaceGlobalTempView("view_1")
             self.assertTrue(self.spark.catalog.tableExists("global_temp.view_1"))
@@ -781,7 +964,7 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
 
     def test_create_session_local_temp_view(self):
         # SPARK-41372: test session local temp view creation.
-        with self.tempView("view_local_temp"):
+        with self.temp_view("view_local_temp"):
             self.connect.sql("SELECT 1 AS X").createTempView("view_local_temp")
             self.assertEqual(self.connect.sql("SELECT * FROM view_local_temp").count(), 1)
             self.connect.sql("SELECT 1 AS X LIMIT 0").createOrReplaceTempView("view_local_temp")
@@ -927,8 +1110,12 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_LIST_OF_COLUMN",
-            messageParameters={"arg_name": "exprs"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "list[Column]",
+                "arg_name": "exprs",
+                "arg_type": "tuple",
+            },
         )
 
     def test_with_columns(self):
@@ -1088,8 +1275,11 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
             self.connect.sql("SELECT 1")._explain_string(mode="unknown")
         self.check_error(
             exception=pe.exception,
-            errorClass="UNKNOWN_EXPLAIN_MODE",
-            messageParameters={"explain_mode": "unknown"},
+            errorClass="VALUE_NOT_ALLOWED",
+            messageParameters={
+                "arg_name": "explain_mode",
+                "allowed_values": "['simple', 'extended', 'codegen', 'cost', 'formatted']",
+            },
         )
 
     def test_count(self) -> None:
@@ -1246,8 +1436,9 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_DICT",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "dict",
                 "arg_name": "metadata",
                 "arg_type": "list",
             },
@@ -1428,6 +1619,7 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
         self.assertTrue(len(proto_string_1) > 10000, len(proto_string_1))
         proto_string_truncated_1 = self.connect._client._proto_to_string(plan1, True)
         self.assertTrue(len(proto_string_truncated_1) < 4000, len(proto_string_truncated_1))
+        self.assertIn("[truncated]", proto_string_truncated_1)
 
         cdf2 = cdf1.select("a" * 4096, "a" * 4096, "a" * 4096)
         plan2 = cdf2._plan.to_proto(self.connect._client)
@@ -1436,6 +1628,7 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
         self.assertTrue(len(proto_string_2) > 20000, len(proto_string_2))
         proto_string_truncated_2 = self.connect._client._proto_to_string(plan2, True)
         self.assertTrue(len(proto_string_truncated_2) < 8000, len(proto_string_truncated_2))
+        self.assertIn("[truncated]", proto_string_truncated_2)
 
         cdf3 = cdf1.select("a" * 4096)
         for _ in range(64):
@@ -1446,13 +1639,14 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
         self.assertTrue(len(proto_string_3) > 128000, len(proto_string_3))
         proto_string_truncated_3 = self.connect._client._proto_to_string(plan3, True)
         self.assertTrue(len(proto_string_truncated_3) < 64000, len(proto_string_truncated_3))
+        self.assertIn("[truncated]", proto_string_truncated_3)
 
     def test_plan_compression(self):
         self.assertTrue(self.connect._client._zstd_module is not None)
         self.connect.range(1).count()
         default_plan_compression_threshold = self.connect._client._plan_compression_threshold
         self.assertTrue(default_plan_compression_threshold > 0)
-        self.assertTrue(self.connect._client._plan_compression_algorithm == "ZSTD")
+        self.assertEqual(self.connect._client._plan_compression_algorithm, "ZSTD")
         try:
             self.connect._client._plan_compression_threshold = 1000
 
@@ -1460,17 +1654,17 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
             cdf1 = self.connect.range(1).select(CF.lit("Apache Spark"))
             plan1 = cdf1._plan.to_proto(self.connect._client)
             self.assertTrue(plan1.root is not None)
-            self.assertTrue(cdf1.count() == 1)
+            self.assertEqual(cdf1.count(), 1)
 
             # Large plan should be compressed
             cdf2 = self.connect.range(1).select(CF.lit("Apache Spark" * 1000))
             plan2 = cdf2._plan.to_proto(self.connect._client)
             self.assertTrue(plan2.compressed_operation is not None)
             # Test compressed relation
-            self.assertTrue(cdf2.count() == 1)
+            self.assertEqual(cdf2.count(), 1)
             # Test compressed command
             cdf2.createOrReplaceTempView("temp_view_cdf2")
-            self.assertTrue(self.connect.sql("SELECT * FROM temp_view_cdf2").count() == 1)
+            self.assertEqual(self.connect.sql("SELECT * FROM temp_view_cdf2").count(), 1)
         finally:
             self.connect._client._plan_compression_threshold = default_plan_compression_threshold
 
@@ -1591,7 +1785,7 @@ class SparkConnectGCTests(SparkConnectSQLTestCase):
                     )
 
                 # Execute the query, and assert the results are correct.
-                self.assertEqual(cdf.collect(), sdf.collect())
+                assertDataFrameEqual(cdf, sdf)
 
                 # Verify the metadata of arrow batch chunks.
                 def split_into_batches(chunks):
@@ -1631,13 +1825,6 @@ class SparkConnectGCTests(SparkConnectSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.connect.test_connect_basic import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

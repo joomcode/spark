@@ -18,7 +18,7 @@
 package org.apache.spark.sql.scripting
 
 import org.apache.spark.{SparkException, SparkNumberFormatException}
-import org.apache.spark.sql.{AnalysisException, QueryTest, Row}
+import org.apache.spark.sql.{AnalysisException, Row}
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.plans.logical.CompoundBody
@@ -34,8 +34,7 @@ import org.apache.spark.sql.test.SharedSparkSession
  *   are executed and output DataFrames are compared with expected outputs.
  */
 class SqlScriptingInterpreterSuite
-    extends QueryTest
-    with SharedSparkSession
+    extends SharedSparkSession
     with SqlScriptingTestUtils {
 
   protected override def beforeAll(): Unit = {
@@ -597,6 +596,27 @@ class SqlScriptingInterpreterSuite
         |""".stripMargin
     val expected = Seq()
     verifySqlScriptResult(commands, expected)
+  }
+
+  test("IF non-boolean condition after a supplementary character") {
+    val emoji = new String(Character.toChars(0x1F600))
+    val commands =
+      s"""
+         |BEGIN
+         |  SELECT '$emoji';
+         |  IF 1 THEN
+         |    SELECT 1;
+         |  END IF;
+         |END
+         |""".stripMargin
+
+    checkError(
+      exception = intercept[SqlScriptingException] (
+        runSqlScript(commands)
+      ),
+      condition = "INVALID_BOOLEAN_STATEMENT",
+      parameters = Map("invalidStatement" -> "1")
+    )
   }
 
   test("searched case with non boolean condition - constant") {

@@ -21,7 +21,7 @@ import java.util.Locale
 
 import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.expressions.{Attribute, ExprId}
 
 object JoinType {
 
@@ -55,6 +55,12 @@ object JoinType {
 
 sealed abstract class JoinType {
   def sql: String
+
+  /**
+   * Returns this join type without cosmetic variations, for plan canonicalization. Only an
+   * [[ExistenceJoin]] has one, the exprId of its `exists` attribute.
+   */
+  def canonicalized: JoinType = this
 }
 
 /**
@@ -105,6 +111,13 @@ case class ExistenceJoin(exists: Attribute) extends JoinType {
     // generate SQL for this join type
     throw SparkUnsupportedOperationException()
   }
+
+  // A join type is not an `Expression`, so `QueryPlan.doCanonicalize` keeps the exprId of
+  // `exists`, and the join nodes call this instead. The exprId only names the column this join
+  // produces, and the parent normalizes its references to it by their ordinal in the join output.
+  // So it is normalized like the first attribute a node produces in `QueryPlan.doCanonicalize`.
+  override def canonicalized: JoinType =
+    ExistenceJoin(exists.withExprId(ExprId(0)).canonicalized.asInstanceOf[Attribute])
 }
 
 case class NaturalJoin(tpe: JoinType) extends JoinType {
@@ -160,6 +173,37 @@ case object Forward extends AsOfJoinDirection
 case object Backward extends AsOfJoinDirection
 case object Nearest extends AsOfJoinDirection
 
+sealed abstract class MatchComparisonOperator {
+  def sql: String
+  def flip: MatchComparisonOperator
+  /** The direction when the left table's operand is first, e.g. `l.ts >= r.ts` is [[Backward]]. */
+  def direction: AsOfJoinDirection
+}
+
+case object GreaterThanOrEqualOp extends MatchComparisonOperator {
+  override def sql: String = ">="
+  override def flip: MatchComparisonOperator = LessThanOrEqualOp
+  override def direction: AsOfJoinDirection = Backward
+}
+
+case object GreaterThanOp extends MatchComparisonOperator {
+  override def sql: String = ">"
+  override def flip: MatchComparisonOperator = LessThanOp
+  override def direction: AsOfJoinDirection = Backward
+}
+
+case object LessThanOrEqualOp extends MatchComparisonOperator {
+  override def sql: String = "<="
+  override def flip: MatchComparisonOperator = GreaterThanOrEqualOp
+  override def direction: AsOfJoinDirection = Forward
+}
+
+case object LessThanOp extends MatchComparisonOperator {
+  override def sql: String = "<"
+  override def flip: MatchComparisonOperator = GreaterThanOp
+  override def direction: AsOfJoinDirection = Forward
+}
+
 object LateralJoinType {
 
   val supported = Seq(
@@ -179,5 +223,72 @@ object LateralJoinType {
           "typ" -> typ,
           "supported" -> supported.mkString("'", "', '", "'"))
       )
+  }
+}
+
+object NearestByDirection {
+
+  /** @see [[NearestByJoinValidation.SupportedDirections]] */
+  val supported: Seq[String] = NearestByJoinValidation.SupportedDirections
+
+  def apply(direction: String): NearestByDirection = {
+    direction.toLowerCase(Locale.ROOT) match {
+      case "distance" => NearestByDistance
+      case "similarity" => NearestBySimilarity
+      case _ =>
+        throw new AnalysisException(
+          errorClass = "NEAREST_BY_JOIN.UNSUPPORTED_DIRECTION",
+          messageParameters = Map(
+            "direction" -> direction,
+            "supported" -> supported.mkString("'", "', '", "'")))
+    }
+  }
+}
+
+sealed abstract class NearestByDirection
+
+case object NearestByDistance extends NearestByDirection
+case object NearestBySimilarity extends NearestByDirection
+
+object NearestByJoinType {
+
+  /** @see [[NearestByJoinValidation.SupportedJoinTypes]] */
+  val supported: Seq[String] = NearestByJoinValidation.SupportedJoinTypes
+
+  /** @see [[NearestByJoinValidation.SupportedJoinTypeDisplay]] */
+  val supportedDisplay: String = NearestByJoinValidation.SupportedJoinTypeDisplay
+
+  def apply(typ: String): JoinType = typ.toLowerCase(Locale.ROOT).replace("_", "") match {
+    case "inner" => Inner
+    case "leftouter" | "left" => LeftOuter
+    case _ =>
+      throw new AnalysisException(
+        errorClass = "NEAREST_BY_JOIN.UNSUPPORTED_JOIN_TYPE",
+        messageParameters = Map(
+          "joinType" -> typ,
+          "supported" -> supportedDisplay))
+  }
+}
+
+object AsOfJoinType {
+
+  val supportedDisplay: String = "'INNER', 'LEFT OUTER'"
+}
+
+object NearestByJoinMode {
+
+  /** @see [[NearestByJoinValidation.SupportedModes]] */
+  val supported: Seq[String] = NearestByJoinValidation.SupportedModes
+
+  /** Returns true for APPROX, false for EXACT. */
+  def apply(mode: String): Boolean = mode.toLowerCase(Locale.ROOT) match {
+    case "approx" => true
+    case "exact" => false
+    case _ =>
+      throw new AnalysisException(
+        errorClass = "NEAREST_BY_JOIN.UNSUPPORTED_MODE",
+        messageParameters = Map(
+          "mode" -> mode,
+          "supported" -> supported.mkString("'", "', '", "'")))
   }
 }

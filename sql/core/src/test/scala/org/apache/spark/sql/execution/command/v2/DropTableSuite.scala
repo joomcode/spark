@@ -22,10 +22,12 @@ import org.apache.spark.sql.Row
 import org.apache.spark.sql.connector.InMemoryTableSessionCatalog
 import org.apache.spark.sql.execution.command
 import org.apache.spark.sql.internal.SQLConf.V2_SESSION_CATALOG_IMPLEMENTATION
+import org.apache.spark.tags.DataSourceV2Test
 
 /**
  * The class contains tests for the `DROP TABLE` command to check V2 table catalogs.
  */
+@DataSourceV2Test
 class DropTableSuite extends command.DropTableSuiteBase with CommandSuiteBase {
   test("purge option") {
     withNamespaceAndTable("ns", "tbl") { t =>
@@ -39,6 +41,13 @@ class DropTableSuite extends command.DropTableSuiteBase with CommandSuiteBase {
         parameters = Map.empty
       )
     }
+  }
+
+  test("DROP TABLE IF EXISTS ... PURGE on a missing table is a no-op") {
+    // The default TableCatalog.purgeTable throws unconditionally, so without an upfront
+    // existence guard `IF EXISTS` would surface UNSUPPORTED_FEATURE.PURGE_TABLE for missing
+    // tables -- defeating the IF EXISTS contract on catalogs that do not support purge.
+    sql(s"DROP TABLE IF EXISTS $catalog.ns.never_existed PURGE")
   }
 
   test("table qualified with the session catalog name") {

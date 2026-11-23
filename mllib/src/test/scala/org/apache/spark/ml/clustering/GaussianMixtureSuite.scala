@@ -75,6 +75,7 @@ class GaussianMixtureSuite extends MLTest with DefaultReadWriteTest {
     assert(gm.getProbabilityCol === "probability")
     assert(gm.getMaxIter === 100)
     assert(gm.getTol === 0.01)
+    assert(gm.getIntermediateStorageLevel === "MEMORY_AND_DISK")
     val model = gm.setMaxIter(1).fit(dataset)
 
     val transformed = model.transform(dataset)
@@ -85,6 +86,14 @@ class GaussianMixtureSuite extends MLTest with DefaultReadWriteTest {
     assert(model.hasSummary)
     val copiedModel = model.copy(ParamMap.empty)
     assert(copiedModel.hasSummary)
+  }
+
+  test("GaussianMixtureModel estimated size") {
+    val model = new GaussianMixture().setK(2).fit(dataset)
+    val maxSize = 1024 * 16
+    assert(
+      model.estimatedSize < maxSize,
+      s"Estimation (${model.estimatedSize}) should be less than $maxSize")
   }
 
   test("GaussianMixture validate input dataset") {
@@ -101,6 +110,7 @@ class GaussianMixtureSuite extends MLTest with DefaultReadWriteTest {
       .setMaxIter(33)
       .setSeed(123)
       .setTol(1e-3)
+      .setIntermediateStorageLevel("DISK_ONLY")
 
     assert(gm.getK === 9)
     assert(gm.getFeaturesCol === "test_feature")
@@ -109,6 +119,7 @@ class GaussianMixtureSuite extends MLTest with DefaultReadWriteTest {
     assert(gm.getMaxIter === 33)
     assert(gm.getSeed === 123)
     assert(gm.getTol === 1e-3)
+    assert(gm.getIntermediateStorageLevel === "DISK_ONLY")
   }
 
   test("parameters validation") {
@@ -270,12 +281,12 @@ class GaussianMixtureSuite extends MLTest with DefaultReadWriteTest {
   }
 
   test("GMM support instance weighting") {
-    val gm1 = new GaussianMixture().setK(k).setMaxIter(20).setSeed(seed)
-    val gm2 = new GaussianMixture().setK(k).setMaxIter(20).setSeed(seed).setWeightCol("weight")
+    val gm1 = new GaussianMixture().setK(2).setMaxIter(20).setSeed(seed)
+    val gm2 = new GaussianMixture().setK(2).setMaxIter(20).setSeed(seed).setWeightCol("weight")
 
     Seq(1.0, 10.0, 90.0).foreach { w =>
-      val gmm1 = gm1.fit(dataset)
-      val ds2 = dataset.select(col("features"), lit(w).as("weight"))
+      val gmm1 = gm1.fit(rDataset)
+      val ds2 = rDataset.select(col("features"), lit(w).as("weight"))
       val gmm2 = gm2.fit(ds2)
       modelEquals(gmm1, gmm2)
     }
@@ -303,7 +314,8 @@ object GaussianMixtureSuite extends SparkFunSuite {
     "probabilityCol" -> "myProbability",
     "k" -> 3,
     "maxIter" -> 2,
-    "tol" -> 0.01
+    "tol" -> 0.01,
+    "intermediateStorageLevel" -> "DISK_ONLY"
   )
 
   val denseData = Seq(

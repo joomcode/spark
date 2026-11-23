@@ -19,7 +19,7 @@ package org.apache.spark.sql.catalyst.plans.logical
 
 import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.sql.catalyst.SQLConfHelper
-import org.apache.spark.sql.catalyst.analysis.{FunctionRegistryBase, MultiInstanceRelation, UnresolvedAttribute, UnresolvedStar}
+import org.apache.spark.sql.catalyst.analysis.{FunctionRegistryBase, MultiInstanceRelation, UnresolvedAttribute, UnresolvedStar, WidenStatefulOpNullability}
 import org.apache.spark.sql.catalyst.analysis.TableFunctionRegistry.TableFunctionBuilder
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeSet, Expression, ExpressionDescription, ExpressionInfo, JsonToStructs, PythonUDF, PythonUDTF}
 import org.apache.spark.sql.catalyst.trees.TreePattern._
@@ -159,12 +159,15 @@ case class FlatMapGroupsInPandasWithState(
     timeout: GroupStateTimeout,
     child: LogicalPlan) extends UnaryNode {
 
-  override def output: Seq[Attribute] = outputAttrs
+  override def output: Seq[Attribute] =
+    if (isStateful) WidenStatefulOpNullability.widenOutputForStatefulOp(outputAttrs)
+    else outputAttrs
 
   override def producedAttributes: AttributeSet = AttributeSet(outputAttrs)
 
   override protected def withNewChildInternal(
     newChild: LogicalPlan): FlatMapGroupsInPandasWithState = copy(child = newChild)
+  override def isStateful: Boolean = child.isStreaming
 }
 
 /**
@@ -205,7 +208,9 @@ case class TransformWithStateInPySpark(
 
   override def right: LogicalPlan = initialState
 
-  override def output: Seq[Attribute] = outputAttrs
+  override def output: Seq[Attribute] =
+    if (isStateful) WidenStatefulOpNullability.widenOutputForStatefulOp(outputAttrs)
+    else outputAttrs
 
   override def producedAttributes: AttributeSet = AttributeSet(outputAttrs)
 
@@ -215,6 +220,7 @@ case class TransformWithStateInPySpark(
   override protected def withNewChildrenInternal(
       newLeft: LogicalPlan, newRight: LogicalPlan): TransformWithStateInPySpark =
     copy(child = newLeft, initialState = newRight)
+  override def isStateful: Boolean = child.isStreaming
 
   def leftAttributes: Seq[Attribute] = {
     assert(resolved, "This method is expected to be called after resolution.")
@@ -281,9 +287,24 @@ trait BaseEvalPython extends UnaryNode {
 
   def udfs: Seq[PythonUDF]
 
+  /**
+   * The columns of the child that are passed through to the output. Starts as the whole output
+   * of the child, and is narrowed by column pruning to those that the parent uses.
+   */
+  def requiredChildOutput: Seq[Attribute]
+
   def resultAttrs: Seq[Attribute]
 
-  override def output: Seq[Attribute] = child.output ++ resultAttrs
+  /** Returns a copy that passes through `requiredChildOutput` of the child. */
+  def withRequiredChildOutput(requiredChildOutput: Seq[Attribute]): BaseEvalPython
+
+  /**
+   * If defined, the UDFs are evaluated only for the child rows where this deterministic
+   * condition is true, and their results are null for the other rows (see `EvalOnlyWhen`).
+   */
+  def evalCondition: Option[Expression] = None
+
+  override def output: Seq[Attribute] = requiredChildOutput ++ resultAttrs
 
   override def producedAttributes: AttributeSet = AttributeSet(resultAttrs)
 
@@ -307,23 +328,48 @@ trait BaseEvalPythonUDTF extends UnaryNode {
 
 /**
  * A logical plan that evaluates a [[PythonUDF]]
+ *
+ * @param udfs the Python UDFs to evaluate
+ * @param requiredChildOutput the columns of the child that are passed through to the output
+ * @param resultAttrs the attributes of the results of the UDFs
+ * @param child the child plan
+ * @param evalCondition if set, a deterministic condition over the child; the UDFs are evaluated
+ *                      only for the child rows where it is true (see `EvalOnlyWhen`)
  */
 case class BatchEvalPython(
     udfs: Seq[PythonUDF],
+    requiredChildOutput: Seq[Attribute],
     resultAttrs: Seq[Attribute],
-    child: LogicalPlan) extends BaseEvalPython {
+    child: LogicalPlan,
+    override val evalCondition: Option[Expression] = None) extends BaseEvalPython {
+  override def withRequiredChildOutput(requiredChildOutput: Seq[Attribute]): BatchEvalPython =
+    copy(requiredChildOutput = requiredChildOutput)
+
   override protected def withNewChildInternal(newChild: LogicalPlan): BatchEvalPython =
     copy(child = newChild)
 }
 
 /**
  * A logical plan that evaluates a [[PythonUDF]] with Apache Arrow.
+ *
+ * @param udfs the Python UDFs to evaluate
+ * @param requiredChildOutput the columns of the child that are passed through to the output
+ * @param resultAttrs the attributes of the results of the UDFs
+ * @param child the child plan
+ * @param evalType the eval type of the UDFs
+ * @param evalCondition if set, a deterministic condition over the child; the UDFs are evaluated
+ *                      only for the child rows where it is true (see `EvalOnlyWhen`)
  */
 case class ArrowEvalPython(
     udfs: Seq[PythonUDF],
+    requiredChildOutput: Seq[Attribute],
     resultAttrs: Seq[Attribute],
     child: LogicalPlan,
-    evalType: Int) extends BaseEvalPython {
+    evalType: Int,
+    override val evalCondition: Option[Expression] = None) extends BaseEvalPython {
+  override def withRequiredChildOutput(requiredChildOutput: Seq[Attribute]): ArrowEvalPython =
+    copy(requiredChildOutput = requiredChildOutput)
+
   override protected def withNewChildInternal(newChild: LogicalPlan): ArrowEvalPython =
     copy(child = newChild)
 }
@@ -367,12 +413,14 @@ case class ArrowEvalPythonUDTF(
 
 /**
  * A logical plan that adds a new long column with the name `name` that
- * increases one by one. This is for 'distributed-sequence' default index
- * in pandas API on Spark.
+ * increases one by one.
+ * This is used in both 'distributed-sequence' index in pandas API on Spark
+ * and 'DataFrame.zipWithIndex'.
  */
 case class AttachDistributedSequence(
     sequenceAttr: Attribute,
-    child: LogicalPlan) extends UnaryNode {
+    child: LogicalPlan,
+    cache: Boolean = false) extends UnaryNode {
 
   override val producedAttributes: AttributeSet = AttributeSet(sequenceAttr)
 

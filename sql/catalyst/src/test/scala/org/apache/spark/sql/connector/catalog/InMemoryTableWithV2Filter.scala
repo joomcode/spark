@@ -21,20 +21,33 @@ import java.util
 
 import org.scalatest.Assertions.assert
 
-import org.apache.spark.sql.connector.expressions.{FieldReference, LiteralValue, NamedReference, Transform}
-import org.apache.spark.sql.connector.expressions.filter.{And, Predicate}
+import org.apache.spark.sql.catalyst.util.{CharVarcharCodegenUtils, CharVarcharUtils}
+import org.apache.spark.sql.connector.catalog.constraints.Constraint
+import org.apache.spark.sql.connector.distributions.{Distribution, Distributions}
+import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, FieldReference, GeneralScalarExpression, LiteralValue, NamedReference, SortOrder, Transform}
+import org.apache.spark.sql.connector.expressions.filter.{AlwaysFalse, And, Predicate}
 import org.apache.spark.sql.connector.read.{InputPartition, Scan, ScanBuilder, SupportsRuntimeV2Filtering}
 import org.apache.spark.sql.connector.write.{LogicalWriteInfo, SupportsOverwriteV2, WriteBuilder, WriterCommitMessage}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.ArrayImplicits._
 
 class InMemoryTableWithV2Filter(
     name: String,
     columns: Array[Column],
     partitioning: Array[Transform],
-    properties: util.Map[String, String])
-  extends InMemoryBaseTable(name, columns, partitioning, properties) with SupportsDeleteV2 {
+    properties: util.Map[String, String],
+    constraints: Array[Constraint] = Array.empty,
+    distribution: Distribution = Distributions.unspecified(),
+    ordering: Array[SortOrder] = Array.empty,
+    numPartitions: Option[Int] = None,
+    advisoryPartitionSize: Option[Long] = None,
+    isDistributionStrictlyRequired: Boolean = true,
+    numRowsPerSplit: Int = Int.MaxValue)
+  extends InMemoryBaseTable(name, columns, partitioning, properties, constraints, distribution,
+    ordering, numPartitions, advisoryPartitionSize, isDistributionStrictlyRequired,
+    numRowsPerSplit) with SupportsDeleteV2 {
 
   override def canDeleteWhere(predicates: Array[Predicate]): Boolean = {
     InMemoryTableWithV2Filter.supportsPredicates(predicates)
@@ -66,14 +79,16 @@ class InMemoryTableWithV2Filter(
     extends BatchScanBaseClass(_data, readSchema, tableSchema) with SupportsRuntimeV2Filtering {
 
     override def filterAttributes(): Array[NamedReference] = {
-      val scanFields = readSchema.fields.map(_.name).toSet
-      partitioning.flatMap(_.references)
-        .filter(ref => scanFields.contains(ref.fieldNames.mkString(".")))
+      identityPartitionAttributes
     }
 
     override def filter(filters: Array[Predicate]): Unit = {
-      if (partitioning.length == 1 && partitioning.head.references().length == 1) {
-        val ref = partitioning.head.references().head
+      if (filters.exists(_.isInstanceOf[AlwaysFalse])) {
+        data = Seq.empty
+        return
+      }
+      if (partitioning.length == 1 && identityPartitionReferences.length == 1) {
+        val ref = identityPartitionReferences.head
         filters.foreach {
           case p : Predicate if p.name().equals("IN") =>
             if (p.children().length > 1) {
@@ -87,6 +102,22 @@ class InMemoryTableWithV2Filter(
                 })
               }
             }
+          case p : Predicate if p.name().equals("=") =>
+            if (p.children().length == 2) {
+              val filterRef = p.children()(0).asInstanceOf[FieldReference].references.head
+              if (filterRef.toString.equals(ref.toString)) {
+                val matchingKey = p.children()(1).asInstanceOf[LiteralValue[_]].value
+                if (matchingKey != null) {
+                  data = data.filter(partition => {
+                    val key = partition.asInstanceOf[BufferedRows].keyString()
+                    key == matchingKey.toString
+                  })
+                } else {
+                  data = Seq.empty // NULL = anything is always false
+                }
+              }
+            }
+          case _ => // Ignore unsupported predicate types
         }
       }
     }
@@ -118,13 +149,16 @@ class InMemoryTableWithV2Filter(
     }
 
     override def canOverwrite(predicates: Array[Predicate]): Boolean = {
-      InMemoryTableWithV2Filter.supportsPredicates(predicates)
+      val acceptCharReadSidePadding = properties.getOrDefault(
+        InMemoryTableWithV2Filter.AcceptCharReadSidePaddingKey, "false").toBoolean
+      InMemoryTableWithV2Filter.supportsPredicates(predicates, acceptCharReadSidePadding)
     }
   }
 
   private class Overwrite(predicates: Array[Predicate]) extends TestBatchWrite {
     import org.apache.spark.sql.connector.catalog.CatalogV2Implicits.MultipartIdentifierHelper
-    override def commit(messages: Array[WriterCommitMessage]): Unit = dataMap.synchronized {
+    override protected def doCommit(
+        messages: Array[WriterCommitMessage]): Unit = dataMap.synchronized {
       val deleteKeys = InMemoryTableWithV2Filter.filtersToKeys(
         dataMap.keys, partCols.map(_.toSeq.quoted).toImmutableArraySeq, predicates)
       dataMap --= deleteKeys
@@ -140,42 +174,83 @@ object InMemoryTableWithV2Filter {
       partitionNames: Seq[String],
       filters: Array[Predicate]): Iterable[Seq[Any]] = {
     keys.filter { partValues =>
-      filters.flatMap(splitAnd).forall {
-        case p: Predicate if p.name().equals("=") =>
-          p.children()(1).asInstanceOf[LiteralValue[_]].value ==
-            InMemoryBaseTable.extractValue(p.children()(0).toString, partitionNames, partValues)
-        case p: Predicate if p.name().equals("<=>") =>
-          val attrVal = InMemoryBaseTable
-            .extractValue(p.children()(0).toString, partitionNames, partValues)
-          val value = p.children()(1).asInstanceOf[LiteralValue[_]].value
-          if (attrVal == null && value == null) {
-            true
-          } else if (attrVal == null || value == null) {
-            false
-          } else {
-            value == attrVal
-          }
-        case p: Predicate if p.name().equals("IS NULL") =>
-          val attr = p.children()(0).toString
-          null == InMemoryBaseTable.extractValue(attr, partitionNames, partValues)
-        case p: Predicate if p.name().equals("IS NOT NULL") =>
-          val attr = p.children()(0).toString
-          null != InMemoryBaseTable.extractValue(attr, partitionNames, partValues)
-        case p: Predicate if p.name().equals("ALWAYS_TRUE") => true
-        case f =>
-          throw new IllegalArgumentException(s"Unsupported filter type: $f")
-      }
+      val resolve: String => Any = attr =>
+        InMemoryBaseTable.extractValue(attr, partitionNames, partValues)
+      filters.flatMap(splitAnd).forall(evalPredicate(_, resolve))
     }
   }
 
-  def supportsPredicates(predicates: Array[Predicate]): Boolean = {
-    predicates.flatMap(splitAnd).forall {
-      case p: Predicate if p.name().equals("=") => true
-      case p: Predicate if p.name().equals("<=>") => true
-      case p: Predicate if p.name().equals("IS NULL") => true
-      case p: Predicate if p.name().equals("IS NOT NULL") => true
-      case p: Predicate if p.name().equals("ALWAYS_TRUE") => true
-      case _ => false
+  /**
+   * Evaluates a single V2 predicate by resolving column values through the
+   * given function. Supports =, <=>, IS_NULL, IS_NOT_NULL, and ALWAYS_TRUE.
+   */
+  def evalPredicate(
+      pred: Predicate,
+      resolveValue: String => Any): Boolean = {
+    lazy val attr = pred.children()(0).toString
+    lazy val value = pred.children()(0) match {
+      case CharReadSidePadding(ref, length) =>
+        Option(resolveValue(ref.toString)).map { v =>
+          CharVarcharCodegenUtils.readSidePadding(v.asInstanceOf[UTF8String], length)
+        }.orNull
+      case _ => resolveValue(attr)
+    }
+    pred.name() match {
+      case "=" =>
+        value ==
+          pred.children()(1).asInstanceOf[LiteralValue[_]].value
+      case "<=>" =>
+        val attrVal = value
+        val litVal =
+          pred.children()(1).asInstanceOf[LiteralValue[_]].value
+        (attrVal == null && litVal == null) ||
+          (attrVal != null && litVal != null && attrVal == litVal)
+      case "IS_NULL" => resolveValue(attr) == null
+      case "IS_NOT_NULL" => resolveValue(attr) != null
+      case "ALWAYS_TRUE" => true
+      case other =>
+        throw new IllegalArgumentException(
+          s"Unsupported filter type: $other")
+    }
+  }
+
+  /**
+   * Table property that lets an overwrite compare `CHAR_READ_SIDE_PADDING` of a column with a
+   * literal, as a connector that pads the CHAR values stored without padding would do.
+   */
+  val AcceptCharReadSidePaddingKey = "accept-char-read-side-padding"
+
+  private object CharReadSidePadding {
+    def unapply(expr: V2Expression): Option[(NamedReference, Int)] = expr match {
+      case e: GeneralScalarExpression if e.name() == CharVarcharUtils.V2_CHAR_READ_SIDE_PADDING =>
+        e.children().toSeq match {
+          case Seq(ref: NamedReference, LiteralValue(length: Int, _), _) => Some((ref, length))
+          case _ => None
+        }
+      case _ => None
+    }
+  }
+
+  /**
+   * Whether every predicate has a shape [[evalPredicate]] can evaluate: a plain column, or a
+   * column and a literal. `CHAR_READ_SIDE_PADDING` of a column compared with a literal is
+   * supported only if `acceptCharReadSidePadding` is true, which `canOverwrite` takes from the
+   * [[AcceptCharReadSidePaddingKey]] table property. Any other predicate over an expression,
+   * e.g. a cast, is not supported and returned to Spark, as a real connector without expression
+   * support would do.
+   */
+  def supportsPredicates(
+      predicates: Array[Predicate],
+      acceptCharReadSidePadding: Boolean = false): Boolean = {
+    predicates.flatMap(splitAnd).forall { p =>
+      (p.name(), p.children().toSeq) match {
+        case ("=" | "<=>", Seq(_: NamedReference, _: LiteralValue[_])) => true
+        case ("=" | "<=>", Seq(CharReadSidePadding(_, _), _: LiteralValue[_])) =>
+          acceptCharReadSidePadding
+        case ("IS_NULL" | "IS_NOT_NULL", Seq(_: NamedReference)) => true
+        case ("ALWAYS_TRUE", _) => true
+        case _ => false
+      }
     }
   }
 

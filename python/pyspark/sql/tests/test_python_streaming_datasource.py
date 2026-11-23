@@ -14,35 +14,75 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import json
 import os
 import tempfile
 import time
 import unittest
 
+from pyspark.errors import PySparkException
 from pyspark.sql.datasource import (
     DataSource,
-    DataSourceStreamReader,
-    InputPartition,
-    DataSourceStreamWriter,
     DataSourceStreamArrowWriter,
+    DataSourceStreamReader,
+    DataSourceStreamWriter,
+    InputPartition,
     SimpleDataSourceStreamReader,
     WriterCommitMessage,
 )
 from pyspark.sql.streaming import StreamingQueryException
-from pyspark.sql.types import Row
-from pyspark.testing.sqlutils import (
-    have_pyarrow,
-    pyarrow_requirement_message,
+from pyspark.sql.streaming.datasource import (
+    ReadAllAvailable,
+    ReadLimit,
+    ReadMaxRows,
+    SupportsTriggerAvailableNow,
 )
+from pyspark.sql.types import Row
 from pyspark.testing import assertDataFrameEqual
 from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import eventually, have_pyarrow, pyarrow_requirement_message
+
+
+def wait_for_condition(query, condition_fn, timeout_sec=30):
+    """
+    Wait for a condition on a streaming query to be met, with timeout and error context.
+
+    :param query: StreamingQuery object
+    :param condition_fn: Function that takes query and returns True when condition is met
+    :param timeout_sec: Timeout in seconds (default 30)
+    :raises TimeoutError: If condition is not met within timeout, with query context
+    """
+    start_time = time.time()
+    sleep_interval = 0.2
+
+    while not condition_fn(query):
+        elapsed = time.time() - start_time
+        if elapsed >= timeout_sec:
+            # Collect context for debugging
+            exception_info = query.exception()
+            recent_progresses = query.recentProgress
+
+            error_msg = (
+                f"Timeout after {timeout_sec} seconds waiting for condition. "
+                f"Query exception: {exception_info}. "
+                f"Recent progress count: {len(recent_progresses)}. "
+            )
+
+            if recent_progresses:
+                error_msg += f"Last progress: {recent_progresses[-1]}. "
+                error_msg += f"All recent progresses: {recent_progresses}"
+            else:
+                error_msg += "No progress recorded."
+
+            raise TimeoutError(error_msg)
+
+        time.sleep(sleep_interval)
 
 
 @unittest.skipIf(not have_pyarrow, pyarrow_requirement_message)
 class BasePythonStreamingDataSourceTestsMixin:
     def test_basic_streaming_data_source_class(self):
-        class MyDataSource(DataSource):
-            ...
+        class MyDataSource(DataSource): ...
 
         options = dict(a=1, b=2)
         ds = MyDataSource(options=options)
@@ -75,9 +115,8 @@ class BasePythonStreamingDataSourceTestsMixin:
             def initialOffset(self):
                 return {"offset": 0}
 
-            def latestOffset(self):
-                self.current += 2
-                return {"offset": self.current}
+            def latestOffset(self, start, limit):
+                return {"offset": start["offset"] + 2}
 
             def partitions(self, start, end):
                 return [RangePartition(start["offset"], end["offset"])]
@@ -139,19 +178,143 @@ class BasePythonStreamingDataSourceTestsMixin:
 
         return TestDataSource
 
-    def test_stream_reader(self):
-        self.spark.dataSource.register(self._get_test_data_source())
+    def _get_test_data_source_old_latest_offset_signature(self):
+        class RangePartition(InputPartition):
+            def __init__(self, start, end):
+                self.start = start
+                self.end = end
+
+        class TestStreamReader(DataSourceStreamReader):
+            current = 0
+
+            def initialOffset(self):
+                return {"offset": 0}
+
+            def latestOffset(self):
+                self.current += 2
+                return {"offset": self.current}
+
+            def partitions(self, start, end):
+                return [RangePartition(start["offset"], end["offset"])]
+
+            def commit(self, end):
+                pass
+
+            def read(self, partition):
+                start, end = partition.start, partition.end
+                for i in range(start, end):
+                    yield (i,)
+
+        class TestDataSource(DataSource):
+            def schema(self):
+                return "id INT"
+
+            def streamReader(self, schema):
+                return TestStreamReader()
+
+        return TestDataSource
+
+    def _get_test_data_source_for_admission_control(self):
+        class TestDataStreamReader(DataSourceStreamReader):
+            def initialOffset(self):
+                return {"partition-1": 0}
+
+            def getDefaultReadLimit(self):
+                return ReadMaxRows(2)
+
+            def latestOffset(self, start: dict, limit: ReadLimit):
+                start_idx = start["partition-1"]
+                if isinstance(limit, ReadAllAvailable):
+                    end_offset = start_idx + 10
+                else:
+                    assert isinstance(limit, ReadMaxRows), (
+                        "Expected ReadMaxRows read limit but got " + str(type(limit))
+                    )
+                    end_offset = start_idx + limit.max_rows
+                return {"partition-1": end_offset}
+
+            def reportLatestOffset(self):
+                return {"partition-1": 1000000}
+
+            def partitions(self, start: dict, end: dict):
+                start_index = start["partition-1"]
+                end_index = end["partition-1"]
+                return [InputPartition(i) for i in range(start_index, end_index)]
+
+            def read(self, partition):
+                yield (partition.value,)
+
+        class TestDataSource(DataSource):
+            def schema(self) -> str:
+                return "id INT"
+
+            def streamReader(self, schema):
+                return TestDataStreamReader()
+
+        return TestDataSource
+
+    def _get_test_data_source_for_trigger_available_now(self):
+        class TestDataStreamReader(DataSourceStreamReader, SupportsTriggerAvailableNow):
+            def initialOffset(self):
+                return {"partition-1": 0}
+
+            def getDefaultReadLimit(self):
+                return ReadMaxRows(2)
+
+            def latestOffset(self, start: dict, limit: ReadLimit):
+                start_idx = start["partition-1"]
+                if isinstance(limit, ReadAllAvailable):
+                    end_offset = start_idx + 10
+                else:
+                    assert isinstance(limit, ReadMaxRows), (
+                        "Expected ReadMaxRows read limit but got " + str(type(limit))
+                    )
+                    end_offset = min(
+                        start_idx + limit.max_rows, self.desired_end_offset["partition-1"]
+                    )
+                return {"partition-1": end_offset}
+
+            def reportLatestOffset(self):
+                return {"partition-1": 1000000}
+
+            def prepareForTriggerAvailableNow(self) -> None:
+                self.desired_end_offset = {"partition-1": 10}
+
+            def partitions(self, start: dict, end: dict):
+                start_index = start["partition-1"]
+                end_index = end["partition-1"]
+                return [InputPartition(i) for i in range(start_index, end_index)]
+
+            def read(self, partition):
+                yield (partition.value,)
+
+        class TestDataSource(DataSource):
+            def schema(self) -> str:
+                return "id INT"
+
+            def streamReader(self, schema):
+                return TestDataStreamReader()
+
+        return TestDataSource
+
+    def _test_stream_reader(self, test_data_source):
+        self.spark.dataSource.register(test_data_source)
         df = self.spark.readStream.format("TestDataSource").load()
 
         def check_batch(df, batch_id):
             assertDataFrameEqual(df, [Row(batch_id * 2), Row(batch_id * 2 + 1)])
 
         q = df.writeStream.foreachBatch(check_batch).start()
-        while len(q.recentProgress) < 10:
-            time.sleep(0.2)
+        wait_for_condition(q, lambda query: len(query.recentProgress) >= 5)
         q.stop()
         q.awaitTermination()
         self.assertIsNone(q.exception(), "No exception has to be propagated.")
+
+    def test_stream_reader(self):
+        self._test_stream_reader(self._get_test_data_source())
+
+    def test_stream_reader_old_latest_offset_signature(self):
+        self._test_stream_reader(self._get_test_data_source_old_latest_offset_signature())
 
     def test_stream_reader_pyarrow(self):
         import pyarrow as pa
@@ -197,8 +360,7 @@ class BasePythonStreamingDataSourceTestsMixin:
             .option("checkpointLocation", checkpoint_dir.name)
             .start(output_dir.name)
         )
-        while not q.recentProgress:
-            time.sleep(0.2)
+        wait_for_condition(q, lambda query: len(query.recentProgress) > 0)
         q.stop()
         q.awaitTermination()
 
@@ -212,6 +374,55 @@ class BasePythonStreamingDataSourceTestsMixin:
         df = self.spark.read.json(output_dir.name)
 
         assertDataFrameEqual(df, expected_data)
+
+    def test_stream_reader_admission_control_trigger_once(self):
+        self.spark.dataSource.register(self._get_test_data_source_for_admission_control())
+        df = self.spark.readStream.format("TestDataSource").load()
+
+        def check_batch(df, batch_id):
+            assertDataFrameEqual(df, [Row(x) for x in range(10)])
+
+        q = df.writeStream.trigger(once=True).foreachBatch(check_batch).start()
+        q.awaitTermination()
+        self.assertIsNone(q.exception(), "No exception has to be propagated.")
+        self.assertEqual(len(q.recentProgress), 1)
+        self.assertEqual(q.lastProgress.numInputRows, 10)
+        self.assertEqual(q.lastProgress.sources[0].numInputRows, 10)
+        self.assertEqual(
+            json.loads(q.lastProgress.sources[0].latestOffset), {"partition-1": 1000000}
+        )
+
+    def test_stream_reader_admission_control_processing_time_trigger(self):
+        self.spark.dataSource.register(self._get_test_data_source_for_admission_control())
+        df = self.spark.readStream.format("TestDataSource").load()
+
+        def check_batch(df, batch_id):
+            assertDataFrameEqual(df, [Row(batch_id * 2), Row(batch_id * 2 + 1)])
+
+        q = df.writeStream.foreachBatch(check_batch).start()
+        wait_for_condition(q, lambda query: len(query.recentProgress) >= 5)
+        q.stop()
+        q.awaitTermination()
+        self.assertIsNone(q.exception(), "No exception has to be propagated.")
+
+    def test_stream_reader_trigger_available_now(self):
+        self.spark.dataSource.register(self._get_test_data_source_for_trigger_available_now())
+        df = self.spark.readStream.format("TestDataSource").load()
+
+        def check_batch(df, batch_id):
+            assertDataFrameEqual(df, [Row(batch_id * 2), Row(batch_id * 2 + 1)])
+
+        q = df.writeStream.foreachBatch(check_batch).trigger(availableNow=True).start()
+        q.awaitTermination(timeout=30)
+        self.assertIsNone(q.exception(), "No exception has to be propagated.")
+        # 2 rows * 5 batches = 10 rows
+        self.assertEqual(len(q.recentProgress), 5)
+        for progress in q.recentProgress:
+            self.assertEqual(progress.numInputRows, 2)
+            self.assertEqual(q.lastProgress.sources[0].numInputRows, 2)
+            self.assertEqual(
+                json.loads(q.lastProgress.sources[0].latestOffset), {"partition-1": 1000000}
+            )
 
     def test_simple_stream_reader(self):
         class SimpleStreamReader(SimpleDataSourceStreamReader):
@@ -245,11 +456,346 @@ class BasePythonStreamingDataSourceTestsMixin:
             assertDataFrameEqual(df, [Row(batch_id * 2), Row(batch_id * 2 + 1)])
 
         q = df.writeStream.foreachBatch(check_batch).start()
-        while len(q.recentProgress) < 10:
-            time.sleep(0.2)
+        wait_for_condition(q, lambda query: len(query.recentProgress) >= 5)
         q.stop()
         q.awaitTermination()
         self.assertIsNone(q.exception(), "No exception has to be propagated.")
+
+    def test_simple_stream_reader_trigger_available_now(self):
+        class SimpleStreamReader(SimpleDataSourceStreamReader, SupportsTriggerAvailableNow):
+            def initialOffset(self):
+                return {"offset": 0}
+
+            def read(self, start: dict):
+                start_idx = start["offset"]
+                end_offset = min(start_idx + 2, self.desired_end_offset["offset"])
+                it = iter([(i,) for i in range(start_idx, end_offset)])
+                return (it, {"offset": end_offset})
+
+            def commit(self, end):
+                pass
+
+            def readBetweenOffsets(self, start: dict, end: dict):
+                start_idx = start["offset"]
+                end_idx = end["offset"]
+                return iter([(i,) for i in range(start_idx, end_idx)])
+
+            def prepareForTriggerAvailableNow(self) -> None:
+                self.desired_end_offset = {"offset": 10}
+
+        class SimpleDataSource(DataSource):
+            def schema(self):
+                return "id INT"
+
+            def simpleStreamReader(self, schema):
+                return SimpleStreamReader()
+
+        self.spark.dataSource.register(SimpleDataSource)
+        df = self.spark.readStream.format("SimpleDataSource").load()
+
+        def check_batch(df, batch_id):
+            # the last offset for the data is 9 since the desired end offset is 10
+            # the batch isn't triggered with no data, so either we have one data or two data in each batch
+            if batch_id * 2 + 1 > 9:
+                assertDataFrameEqual(df, [Row(batch_id * 2)])
+            else:
+                assertDataFrameEqual(df, [Row(batch_id * 2), Row(batch_id * 2 + 1)])
+
+        q = df.writeStream.foreachBatch(check_batch).trigger(availableNow=True).start()
+        q.awaitTermination(timeout=30)
+        self.assertIsNone(q.exception(), "No exception has to be propagated.")
+
+    def test_simple_stream_reader_offset_did_not_advance_raises(self):
+        """Validate that returning end == start with non-empty data raises SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE."""
+        from pyspark.sql.datasource_internal import _SimpleStreamReaderWrapper
+
+        class BuggySimpleStreamReader(SimpleDataSourceStreamReader):
+            def initialOffset(self):
+                return {"offset": 0}
+
+            def read(self, start: dict):
+                # Bug: return same offset as end despite returning data
+                start_idx = start["offset"]
+                it = iter([(i,) for i in range(start_idx, start_idx + 3)])
+                return (it, start)
+
+            def readBetweenOffsets(self, start: dict, end: dict):
+                return iter([])
+
+            def commit(self, end: dict):
+                pass
+
+        reader = BuggySimpleStreamReader()
+        wrapper = _SimpleStreamReaderWrapper(reader)
+        with self.assertRaises(PySparkException) as cm:
+            wrapper.latestOffset({"offset": 0}, ReadAllAvailable())
+        self.assertEqual(
+            cm.exception.getCondition(),
+            "SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE",
+        )
+
+    def test_simple_stream_reader_empty_iterator_start_equals_end_allowed(self):
+        """When read() returns end == start with an empty iterator, no exception and no cache entry."""
+        from pyspark.sql.datasource_internal import _SimpleStreamReaderWrapper
+
+        class EmptyBatchReader(SimpleDataSourceStreamReader):
+            def initialOffset(self):
+                return {"offset": 0}
+
+            def read(self, start: dict):
+                # Valid: same offset as end but empty iterator (no data)
+                return (iter([]), start)
+
+            def readBetweenOffsets(self, start: dict, end: dict):
+                return iter([])
+
+            def commit(self, end: dict):
+                pass
+
+        reader = EmptyBatchReader()
+        wrapper = _SimpleStreamReaderWrapper(reader)
+        start = {"offset": 0}
+        end = wrapper.latestOffset(start, ReadAllAvailable())
+        self.assertEqual(end, start)
+        self.assertEqual(len(wrapper.cache), 0)
+
+    def test_simple_stream_reader_returns_list(self):
+        """read() returning a list instead of an iterator is handled like an iterator."""
+        from pyspark.sql.datasource_internal import _SimpleStreamReaderWrapper
+
+        class ListReader(SimpleDataSourceStreamReader):
+            def __init__(self, rows, advance):
+                self.rows = rows
+                self.advance = advance
+
+            def initialOffset(self):
+                return {"offset": 0}
+
+            def read(self, start: dict):
+                end = {"offset": start["offset"] + len(self.rows)} if self.advance else start
+                return (list(self.rows), end)
+
+            def readBetweenOffsets(self, start: dict, end: dict):
+                return iter([])
+
+            def commit(self, end: dict):
+                pass
+
+        start = {"offset": 0}
+
+        # Non-empty list with an advanced end offset is cached and readable.
+        wrapper = _SimpleStreamReaderWrapper(ListReader([(0,), (1,)], advance=True))
+        end = wrapper.latestOffset(start, ReadAllAvailable())
+        self.assertEqual(end, {"offset": 2})
+        self.assertEqual(list(wrapper.getCache(start, end)), [(0,), (1,)])
+
+        # Empty list with end == start is allowed and not cached.
+        wrapper = _SimpleStreamReaderWrapper(ListReader([], advance=False))
+        end = wrapper.latestOffset(start, ReadAllAvailable())
+        self.assertEqual(end, start)
+        self.assertEqual(len(wrapper.cache), 0)
+
+        # Non-empty list with end == start raises the offset validation error.
+        wrapper = _SimpleStreamReaderWrapper(ListReader([(0,)], advance=False))
+        with self.assertRaises(PySparkException) as cm:
+            wrapper.latestOffset(start, ReadAllAvailable())
+        self.assertEqual(
+            cm.exception.getCondition(),
+            "SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE",
+        )
+
+    def test_simple_stream_reader_returns_non_iterator_iterables(self):
+        """read() returning a non-iterator iterable (e.g. tuple, range) is handled like a list."""
+        from collections import deque
+
+        from pyspark.sql.datasource_internal import _SimpleStreamReaderWrapper
+
+        class IterableOnly:
+            """An iterable that implements __iter__ but not __next__."""
+
+            def __init__(self, rows):
+                self._rows = rows
+
+            def __iter__(self):
+                return iter(self._rows)
+
+        class NextOnly:
+            """Implements only __next__ without __iter__, which next() accepts."""
+
+            def __init__(self, rows):
+                self._rows = iter(rows)
+
+            def __next__(self):
+                return next(self._rows)
+
+        class GetitemOnly:
+            """An iterable that implements only __getitem__, without __iter__ or __next__."""
+
+            def __init__(self, rows):
+                self._rows = rows
+
+            def __getitem__(self, index):
+                return self._rows[index]
+
+        class NonIteratorIterableReader(SimpleDataSourceStreamReader):
+            def __init__(self, rows, to_result, advance):
+                self.rows = rows
+                self.to_result = to_result
+                self.advance = advance
+
+            def initialOffset(self):
+                return {"offset": 0}
+
+            def read(self, start: dict):
+                end = {"offset": start["offset"] + len(self.rows)} if self.advance else start
+                return (self.to_result(self.rows), end)
+
+            def readBetweenOffsets(self, start: dict, end: dict):
+                return iter([])
+
+            def commit(self, end: dict):
+                pass
+
+        start = {"offset": 0}
+        # Examples of non-iterator iterables that read() may return instead of an iterator.
+        # GetitemOnly is included because it is the one kind that a guard narrowing the
+        # conversion to isinstance(it, Iterable) would mishandle.
+        non_iterator_results = [
+            tuple,
+            lambda rows: range(len(rows)),
+            lambda rows: deque(rows),
+            IterableOnly,
+            GetitemOnly,
+        ]
+
+        for to_result in non_iterator_results:
+            # Non-empty iterable with an advanced end offset is cached and readable.
+            wrapper = _SimpleStreamReaderWrapper(
+                NonIteratorIterableReader([0, 1], to_result, advance=True)
+            )
+            end = wrapper.latestOffset(start, ReadAllAvailable())
+            self.assertEqual(end, {"offset": 2})
+            self.assertEqual(list(wrapper.getCache(start, end)), [0, 1])
+
+            # Empty iterable with end == start is allowed and not cached.
+            wrapper = _SimpleStreamReaderWrapper(
+                NonIteratorIterableReader([], to_result, advance=False)
+            )
+            end = wrapper.latestOffset(start, ReadAllAvailable())
+            self.assertEqual(end, start)
+            self.assertEqual(len(wrapper.cache), 0)
+
+            # Non-empty iterable with end == start raises the offset validation error.
+            wrapper = _SimpleStreamReaderWrapper(
+                NonIteratorIterableReader([0], to_result, advance=False)
+            )
+            with self.assertRaises(PySparkException) as cm:
+                wrapper.latestOffset(start, ReadAllAvailable())
+            self.assertEqual(
+                cm.exception.getCondition(),
+                "SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE",
+            )
+
+        # Objects that implement only __next__ keep being accepted by next() directly.
+        wrapper = _SimpleStreamReaderWrapper(NonIteratorIterableReader([], NextOnly, advance=False))
+        end = wrapper.latestOffset(start, ReadAllAvailable())
+        self.assertEqual(end, start)
+        self.assertEqual(len(wrapper.cache), 0)
+
+        wrapper = _SimpleStreamReaderWrapper(
+            NonIteratorIterableReader([0], NextOnly, advance=False)
+        )
+        with self.assertRaises(PySparkException) as cm:
+            wrapper.latestOffset(start, ReadAllAvailable())
+        self.assertEqual(
+            cm.exception.getCondition(),
+            "SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE",
+        )
+
+    def test_simple_stream_reader_next_lookup_uses_type(self):
+        """The __next__ check uses the type, so __getattr__ hooks and instance attributes
+        on the result cannot misroute the empty/non-empty validation."""
+        from pyspark.sql.datasource_internal import _SimpleStreamReaderWrapper
+
+        class GetattrReturnsList(list):
+            def __getattr__(self, name):
+                return None
+
+        class GetattrRaisesList(list):
+            def __getattr__(self, name):
+                raise KeyError(name)
+
+        class IteratorProxy:
+            def __init__(self, rows):
+                self._rows = iter(rows)
+
+            def __getattr__(self, name):
+                return getattr(self._rows, name)
+
+            def __iter__(self):
+                return self._rows
+
+        def with_instance_next(rows):
+            # An instance __next__ attribute must not be consulted by the check.
+            result = GetattrReturnsList(rows)
+            result.__next__ = lambda: (_ for _ in ()).throw(AssertionError("unused"))
+            return result
+
+        class HookedResultReader(SimpleDataSourceStreamReader):
+            def __init__(self, rows, to_result, advance):
+                self.rows = rows
+                self.to_result = to_result
+                self.advance = advance
+
+            def initialOffset(self):
+                return {"offset": 0}
+
+            def read(self, start: dict):
+                end = {"offset": start["offset"] + len(self.rows)} if self.advance else start
+                return (self.to_result(self.rows), end)
+
+            def readBetweenOffsets(self, start: dict, end: dict):
+                return iter([])
+
+            def commit(self, end: dict):
+                pass
+
+        start = {"offset": 0}
+        # Instance lookups answer __next__ (or raise for it), but the type does not
+        # define it, so the result must be treated as the plain iterable it is.
+        for to_result in [GetattrReturnsList, GetattrRaisesList, with_instance_next]:
+            # Empty result with end == start is allowed and not cached.
+            wrapper = _SimpleStreamReaderWrapper(HookedResultReader([], to_result, advance=False))
+            end = wrapper.latestOffset(start, ReadAllAvailable())
+            self.assertEqual(end, start)
+            self.assertEqual(len(wrapper.cache), 0)
+
+            # Non-empty result with end == start raises the offset validation error,
+            # not a TypeError and not an exception escaping from a hook.
+            wrapper = _SimpleStreamReaderWrapper(HookedResultReader([0], to_result, advance=False))
+            with self.assertRaises(PySparkException) as cm:
+                wrapper.latestOffset(start, ReadAllAvailable())
+            self.assertEqual(
+                cm.exception.getCondition(),
+                "SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE",
+            )
+
+        # A proxy forwarding __getattr__ and __iter__ to an iterator is converted with
+        # iter() and validated like any other iterable. It is only checked on paths
+        # where the guard runs: the cache readback copies entries with copy.copy,
+        # which a proxy rebuilt without __init__ cannot survive.
+        wrapper = _SimpleStreamReaderWrapper(HookedResultReader([0], IteratorProxy, advance=False))
+        with self.assertRaises(PySparkException) as cm:
+            wrapper.latestOffset(start, ReadAllAvailable())
+        self.assertEqual(
+            cm.exception.getCondition(),
+            "SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE",
+        )
+
+        wrapper = _SimpleStreamReaderWrapper(HookedResultReader([], IteratorProxy, advance=False))
+        end = wrapper.latestOffset(start, ReadAllAvailable())
+        self.assertEqual(end, start)
+        self.assertEqual(len(wrapper.cache), 0)
 
     def test_stream_writer(self):
         input_dir = tempfile.TemporaryDirectory(prefix="test_data_stream_write_input")
@@ -267,8 +813,7 @@ class BasePythonStreamingDataSourceTestsMixin:
                 .option("checkpointLocation", checkpoint_dir.name)
                 .start(output_dir.name)
             )
-            while not q.recentProgress:
-                time.sleep(0.2)
+            wait_for_condition(q, lambda query: len(query.recentProgress) > 0)
 
             # Test stream writer write and commit.
             # The first microbatch contain 30 rows and 2 partitions.
@@ -282,8 +827,7 @@ class BasePythonStreamingDataSourceTestsMixin:
             # Test StreamWriter write and abort.
             # When row id > 50, write tasks throw exception and fail.
             # 1.txt is written by StreamWriter.abort() to record the failure.
-            while q.exception() is None:
-                time.sleep(0.2)
+            wait_for_condition(q, lambda query: query.exception() is not None)
             assertDataFrameEqual(
                 self.spark.read.text(os.path.join(output_dir.name, "1.txt")),
                 [Row("failed in batch 1")],
@@ -298,12 +842,13 @@ class BasePythonStreamingDataSourceTestsMixin:
 
     def test_stream_arrow_writer(self):
         """Test DataSourceStreamArrowWriter with Arrow RecordBatch format."""
-        import tempfile
-        import shutil
         import json
         import os
-        import pyarrow as pa
+        import shutil
+        import tempfile
         from dataclasses import dataclass
+
+        import pyarrow as pa
 
         @dataclass
         class ArrowCommitMessage(WriterCommitMessage):
@@ -399,41 +944,45 @@ class BasePythonStreamingDataSourceTestsMixin:
                 .start()
             )
 
-            # Wait a bit for data to be processed, then stop
-            time.sleep(6)  # Allow a few batches to run
+            @eventually(
+                timeout=20,
+                interval=2.0,
+                catch_assertions=True,
+                expected_exceptions=(json.JSONDecodeError,),
+            )
+            def check():
+                # Since we're writing actual JSON files, verify commit metadata and written files
+                commit_files = [f for f in os.listdir(temp_dir) if f.startswith("commit_")]
+                self.assertTrue(len(commit_files) > 0, "No commit files were created")
+
+                # Read and verify commit metadata - check all commits for any with data
+                total_committed_rows = 0
+                total_committed_batches = 0
+
+                for commit_file in commit_files:
+                    with open(os.path.join(temp_dir, commit_file), "r") as f:
+                        commit_data = json.load(f)
+                        total_committed_rows += commit_data.get("total_rows", 0)
+                        total_committed_batches += commit_data.get("total_batches", 0)
+
+                self.assertTrue(
+                    total_committed_rows > 0,
+                    f"Expected committed data but got {total_committed_rows} rows",
+                )
+
+            check()
+
             query.stop()
             query.awaitTermination()
 
-            # Since we're writing actual JSON files, verify commit metadata and written files
-            commit_files = [f for f in os.listdir(temp_dir) if f.startswith("commit_")]
-            self.assertTrue(len(commit_files) > 0, "No commit files were created")
-
-            # Read and verify commit metadata - check all commits for any with data
-            total_committed_rows = 0
-            total_committed_batches = 0
-
-            for commit_file in commit_files:
-                with open(os.path.join(temp_dir, commit_file), "r") as f:
-                    commit_data = json.load(f)
-                    total_committed_rows += commit_data.get("total_rows", 0)
-                    total_committed_batches += commit_data.get("total_batches", 0)
-
-            # We should have both committed data AND JSON files written
             json_files = [
                 f
                 for f in os.listdir(temp_dir)
                 if f.startswith("partition_") and f.endswith(".json")
             ]
 
-            # Verify that we have both committed data AND JSON files
-            has_committed_data = total_committed_rows > 0
-            has_json_files = len(json_files) > 0
-
             self.assertTrue(
-                has_committed_data, f"Expected committed data but got {total_committed_rows} rows"
-            )
-            self.assertTrue(
-                has_json_files, f"Expected JSON files but found {len(json_files)} files"
+                len(json_files) > 0, f"Expected JSON files but found {len(json_files)} files"
             )
 
             # Verify JSON files contain valid data
@@ -452,12 +1001,6 @@ class PythonStreamingDataSourceTests(BasePythonStreamingDataSourceTestsMixin, Re
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.test_python_streaming_datasource import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

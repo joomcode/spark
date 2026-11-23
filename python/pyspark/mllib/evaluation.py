@@ -15,8 +15,8 @@
 # limitations under the License.
 #
 
-from typing import Generic, List, Optional, Tuple, TypeVar, Union
 import sys
+from typing import Generic, List, Optional, Tuple, TypeVar, Union
 
 from pyspark import since
 from pyspark.core.rdd import RDD
@@ -668,9 +668,11 @@ class MultilabelMetrics(JavaModelWrapper):
 
 def _test() -> None:
     import doctest
+
     import numpy
-    from pyspark.sql import SparkSession
+
     import pyspark.mllib.evaluation
+    from pyspark.sql import SparkSession
 
     try:
         # Numpy 1.14+ changed it's string format.
@@ -680,7 +682,7 @@ def _test() -> None:
     globs = pyspark.mllib.evaluation.__dict__.copy()
     spark = SparkSession.builder.master("local[4]").appName("mllib.evaluation tests").getOrCreate()
     globs["sc"] = spark.sparkContext
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
     spark.stop()
     if failure_count:
         sys.exit(-1)

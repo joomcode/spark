@@ -15,56 +15,52 @@
 # limitations under the License.
 #
 
-from abc import abstractmethod
-
 import json
 import os
-import time
 import tempfile
-from pyspark.sql.streaming import StatefulProcessor
-
+import time
 import unittest
+from abc import abstractmethod
 from typing import cast
 
 from pyspark import SparkConf
 from pyspark.sql.functions import array_sort, col, explode, split
+from pyspark.sql.streaming import StatefulProcessor
+from pyspark.sql.tests.pandas.helper.helper_pandas_transform_with_state import (
+    InvalidSimpleStatefulProcessorFactory,
+    ListStateLargeListProcessorFactory,
+    ListStateLargeTTLProcessorFactory,
+    ListStateProcessorFactory,
+    MapStateLargeTTLProcessorFactory,
+    MapStateProcessorFactory,
+    SimpleStatefulProcessorFactory,
+    SimpleStatefulProcessorWithInitialStateFactory,
+    SimpleTTLStatefulProcessorFactory,
+    StatefulProcessorWithInitialStateTimersFactory,
+    StatefulProcessorWithListStateInitialStateFactory,
+    TTLStatefulProcessorFactory,
+)
 from pyspark.sql.types import (
-    StringType,
-    StructType,
-    StructField,
-    Row,
     IntegerType,
+    Row,
+    StringType,
+    StructField,
+    StructType,
 )
 from pyspark.testing import assertDataFrameEqual
-from pyspark.testing.sqlutils import (
-    ReusedSQLTestCase,
+from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import (
     have_pandas,
     have_pyarrow,
     pandas_requirement_message,
     pyarrow_requirement_message,
 )
 
-from pyspark.sql.tests.pandas.helper.helper_pandas_transform_with_state import (
-    SimpleStatefulProcessorWithInitialStateFactory,
-    StatefulProcessorWithInitialStateTimersFactory,
-    StatefulProcessorWithListStateInitialStateFactory,
-    SimpleStatefulProcessorFactory,
-    SimpleTTLStatefulProcessorFactory,
-    TTLStatefulProcessorFactory,
-    InvalidSimpleStatefulProcessorFactory,
-    ListStateProcessorFactory,
-    ListStateLargeListProcessorFactory,
-    ListStateLargeTTLProcessorFactory,
-    MapStateProcessorFactory,
-    MapStateLargeTTLProcessorFactory,
-)
-
 
 class TransformWithStateStateVariableTestsMixin:
     @classmethod
     @abstractmethod
-    def use_pandas(cls) -> bool:
-        ...
+    def use_pandas(cls) -> bool: ...
 
     @classmethod
     def get_processor(cls, stateful_processor_factory) -> StatefulProcessor:
@@ -707,9 +703,7 @@ class TransformWithStateStateVariableTestsMixin:
                     "id AS groupingKey",
                     "map_key.name AS mapKey",
                     "map_value.value.count AS mapValue",
-                ).sort(
-                    "groupingKey"
-                ).collect() == [
+                ).sort("groupingKey").collect() == [
                     Row(groupingKey="0", mapKey="key2", mapValue=2),
                     Row(groupingKey="1", mapKey="key2", mapValue=2),
                 ]
@@ -802,9 +796,7 @@ class TransformWithStateStateVariableTestsMixin:
                     "key.id AS groupingKey", "list_value.temperature AS valueList"
                 ).sort("groupingKey").withColumn(
                     "valueSortedList", array_sort(col("valueList"))
-                ).select(
-                    "groupingKey", "valueSortedList"
-                ).collect() == [
+                ).select("groupingKey", "valueSortedList").collect() == [
                     Row(groupingKey="0", valueSortedList=[20, 20, 120, 120, 222]),
                     Row(groupingKey="1", valueSortedList=[20, 20, 120, 120, 222]),
                 ]
@@ -1010,12 +1002,7 @@ class TransformWithStateInPandasStateVariableTests(
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.pandas.streaming.test_pandas_transform_with_state import *  # noqa: F401
+    from pyspark.sql.tests.pandas.streaming.test_pandas_transform_with_state import *  # noqa: F403
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

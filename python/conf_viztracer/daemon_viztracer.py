@@ -18,20 +18,19 @@
 import os
 import sys
 
+import pyspark.worker
 import viztracer
 from viztracer.main import main
 
-import pyspark.worker
-
 
 def viztracer_wrapper(func):
-
     def wrapper(*args, **kwargs):
         result = func(*args, **kwargs)
         tracer = viztracer.get_tracer()
         if tracer is not None:
             tracer.exit_routine()
         return result
+
     return wrapper
 
 
@@ -43,6 +42,5 @@ if __name__ == "__main__":
     else:
         output_dir = "./"
 
-    sys.argv[:] = ["viztracer", "-m", "pyspark.daemon", "--quiet", "-u",
-                   "--output_dir", output_dir]
+    sys.argv[:] = ["viztracer", "-m", "pyspark.daemon", "--quiet", "-u", "--output_dir", output_dir]
     main()

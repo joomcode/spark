@@ -15,28 +15,30 @@
 # limitations under the License.
 #
 
-from contextlib import contextmanager
 import inspect
-import tempfile
-import unittest
 import os
+import pstats
 import sys
+import tempfile
+import threading
+import unittest
 import warnings
+from contextlib import contextmanager
 from io import StringIO
-from typing import Iterator, cast
+from typing import Iterator
+from unittest import mock
 
 from pyspark import SparkConf
 from pyspark.errors import PySparkValueError
+from pyspark.profiler import SamplingResultParam, UDFBasicProfiler
 from pyspark.sql import SparkSession
-from pyspark.sql.datasource import DataSource, DataSourceReader
-from pyspark.sql.functions import col, arrow_udf, pandas_udf, udf
+from pyspark.sql.functions import arrow_udf, col, pandas_udf, udf
 from pyspark.sql.window import Window
-from pyspark.profiler import UDFBasicProfiler
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 from pyspark.testing.utils import (
+    have_flameprof,
     have_pandas,
     have_pyarrow,
-    have_flameprof,
     pandas_requirement_message,
     pyarrow_requirement_message,
 )
@@ -261,7 +263,7 @@ class UDFProfiler2TestsMixin:
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
-        cast(str, pandas_requirement_message or pyarrow_requirement_message),
+        pandas_requirement_message or pyarrow_requirement_message,
     )
     def test_perf_profiler_udf_with_arrow(self):
         with self.sql_conf({"spark.sql.pyspark.udf.profiler": "perf"}):
@@ -301,9 +303,22 @@ class UDFProfiler2TestsMixin:
             for id in self.profile_results:
                 self.assert_udf_profile_present(udf_id=id, expected_line_count_prefix=10)
 
+    def test_perf_profiler_udf_without_module(self):
+        @udf("long")
+        def add1(x):
+            return x + 1
+
+        add1.__module__ = None
+
+        with self.sql_conf({"spark.sql.pyspark.udf.profiler": "perf"}):
+            df = self.spark.range(10, numPartitions=2).select(add1("id"))
+            df.collect()
+
+        self.assertEqual(1, len(self.profile_results), str(self.profile_results.keys()))
+
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
-        cast(str, pandas_requirement_message or pyarrow_requirement_message),
+        pandas_requirement_message or pyarrow_requirement_message,
     )
     def test_perf_profiler_pandas_udf(self):
         @pandas_udf("long")
@@ -350,7 +365,7 @@ class UDFProfiler2TestsMixin:
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
-        cast(str, pandas_requirement_message or pyarrow_requirement_message),
+        pandas_requirement_message or pyarrow_requirement_message,
     )
     def test_perf_profiler_pandas_udf_iterator(self):
         import pandas as pd
@@ -389,7 +404,7 @@ class UDFProfiler2TestsMixin:
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
-        cast(str, pandas_requirement_message or pyarrow_requirement_message),
+        pandas_requirement_message or pyarrow_requirement_message,
     )
     def test_perf_profiler_map_in_pandas(self):
         df = self.spark.createDataFrame([(1, 21), (2, 30)], ("id", "age")).repartition(1)
@@ -426,7 +441,7 @@ class UDFProfiler2TestsMixin:
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
-        cast(str, pandas_requirement_message or pyarrow_requirement_message),
+        pandas_requirement_message or pyarrow_requirement_message,
     )
     def test_perf_profiler_pandas_udf_window(self):
         # WindowInPandasExec
@@ -472,7 +487,7 @@ class UDFProfiler2TestsMixin:
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
-        cast(str, pandas_requirement_message or pyarrow_requirement_message),
+        pandas_requirement_message or pyarrow_requirement_message,
     )
     def test_perf_profiler_aggregate_in_pandas(self):
         # AggregateInPandasExec
@@ -514,8 +529,9 @@ class UDFProfiler2TestsMixin:
 
     @unittest.skipIf(not have_pyarrow, pyarrow_requirement_message)
     def test_perf_profiler_arrow_udf_grouped_agg_iter(self):
-        import pyarrow as pa
         from typing import Iterator
+
+        import pyarrow as pa
 
         @arrow_udf("double")
         def arrow_mean_iter(it: Iterator[pa.Array]) -> float:
@@ -539,7 +555,34 @@ class UDFProfiler2TestsMixin:
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
-        cast(str, pandas_requirement_message or pyarrow_requirement_message),
+        pandas_requirement_message or pyarrow_requirement_message,
+    )
+    def test_perf_profiler_pandas_udf_grouped_agg_iter(self):
+        import pandas as pd
+
+        @pandas_udf("double")
+        def pandas_mean_iter(it: Iterator[pd.Series]) -> float:
+            sum_val = 0.0
+            cnt = 0
+            for v in it:
+                sum_val += v.sum()
+                cnt += len(v)
+            return sum_val / cnt if cnt > 0 else 0.0
+
+        with self.sql_conf({"spark.sql.pyspark.udf.profiler": "perf"}):
+            df = self.spark.createDataFrame(
+                [(1, 1.0), (1, 2.0), (2, 3.0), (2, 5.0), (2, 10.0)], ("id", "v")
+            )
+            df.groupBy(df.id).agg(pandas_mean_iter(df["v"])).show()
+
+        self.assertEqual(1, len(self.profile_results), str(self.profile_results.keys()))
+
+        for id in self.profile_results:
+            self.assert_udf_profile_present(udf_id=id, expected_line_count_prefix=2)
+
+    @unittest.skipIf(
+        not have_pandas or not have_pyarrow,
+        pandas_requirement_message or pyarrow_requirement_message,
     )
     def test_perf_profiler_group_apply_in_pandas(self):
         # FlatMapGroupsInBatchExec
@@ -561,7 +604,7 @@ class UDFProfiler2TestsMixin:
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
-        cast(str, pandas_requirement_message or pyarrow_requirement_message),
+        pandas_requirement_message or pyarrow_requirement_message,
     )
     def test_perf_profiler_cogroup_apply_in_pandas(self):
         # FlatMapCoGroupsInBatchExec
@@ -590,7 +633,7 @@ class UDFProfiler2TestsMixin:
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
-        cast(str, pandas_requirement_message or pyarrow_requirement_message),
+        pandas_requirement_message or pyarrow_requirement_message,
     )
     def test_perf_profiler_group_apply_in_arrow(self):
         # FlatMapGroupsInBatchExec
@@ -615,7 +658,7 @@ class UDFProfiler2TestsMixin:
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
-        cast(str, pandas_requirement_message or pyarrow_requirement_message),
+        pandas_requirement_message or pyarrow_requirement_message,
     )
     def test_perf_profiler_cogroup_apply_in_arrow(self):
         import pyarrow as pa
@@ -635,35 +678,6 @@ class UDFProfiler2TestsMixin:
 
         for id in self.profile_results:
             self.assert_udf_profile_present(udf_id=id, expected_line_count_prefix=2)
-
-    @unittest.skipIf(not have_pyarrow, pyarrow_requirement_message)
-    def test_perf_profiler_data_source(self):
-        class TestDataSourceReader(DataSourceReader):
-            def __init__(self, schema):
-                self.schema = schema
-
-            def partitions(self):
-                raise NotImplementedError
-
-            def read(self, partition):
-                yield from ((1,), (2,), (3,))
-
-        class TestDataSource(DataSource):
-            def schema(self):
-                return "id long"
-
-            def reader(self, schema) -> "DataSourceReader":
-                return TestDataSourceReader(schema)
-
-        self.spark.dataSource.register(TestDataSource)
-
-        with self.sql_conf({"spark.sql.pyspark.udf.profiler": "perf"}):
-            self.spark.read.format("TestDataSource").load().collect()
-
-        self.assertEqual(1, len(self.profile_results), str(self.profile_results.keys()))
-
-        for id in self.profile_results:
-            self.assert_udf_profile_present(udf_id=id, expected_line_count_prefix=4)
 
     def test_perf_profiler_render(self):
         with self.sql_conf({"spark.sql.pyspark.udf.profiler": "perf"}):
@@ -751,20 +765,131 @@ class UDFProfiler2TestsMixin:
         self.spark.profile.clear()
         self.assertEqual(0, len(self.profile_results), str(list(self.profile_results)))
 
+    @property
+    def sampling_profile_results(self):
+        return self.spark._profiler_collector._sampling_profile_results
+
+    def test_sampling_profiler_udf(self):
+        import time
+
+        @udf("long")
+        def busy_add1(x):
+            # Sleep so the sampling thread reliably catches this frame on the stack.
+            time.sleep(0.05)
+            return x + 1
+
+        # Without the conf enabled, no sampling results are collected.
+        self.spark.range(5, numPartitions=1).select(busy_add1("id")).collect()
+        self.assertEqual(0, len(self.sampling_profile_results))
+
+        with self.sql_conf(
+            {
+                "spark.sql.pyspark.udf.profiler": "sampling",
+                "spark.sql.pyspark.udf.profiler.samplingInterval": "10",
+            }
+        ):
+            self.spark.range(10, numPartitions=2).select(busy_add1("id")).collect()
+
+        results = self.sampling_profile_results
+        # Two partitions -> two tasks -> two call-trees keyed by task.
+        self.assertEqual(2, len(results), str(list(results)))
+
+        # Flatten the per-thread call trees and assert the UDF frame was sampled.
+        def collect_idents(node, idents):
+            for key, child in node.items():
+                if key == "count":
+                    continue
+                idents.append(key)
+                collect_idents(child, idents)
+
+        for result in results.values():
+            idents = []
+            for thread_tree in result["callstack"].values():
+                collect_idents(thread_tree, idents)
+            self.assertTrue(
+                any("busy_add1" in ident for ident in idents),
+                f"UDF frame not found in samples: {idents}",
+            )
+
+        # Clearing a single result removes only that result.
+        ids = list(results)
+        self.spark._profiler_collector.clear_sampling_profiles(ids[0])
+        self.assertEqual([ids[1]], list(self.sampling_profile_results))
+
+        # Clearing other profiler types keeps the sampling results.
+        self.spark.profile.clear(type="perf")
+        self.spark.profile.clear(type="memory")
+        self.assertEqual([ids[1]], list(self.sampling_profile_results))
+
+        # Clearing all profiles removes the sampling results and the emptied entries.
+        self.spark.profile.clear()
+        self.assertEqual(0, len(self.sampling_profile_results))
+        self.assertEqual(0, len(self.spark._profiler_collector._profile_results))
+
 
 class UDFProfiler2Tests(UDFProfiler2TestsMixin, ReusedSQLTestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.spark._profiler_collector._accumulator._value = None
+        self.spark._profiler_collector._accumulator._value = {}
+
+    def test_clear_during_accumulator_merge(self):
+        # The accumulator server thread merges worker updates into the same dict that
+        # spark.profile.clear() pops from. Pause a merge midway and clear from another thread.
+        accumulator = self.spark._profiler_collector._accumulator
+        merging, cleared = threading.Event(), threading.Event()
+        add_in_place = SamplingResultParam.addInPlace
+
+        def paused_add_in_place(value1, value2):
+            merging.set()
+            # Without a shared lock, the clear runs while the merge is waiting here.
+            cleared.wait(timeout=0.1)
+            return add_in_place(value1, value2)
+
+        def clear():
+            # Skip the clear if the merge never pauses, so it can't affect later tests.
+            if merging.wait(timeout=10):
+                self.spark.profile.clear()
+                cleared.set()
+
+        accumulator += {"id": {"sampling": {"count": 1}}}
+        with mock.patch.object(SamplingResultParam, "addInPlace", paused_add_in_place):
+            thread = threading.Thread(target=clear, daemon=True)
+            thread.start()
+            accumulator += {"id": {"sampling": {"count": 1}}}
+            thread.join(timeout=10)
+        self.assertTrue(merging.is_set(), "The merge did not reach the pause")
+        self.assertFalse(thread.is_alive())
+        self.assertEqual({}, self.spark._profiler_collector._profile_results)
+
+    def test_show_perf_during_accumulator_merge(self):
+        # Merges mutate the stats in place. Merge a new function midway through show().
+        accumulator = self.spark._profiler_collector._accumulator
+
+        def stats(name):
+            st = pstats.Stats()
+            st.stream = None
+            st.stats = {("udf.py", 1, name): (1, 1, 0.1, 0.1, {})}
+            return st
+
+        accumulator += {"id": {"perf": stats("f")}}
+        func_std_string = pstats.func_std_string
+        merged = False
+
+        def func_std_string_with_merge(func):
+            nonlocal merged
+            if not merged:
+                merged = True
+                accumulator.add({"id": {"perf": stats("g")}})
+            return func_std_string(func)
+
+        with mock.patch("pstats.func_std_string", func_std_string_with_merge):
+            with self.trap_stdout() as io:
+                self.spark.profile.show(type="perf")
+        self.assertIn("Profile of id", io.getvalue())
+        self.assertEqual(2, len(self.profile_results["id"].stats))
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.test_udf_profiler import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

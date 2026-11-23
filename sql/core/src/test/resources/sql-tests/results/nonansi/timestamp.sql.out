@@ -181,6 +181,22 @@ NULL
 
 
 -- !query
+SELECT make_timestamp(1, 1, 1, 1, 1, 4324.967296)
+-- !query schema
+struct<make_timestamp(1, 1, 1, 1, 1, 4324.967296):timestamp>
+-- !query output
+NULL
+
+
+-- !query
+SELECT try_make_timestamp(1, 1, 1, 1, 1, 4324.967296)
+-- !query schema
+struct<try_make_timestamp(1, 1, 1, 1, 1, 4324.967296):timestamp>
+-- !query output
+NULL
+
+
+-- !query
 SELECT make_timestamp(make_date(2021, 07, 11))
 -- !query schema
 struct<make_timestamp(make_date(2021, 7, 11)):timestamp>
@@ -589,8 +605,14 @@ select TIMESTAMP_SECONDS(1230219000123123)
 -- !query schema
 struct<>
 -- !query output
-java.lang.ArithmeticException
-long overflow
+org.apache.spark.SparkArithmeticException
+{
+  "errorClass" : "DATETIME_OVERFLOW",
+  "sqlState" : "22008",
+  "messageParameters" : {
+    "operation" : "create a TIMESTAMP from 1230219000123123L seconds since the epoch"
+  }
+}
 
 
 -- !query
@@ -598,8 +620,14 @@ select TIMESTAMP_SECONDS(-1230219000123123)
 -- !query schema
 struct<>
 -- !query output
-java.lang.ArithmeticException
-long overflow
+org.apache.spark.SparkArithmeticException
+{
+  "errorClass" : "DATETIME_OVERFLOW",
+  "sqlState" : "22008",
+  "messageParameters" : {
+    "operation" : "create a TIMESTAMP from -1230219000123123L seconds since the epoch"
+  }
+}
 
 
 -- !query
@@ -607,8 +635,14 @@ select TIMESTAMP_MILLIS(92233720368547758)
 -- !query schema
 struct<>
 -- !query output
-java.lang.ArithmeticException
-long overflow
+org.apache.spark.SparkArithmeticException
+{
+  "errorClass" : "DATETIME_OVERFLOW",
+  "sqlState" : "22008",
+  "messageParameters" : {
+    "operation" : "create a TIMESTAMP from 92233720368547758L milliseconds since the epoch"
+  }
+}
 
 
 -- !query
@@ -616,8 +650,14 @@ select TIMESTAMP_MILLIS(-92233720368547758)
 -- !query schema
 struct<>
 -- !query output
-java.lang.ArithmeticException
-long overflow
+org.apache.spark.SparkArithmeticException
+{
+  "errorClass" : "DATETIME_OVERFLOW",
+  "sqlState" : "22008",
+  "messageParameters" : {
+    "operation" : "create a TIMESTAMP from -92233720368547758L milliseconds since the epoch"
+  }
+}
 
 
 -- !query
@@ -1011,7 +1051,7 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"2011-11-11 11:11:10\"",
     "inputType" : "\"STRING\"",
     "paramIndex" : "second",
-    "requiredType" : "\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\"",
+    "requiredType" : "(\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\" or \"(TIMESTAMP_LTZ(P) OR TIMESTAMP_NTZ(P) WITH P IN [7, 9])\")",
     "sqlExpr" : "\"(TIMESTAMP '2011-11-11 11:11:11' - 2011-11-11 11:11:10)\""
   },
   "queryContext" : [ {
@@ -1037,7 +1077,7 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"2011-11-11 11:11:11\"",
     "inputType" : "\"STRING\"",
     "paramIndex" : "first",
-    "requiredType" : "\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\"",
+    "requiredType" : "(\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\" or \"(TIMESTAMP_LTZ(P) OR TIMESTAMP_NTZ(P) WITH P IN [7, 9])\")",
     "sqlExpr" : "\"(2011-11-11 11:11:11 - TIMESTAMP '2011-11-11 11:11:10')\""
   },
   "queryContext" : [ {
@@ -1087,7 +1127,7 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"str\"",
     "inputType" : "\"STRING\"",
     "paramIndex" : "first",
-    "requiredType" : "\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\"",
+    "requiredType" : "(\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\" or \"(TIMESTAMP_LTZ(P) OR TIMESTAMP_NTZ(P) WITH P IN [7, 9])\")",
     "sqlExpr" : "\"(str - TIMESTAMP '2011-11-11 11:11:11')\""
   },
   "queryContext" : [ {
@@ -1113,7 +1153,7 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"str\"",
     "inputType" : "\"STRING\"",
     "paramIndex" : "second",
-    "requiredType" : "\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\"",
+    "requiredType" : "(\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\" or \"(TIMESTAMP_LTZ(P) OR TIMESTAMP_NTZ(P) WITH P IN [7, 9])\")",
     "sqlExpr" : "\"(TIMESTAMP '2011-11-11 11:11:11' - str)\""
   },
   "queryContext" : [ {
@@ -1472,6 +1512,23 @@ org.apache.spark.sql.catalyst.parser.ParseException
     "stopIndex" : 64,
     "fragment" : "timestampdiff('YEAR', date'2022-02-15', date'2023-02-15')"
   } ]
+}
+
+
+-- !query
+select timestampdiff(NANOSECOND, timestamp'2022-02-14 01:02:03', timestamp'2022-02-14 01:02:04')
+-- !query schema
+struct<>
+-- !query output
+org.apache.spark.SparkIllegalArgumentException
+{
+  "errorClass" : "INVALID_PARAMETER_VALUE.DATETIME_UNIT",
+  "sqlState" : "22023",
+  "messageParameters" : {
+    "functionName" : "`TIMESTAMPDIFF`",
+    "invalidValue" : "'NANOSECOND'",
+    "parameter" : "`unit`"
+  }
 }
 
 

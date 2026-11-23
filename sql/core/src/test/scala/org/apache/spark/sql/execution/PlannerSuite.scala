@@ -23,6 +23,7 @@ import org.apache.spark.sql.{execution, DataFrame, Row}
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, DeclarativeAggregate, Final}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical.{LocalRelation, LogicalPlan, Range, Repartition, RepartitionOperation, Union}
 import org.apache.spark.sql.catalyst.plans.physical._
@@ -30,7 +31,7 @@ import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanHelper, Disable
 import org.apache.spark.sql.execution.aggregate.{HashAggregateExec, ObjectHashAggregateExec, SortAggregateExec}
 import org.apache.spark.sql.execution.columnar.{InMemoryRelation, InMemoryTableScanExec}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, EnsureRequirements, REPARTITION_BY_COL, ReusedExchangeExec, ShuffleExchangeExec, ShuffleExchangeLike}
-import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, SortMergeJoinExec}
+import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, SortMergeAsOfJoinExec, SortMergeJoinExec}
 import org.apache.spark.sql.execution.reuse.ReuseExchangeAndSubquery
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
@@ -732,16 +733,67 @@ class PlannerSuite extends SharedSparkSession with AdaptiveSparkPlanHelper {
     outputPlan match {
       case SortMergeJoinExec(leftKeys, rightKeys, _, _,
              SortExec(_, _,
-               ShuffleExchangeExec(HashPartitioning(leftPartitioningExpressions, _), _, _, _), _),
+               ShuffleExchangeExec(HashPartitioning(leftPartitioningExpressions, _),
+               _, _, _, _), _),
              SortExec(_, _,
                ShuffleExchangeExec(HashPartitioning(rightPartitioningExpressions, _),
-               _, _, _), _), _) =>
+               _, _, _, _), _), _) =>
         assert(leftKeys === smjExec.leftKeys)
         assert(rightKeys === smjExec.rightKeys)
         assert(leftKeys === leftPartitioningExpressions)
         assert(rightKeys === rightPartitioningExpressions)
       case _ => fail(outputPlan.toString)
     }
+  }
+
+  test("SPARK-59438: as-of join with no equi-keys requires a single partition") {
+    // No equi-keys: distribution is AllTuples, so both sides shuffle to one partition.
+    val asOfExec = SortMergeAsOfJoinExec(
+      leftKeys = Nil,
+      rightKeys = Nil,
+      leftSortExprs = exprA :: Nil,
+      rightSortExprs = exprB :: Nil,
+      asOfCondition = GreaterThanOrEqual(exprA, exprB),
+      direction = Backward,
+      joinType = Inner,
+      condition = None,
+      left = planA,
+      right = planB)
+    assert(asOfExec.requiredChildDistribution == Seq(AllTuples, AllTuples))
+    assert(asOfExec.requiredChildOrdering == Seq(Seq(orderingA), Seq(orderingB)))
+    val outputPlan = EnsureRequirements.apply(asOfExec)
+    assertDistributionRequirementsAreSatisfied(outputPlan)
+    val exchanges = outputPlan.collect { case e: ShuffleExchangeExec => e }
+    assert(exchanges.length == 2, s"Expected a shuffle on each side:\n$outputPlan")
+    assert(exchanges.forall(_.outputPartitioning == SinglePartition),
+      s"Both sides must be shuffled to a single partition:\n$outputPlan")
+  }
+
+  test("SPARK-59438: as-of join with equi-keys hash-partitions on the keys") {
+    // With equi-keys: distribution is Clustered, so each side hash-partitions on its key.
+    val asOfExec = SortMergeAsOfJoinExec(
+      leftKeys = exprC :: Nil,
+      rightKeys = exprC :: Nil,
+      leftSortExprs = exprA :: Nil,
+      rightSortExprs = exprB :: Nil,
+      asOfCondition = GreaterThanOrEqual(exprA, exprB),
+      direction = Backward,
+      joinType = Inner,
+      condition = None,
+      left = planA,
+      right = planB)
+    assert(asOfExec.requiredChildDistribution ==
+      Seq(ClusteredDistribution(exprC :: Nil), ClusteredDistribution(exprC :: Nil)))
+    assert(asOfExec.requiredChildOrdering ==
+      Seq(Seq(orderingC, orderingA), Seq(orderingC, orderingB)))
+    val outputPlan = EnsureRequirements.apply(asOfExec)
+    assertDistributionRequirementsAreSatisfied(outputPlan)
+    val exchanges = outputPlan.collect { case e: ShuffleExchangeExec => e }
+    assert(exchanges.length == 2, s"Expected a shuffle on each side:\n$outputPlan")
+    assert(exchanges.forall(_.outputPartitioning match {
+      case h: HashPartitioning => h.expressions == Seq(exprC)
+      case _ => false
+    }), s"Both sides must hash-partition on the equi-key:\n$outputPlan")
   }
 
   test("SPARK-24500: create union with stream of children") {
@@ -1343,10 +1395,15 @@ class PlannerSuite extends SharedSparkSession with AdaptiveSparkPlanHelper {
 
       val planned = df.queryExecution.executedPlan
 
-      assert(collect(planned) { case h: HashAggregateExec => h }.nonEmpty)
+      // `range(5)` is a single partition sorted by `id`, so the aggregate is a sort aggregate
+      // (the child already satisfies the grouping-key ordering) rather than a hash aggregate.
+      assert(collect(planned) {
+        case h: HashAggregateExec => h
+        case s: SortAggregateExec => s
+      }.nonEmpty)
 
       val exchanges = collect(planned) { case s: ShuffleExchangeExec => s }
-      assert(exchanges.size == 0)
+      assert(exchanges.isEmpty)
     }
   }
 
@@ -1358,10 +1415,15 @@ class PlannerSuite extends SharedSparkSession with AdaptiveSparkPlanHelper {
 
       val planned = df.queryExecution.executedPlan
 
-      assert(collect(planned) { case h: HashAggregateExec => h }.nonEmpty)
+      // `range(5)` is a single partition sorted by `key`, so the aggregate is a sort aggregate
+      // (the child already satisfies the grouping-key ordering) rather than a hash aggregate.
+      assert(collect(planned) {
+        case h: HashAggregateExec => h
+        case s: SortAggregateExec => s
+      }.nonEmpty)
 
       val exchanges = collect(planned) { case s: ShuffleExchangeExec => s }
-      assert(exchanges.size == 0)
+      assert(exchanges.isEmpty)
     }
   }
 
@@ -1583,6 +1645,41 @@ class PlannerSuite extends SharedSparkSession with AdaptiveSparkPlanHelper {
     // Total shuffles: one for df1, one for df2, one for groupBy.
     // The groupBy reuse the output partitioning after DirectShufflePartitionID.
     checkShuffleCount(grouped, 3)
+  }
+
+  test("SPARK-55979: required input attributes are missing from PartialMerge / Final " +
+    "BaseAggregateExec.references") {
+    val scanAggBufferAttr = AttributeReference("buf", IntegerType, nullable = true)()
+    val inputAggBufferAttr = scanAggBufferAttr.withName("renamed_buf")
+
+    case class MyAggregate() extends DeclarativeAggregate {
+      override def children: Seq[Expression] = Nil
+      override def nullable: Boolean = true
+      override def dataType: DataType = IntegerType
+      override def prettyName: String = "test_agg"
+      override val aggBufferAttributes: Seq[AttributeReference] = Seq(scanAggBufferAttr)
+      override lazy val inputAggBufferAttributes: Seq[AttributeReference] =
+        Seq(inputAggBufferAttr)
+      override val initialValues: Seq[Expression] = Seq(Literal(0))
+      override val updateExpressions: Seq[Expression] = Seq(scanAggBufferAttr)
+      override val mergeExpressions: Seq[Expression] = Seq(inputAggBufferAttr)
+      override val evaluateExpression: Expression = scanAggBufferAttr
+      override protected def withNewChildrenInternal(
+        newChildren: IndexedSeq[Expression]): Expression = copy()
+    }
+    val aggregateExpression = AggregateExpression(MyAggregate(), Final, isDistinct = false)
+    val aggregate = HashAggregateExec(
+      requiredChildDistributionExpressions = None,
+      isStreaming = false,
+      numShufflePartitions = None,
+      groupingExpressions = Nil,
+      aggregateExpressions = Seq(aggregateExpression),
+      aggregateAttributes = Seq(aggregateExpression.resultAttribute),
+      initialInputBufferOffset = 0,
+      resultExpressions = Seq(Alias(aggregateExpression, "result")()),
+      child = LocalTableScanExec(Seq(scanAggBufferAttr), Nil, None))
+
+    assert(aggregate.references.contains(inputAggBufferAttr))
   }
 }
 

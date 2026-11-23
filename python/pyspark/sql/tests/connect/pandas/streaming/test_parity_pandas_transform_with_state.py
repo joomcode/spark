@@ -16,10 +16,10 @@
 #
 import unittest
 
+from pyspark import SparkConf
 from pyspark.sql.tests.pandas.streaming.test_pandas_transform_with_state import (
     TransformWithStateInPandasTestsMixin,
 )
-from pyspark import SparkConf
 from pyspark.testing.connectutils import ReusedConnectTestCase
 
 
@@ -54,12 +54,6 @@ class TransformWithStateInPandasParityTests(
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.connect.pandas.streaming.test_parity_pandas_transform_with_state import *  # noqa: F401,E501
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

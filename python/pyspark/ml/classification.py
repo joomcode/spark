@@ -20,88 +20,91 @@ import sys
 import uuid
 import warnings
 from abc import ABCMeta, abstractmethod
-from multiprocessing.pool import ThreadPool
 from functools import cached_property
+from multiprocessing.pool import ThreadPool
 from typing import (
+    TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generic,
     List,
     Optional,
+    Tuple,
     Type,
     TypeVar,
     Union,
     cast,
     overload,
-    TYPE_CHECKING,
-    Tuple,
-    Callable,
 )
 
-from pyspark import keyword_only, since, inheritable_thread_target
-from pyspark.ml import Estimator, Predictor, PredictionModel, Model, functions as MF
+from pyspark import inheritable_thread_target, keyword_only, since
+from pyspark.ml import functions as MF
+from pyspark.ml.base import Estimator, Model, PredictionModel, Predictor, _PredictorParams
+from pyspark.ml.common import inherit_doc
+from pyspark.ml.linalg import Matrix, Vector
 from pyspark.ml.param.shared import (
-    HasRawPredictionCol,
-    HasProbabilityCol,
-    HasThresholds,
-    HasRegParam,
-    HasMaxIter,
-    HasFitIntercept,
-    HasTol,
-    HasStandardization,
-    HasWeightCol,
     HasAggregationDepth,
-    HasThreshold,
     HasBlockSize,
+    HasElasticNetParam,
+    HasFitIntercept,
+    HasIntermediateStorageLevel,
     HasMaxBlockSizeInMB,
+    HasMaxIter,
+    HasParallelism,
+    HasProbabilityCol,
+    HasRawPredictionCol,
+    HasRegParam,
+    HasSeed,
+    HasSolver,
+    HasStandardization,
+    HasStepSize,
+    HasThreshold,
+    HasThresholds,
+    HasTol,
+    HasWeightCol,
     Param,
     Params,
     TypeConverters,
-    HasElasticNetParam,
-    HasSeed,
-    HasStepSize,
-    HasSolver,
-    HasParallelism,
 )
+from pyspark.ml.regression import DecisionTreeRegressionModel, _FactorizationMachinesParams
 from pyspark.ml.tree import (
     _DecisionTreeModel,
     _DecisionTreeParams,
-    _TreeEnsembleModel,
-    _RandomForestParams,
     _GBTParams,
     _HasVarianceImpurity,
+    _RandomForestParams,
     _TreeClassifierParams,
+    _TreeEnsembleModel,
 )
-from pyspark.ml.regression import _FactorizationMachinesParams, DecisionTreeRegressionModel
-from pyspark.ml.base import _PredictorParams
 from pyspark.ml.util import (
     DefaultParamsReader,
     DefaultParamsWriter,
+    HasTrainingSummary,
     JavaMLReadable,
     JavaMLWritable,
     JavaMLWriter,
-    MLReader,
     MLReadable,
-    MLWriter,
+    MLReader,
     MLWritable,
-    HasTrainingSummary,
+    MLWriter,
+    _cache_spark_dataset,
+    try_remote_attribute_relation,
     try_remote_read,
     try_remote_write,
-    try_remote_attribute_relation,
-    _cache_spark_dataset,
 )
-from pyspark.ml.wrapper import JavaParams, JavaPredictor, JavaPredictionModel, JavaWrapper
-from pyspark.ml.common import inherit_doc
-from pyspark.ml.linalg import Matrix, Vector
-from pyspark.sql import DataFrame, Row, SparkSession, functions as F
+from pyspark.ml.wrapper import JavaParams, JavaPredictionModel, JavaPredictor, JavaWrapper
+from pyspark.sql import DataFrame, Row, SparkSession
+from pyspark.sql import functions as F
 from pyspark.sql.internal import InternalFunction as SF
-from pyspark.storagelevel import StorageLevel
 from pyspark.sql.utils import is_remote
+from pyspark.storagelevel import StorageLevel
 
 if TYPE_CHECKING:
-    from pyspark.ml._typing import P, ParamMap
     from py4j.java_gateway import JavaObject
+
     from pyspark.core.context import SparkContext
+    from pyspark.ml._typing import P, ParamMap
 
 
 T = TypeVar("T")
@@ -605,6 +608,7 @@ class _LinearSVCParams(
     HasAggregationDepth,
     HasThreshold,
     HasMaxBlockSizeInMB,
+    HasIntermediateStorageLevel,
 ):
     """
     Params for :py:class:`LinearSVC` and :py:class:`LinearSVCModel`.
@@ -736,12 +740,14 @@ class LinearSVC(
         weightCol: Optional[str] = None,
         aggregationDepth: int = 2,
         maxBlockSizeInMB: float = 0.0,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ):
         """
         __init__(self, \\*, featuresCol="features", labelCol="label", predictionCol="prediction", \
                  maxIter=100, regParam=0.0, tol=1e-6, rawPredictionCol="rawPrediction", \
                  fitIntercept=True, standardization=True, threshold=0.0, weightCol=None, \
-                 aggregationDepth=2, maxBlockSizeInMB=0.0):
+                 aggregationDepth=2, maxBlockSizeInMB=0.0, \
+                 intermediateStorageLevel="MEMORY_AND_DISK"):
         """
         super().__init__()
         self._java_obj = self._new_java_obj(
@@ -768,12 +774,14 @@ class LinearSVC(
         weightCol: Optional[str] = None,
         aggregationDepth: int = 2,
         maxBlockSizeInMB: float = 0.0,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ) -> "LinearSVC":
         """
         setParams(self, \\*, featuresCol="features", labelCol="label", predictionCol="prediction", \
                   maxIter=100, regParam=0.0, tol=1e-6, rawPredictionCol="rawPrediction", \
                   fitIntercept=True, standardization=True, threshold=0.0, weightCol=None, \
-                  aggregationDepth=2, maxBlockSizeInMB=0.0):
+                  aggregationDepth=2, maxBlockSizeInMB=0.0, \
+                  intermediateStorageLevel="MEMORY_AND_DISK"):
         Sets params for Linear SVM Classifier.
         """
         kwargs = self._input_kwargs
@@ -844,6 +852,13 @@ class LinearSVC(
         Sets the value of :py:attr:`maxBlockSizeInMB`.
         """
         return self._set(maxBlockSizeInMB=value)
+
+    @since("4.4.0")
+    def setIntermediateStorageLevel(self, value: str) -> "LinearSVC":
+        """
+        Sets the value of :py:attr:`intermediateStorageLevel`.
+        """
+        return self._set(intermediateStorageLevel=value)
 
 
 class LinearSVCModel(
@@ -950,6 +965,7 @@ class _LogisticRegressionParams(
     HasAggregationDepth,
     HasThreshold,
     HasMaxBlockSizeInMB,
+    HasIntermediateStorageLevel,
 ):
     """
     Params for :py:class:`LogisticRegression` and :py:class:`LogisticRegressionModel`.
@@ -1261,8 +1277,8 @@ class LogisticRegression(
         lowerBoundsOnIntercepts: Optional[Vector] = ...,
         upperBoundsOnIntercepts: Optional[Vector] = ...,
         maxBlockSizeInMB: float = ...,
-    ):
-        ...
+        intermediateStorageLevel: str = ...,
+    ): ...
 
     @overload
     def __init__(
@@ -1288,8 +1304,8 @@ class LogisticRegression(
         lowerBoundsOnIntercepts: Optional[Vector] = ...,
         upperBoundsOnIntercepts: Optional[Vector] = ...,
         maxBlockSizeInMB: float = ...,
-    ):
-        ...
+        intermediateStorageLevel: str = ...,
+    ): ...
 
     @keyword_only
     def __init__(
@@ -1316,6 +1332,7 @@ class LogisticRegression(
         lowerBoundsOnIntercepts: Optional[Vector] = None,
         upperBoundsOnIntercepts: Optional[Vector] = None,
         maxBlockSizeInMB: float = 0.0,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ):
         """
         __init__(self, \\*, featuresCol="features", labelCol="label", predictionCol="prediction", \
@@ -1325,7 +1342,8 @@ class LogisticRegression(
                  aggregationDepth=2, family="auto", \
                  lowerBoundsOnCoefficients=None, upperBoundsOnCoefficients=None, \
                  lowerBoundsOnIntercepts=None, upperBoundsOnIntercepts=None, \
-                 maxBlockSizeInMB=0.0):
+                 maxBlockSizeInMB=0.0, \
+                 intermediateStorageLevel="MEMORY_AND_DISK"):
         If the threshold and thresholds Params are both set, they must be equivalent.
         """
         super().__init__()
@@ -1360,8 +1378,8 @@ class LogisticRegression(
         lowerBoundsOnIntercepts: Optional[Vector] = ...,
         upperBoundsOnIntercepts: Optional[Vector] = ...,
         maxBlockSizeInMB: float = ...,
-    ) -> "LogisticRegression":
-        ...
+        intermediateStorageLevel: str = ...,
+    ) -> "LogisticRegression": ...
 
     @overload
     def setParams(
@@ -1387,8 +1405,8 @@ class LogisticRegression(
         lowerBoundsOnIntercepts: Optional[Vector] = ...,
         upperBoundsOnIntercepts: Optional[Vector] = ...,
         maxBlockSizeInMB: float = ...,
-    ) -> "LogisticRegression":
-        ...
+        intermediateStorageLevel: str = ...,
+    ) -> "LogisticRegression": ...
 
     @keyword_only
     @since("1.3.0")
@@ -1416,6 +1434,7 @@ class LogisticRegression(
         lowerBoundsOnIntercepts: Optional[Vector] = None,
         upperBoundsOnIntercepts: Optional[Vector] = None,
         maxBlockSizeInMB: float = 0.0,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ) -> "LogisticRegression":
         """
         setParams(self, \\*, featuresCol="features", labelCol="label", predictionCol="prediction", \
@@ -1425,7 +1444,8 @@ class LogisticRegression(
                   aggregationDepth=2, family="auto", \
                   lowerBoundsOnCoefficients=None, upperBoundsOnCoefficients=None, \
                   lowerBoundsOnIntercepts=None, upperBoundsOnIntercepts=None, \
-                  maxBlockSizeInMB=0.0):
+                  maxBlockSizeInMB=0.0, \
+                  intermediateStorageLevel="MEMORY_AND_DISK"):
         Sets params for logistic regression.
         If the threshold and thresholds Params are both set, they must be equivalent.
         """
@@ -1526,6 +1546,13 @@ class LogisticRegression(
         Sets the value of :py:attr:`maxBlockSizeInMB`.
         """
         return self._set(maxBlockSizeInMB=value)
+
+    @since("4.4.0")
+    def setIntermediateStorageLevel(self, value: str) -> "LogisticRegression":
+        """
+        Sets the value of :py:attr:`intermediateStorageLevel`.
+        """
+        return self._set(intermediateStorageLevel=value)
 
 
 class LogisticRegressionModel(
@@ -1682,6 +1709,7 @@ class _DecisionTreeClassifierParams(_DecisionTreeParams, _TreeClassifierParams):
             maxBins=32,
             minInstancesPerNode=1,
             minInfoGain=0.0,
+            pruneTree=True,
             maxMemoryInMB=256,
             cacheNodeIds=False,
             checkpointInterval=10,
@@ -1793,6 +1821,7 @@ class DecisionTreeClassifier(
         maxBins: int = 32,
         minInstancesPerNode: int = 1,
         minInfoGain: float = 0.0,
+        pruneTree: bool = True,
         maxMemoryInMB: int = 256,
         cacheNodeIds: bool = False,
         checkpointInterval: int = 10,
@@ -1801,13 +1830,15 @@ class DecisionTreeClassifier(
         weightCol: Optional[str] = None,
         leafCol: str = "",
         minWeightFractionPerNode: float = 0.0,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ):
         """
         __init__(self, \\*, featuresCol="features", labelCol="label", predictionCol="prediction", \
                  probabilityCol="probability", rawPredictionCol="rawPrediction", \
-                 maxDepth=5, maxBins=32, minInstancesPerNode=1, minInfoGain=0.0, \
+                 maxDepth=5, maxBins=32, minInstancesPerNode=1, minInfoGain=0.0, pruneTree=True, \
                  maxMemoryInMB=256, cacheNodeIds=False, checkpointInterval=10, impurity="gini", \
-                 seed=None, weightCol=None, leafCol="", minWeightFractionPerNode=0.0)
+                 seed=None, weightCol=None, leafCol="", minWeightFractionPerNode=0.0, \
+                 intermediateStorageLevel="MEMORY_AND_DISK")
         """
         super().__init__()
         self._java_obj = self._new_java_obj(
@@ -1830,6 +1861,7 @@ class DecisionTreeClassifier(
         maxBins: int = 32,
         minInstancesPerNode: int = 1,
         minInfoGain: float = 0.0,
+        pruneTree: bool = True,
         maxMemoryInMB: int = 256,
         cacheNodeIds: bool = False,
         checkpointInterval: int = 10,
@@ -1838,13 +1870,15 @@ class DecisionTreeClassifier(
         weightCol: Optional[str] = None,
         leafCol: str = "",
         minWeightFractionPerNode: float = 0.0,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ) -> "DecisionTreeClassifier":
         """
         setParams(self, \\*, featuresCol="features", labelCol="label", predictionCol="prediction", \
                   probabilityCol="probability", rawPredictionCol="rawPrediction", \
-                  maxDepth=5, maxBins=32, minInstancesPerNode=1, minInfoGain=0.0, \
+                  maxDepth=5, maxBins=32, minInstancesPerNode=1, minInfoGain=0.0, pruneTree=True, \
                   maxMemoryInMB=256, cacheNodeIds=False, checkpointInterval=10, impurity="gini", \
-                  seed=None, weightCol=None, leafCol="", minWeightFractionPerNode=0.0)
+                  seed=None, weightCol=None, leafCol="", minWeightFractionPerNode=0.0, \
+                  intermediateStorageLevel="MEMORY_AND_DISK")
         Sets params for the DecisionTreeClassifier.
         """
         kwargs = self._input_kwargs
@@ -1864,6 +1898,13 @@ class DecisionTreeClassifier(
         Sets the value of :py:attr:`maxBins`.
         """
         return self._set(maxBins=value)
+
+    @since("4.3.0")
+    def setPruneTree(self, value: bool) -> "DecisionTreeClassifier":
+        """
+        Sets the value of :py:attr:`pruneTree`.
+        """
+        return self._set(pruneTree=value)
 
     def setMinInstancesPerNode(self, value: int) -> "DecisionTreeClassifier":
         """
@@ -1909,6 +1950,13 @@ class DecisionTreeClassifier(
         Sets the value of :py:attr:`checkpointInterval`.
         """
         return self._set(checkpointInterval=value)
+
+    @since("4.4.0")
+    def setIntermediateStorageLevel(self, value: str) -> "DecisionTreeClassifier":
+        """
+        Sets the value of :py:attr:`intermediateStorageLevel`.
+        """
+        return self._set(intermediateStorageLevel=value)
 
     def setSeed(self, value: int) -> "DecisionTreeClassifier":
         """
@@ -1976,6 +2024,7 @@ class _RandomForestClassifierParams(_RandomForestParams, _TreeClassifierParams):
             maxBins=32,
             minInstancesPerNode=1,
             minInfoGain=0.0,
+            pruneTree=True,
             maxMemoryInMB=256,
             cacheNodeIds=False,
             checkpointInterval=10,
@@ -2085,6 +2134,7 @@ class RandomForestClassifier(
         maxBins: int = 32,
         minInstancesPerNode: int = 1,
         minInfoGain: float = 0.0,
+        pruneTree: bool = True,
         maxMemoryInMB: int = 256,
         cacheNodeIds: bool = False,
         checkpointInterval: int = 10,
@@ -2097,14 +2147,16 @@ class RandomForestClassifier(
         minWeightFractionPerNode: float = 0.0,
         weightCol: Optional[str] = None,
         bootstrap: Optional[bool] = True,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ):
         """
         __init__(self, \\*, featuresCol="features", labelCol="label", predictionCol="prediction", \
                  probabilityCol="probability", rawPredictionCol="rawPrediction", \
-                 maxDepth=5, maxBins=32, minInstancesPerNode=1, minInfoGain=0.0, \
+                 maxDepth=5, maxBins=32, minInstancesPerNode=1, minInfoGain=0.0, pruneTree=True, \
                  maxMemoryInMB=256, cacheNodeIds=False, checkpointInterval=10, impurity="gini", \
                  numTrees=20, featureSubsetStrategy="auto", seed=None, subsamplingRate=1.0, \
-                 leafCol="", minWeightFractionPerNode=0.0, weightCol=None, bootstrap=True)
+                 leafCol="", minWeightFractionPerNode=0.0, weightCol=None, bootstrap=True, \
+                 intermediateStorageLevel="MEMORY_AND_DISK")
         """
         super().__init__()
         self._java_obj = self._new_java_obj(
@@ -2127,6 +2179,7 @@ class RandomForestClassifier(
         maxBins: int = 32,
         minInstancesPerNode: int = 1,
         minInfoGain: float = 0.0,
+        pruneTree: bool = True,
         maxMemoryInMB: int = 256,
         cacheNodeIds: bool = False,
         checkpointInterval: int = 10,
@@ -2139,14 +2192,16 @@ class RandomForestClassifier(
         minWeightFractionPerNode: float = 0.0,
         weightCol: Optional[str] = None,
         bootstrap: Optional[bool] = True,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ) -> "RandomForestClassifier":
         """
         setParams(self, featuresCol="features", labelCol="label", predictionCol="prediction", \
                  probabilityCol="probability", rawPredictionCol="rawPrediction", \
-                  maxDepth=5, maxBins=32, minInstancesPerNode=1, minInfoGain=0.0, \
+                  maxDepth=5, maxBins=32, minInstancesPerNode=1, minInfoGain=0.0, pruneTree=True, \
                   maxMemoryInMB=256, cacheNodeIds=False, checkpointInterval=10, seed=None, \
                   impurity="gini", numTrees=20, featureSubsetStrategy="auto", subsamplingRate=1.0, \
-                  leafCol="", minWeightFractionPerNode=0.0, weightCol=None, bootstrap=True)
+                  leafCol="", minWeightFractionPerNode=0.0, weightCol=None, bootstrap=True, \
+                  intermediateStorageLevel="MEMORY_AND_DISK")
         Sets params for linear classification.
         """
         kwargs = self._input_kwargs
@@ -2166,6 +2221,13 @@ class RandomForestClassifier(
         Sets the value of :py:attr:`maxBins`.
         """
         return self._set(maxBins=value)
+
+    @since("4.3.0")
+    def setPruneTree(self, value: bool) -> "RandomForestClassifier":
+        """
+        Sets the value of :py:attr:`pruneTree`.
+        """
+        return self._set(pruneTree=value)
 
     def setMinInstancesPerNode(self, value: int) -> "RandomForestClassifier":
         """
@@ -2238,6 +2300,13 @@ class RandomForestClassifier(
         """
         return self._set(checkpointInterval=value)
 
+    @since("4.4.0")
+    def setIntermediateStorageLevel(self, value: str) -> "RandomForestClassifier":
+        """
+        Sets the value of :py:attr:`intermediateStorageLevel`.
+        """
+        return self._set(intermediateStorageLevel=value)
+
     @since("3.0.0")
     def setWeightCol(self, value: str) -> "RandomForestClassifier":
         """
@@ -2253,7 +2322,7 @@ class RandomForestClassifier(
         return self._set(minWeightFractionPerNode=value)
 
 
-class RandomForestClassificationModel(
+class RandomForestClassificationModel(  # type: ignore[misc]
     _TreeEnsembleModel,
     _JavaProbabilisticClassificationModel[Vector],
     _RandomForestClassifierParams,
@@ -2567,6 +2636,7 @@ class GBTClassifier(
         leafCol: str = "",
         minWeightFractionPerNode: float = 0.0,
         weightCol: Optional[str] = None,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ):
         """
         __init__(self, \\*, featuresCol="features", labelCol="label", predictionCol="prediction", \
@@ -2575,7 +2645,8 @@ class GBTClassifier(
                  lossType="logistic", maxIter=20, stepSize=0.1, seed=None, subsamplingRate=1.0, \
                  impurity="variance", featureSubsetStrategy="all", validationTol=0.01, \
                  validationIndicatorCol=None, leafCol="", minWeightFractionPerNode=0.0, \
-                 weightCol=None)
+                 weightCol=None, \
+                 intermediateStorageLevel="MEMORY_AND_DISK")
         """
         super().__init__()
         self._java_obj = self._new_java_obj(
@@ -2611,6 +2682,7 @@ class GBTClassifier(
         leafCol: str = "",
         minWeightFractionPerNode: float = 0.0,
         weightCol: Optional[str] = None,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ) -> "GBTClassifier":
         """
         setParams(self, \\*, featuresCol="features", labelCol="label", predictionCol="prediction", \
@@ -2619,7 +2691,8 @@ class GBTClassifier(
                   lossType="logistic", maxIter=20, stepSize=0.1, seed=None, subsamplingRate=1.0, \
                   impurity="variance", featureSubsetStrategy="all", validationTol=0.01, \
                   validationIndicatorCol=None, leafCol="", minWeightFractionPerNode=0.0, \
-                  weightCol=None)
+                  weightCol=None, \
+                  intermediateStorageLevel="MEMORY_AND_DISK")
         Sets params for Gradient Boosted Tree Classification.
         """
         kwargs = self._input_kwargs
@@ -2712,6 +2785,13 @@ class GBTClassifier(
         Sets the value of :py:attr:`checkpointInterval`.
         """
         return self._set(checkpointInterval=value)
+
+    @since("4.4.0")
+    def setIntermediateStorageLevel(self, value: str) -> "GBTClassifier":
+        """
+        Sets the value of :py:attr:`intermediateStorageLevel`.
+        """
+        return self._set(intermediateStorageLevel=value)
 
     @since("1.4.0")
     def setSeed(self, value: int) -> "GBTClassifier":
@@ -3569,7 +3649,7 @@ class OneVsRest(
                 weightCol = self.getWeightCol()
             else:
                 warnings.warn(
-                    "weightCol is ignored, " "as it is not supported by {} now.".format(classifier)
+                    "weightCol is ignored, as it is not supported by {} now.".format(classifier)
                 )
 
         if weightCol:
@@ -4024,6 +4104,7 @@ class OneVsRestModelWriter(MLWriter):
 class FMClassifier(
     _JavaProbabilisticClassifier["FMClassificationModel"],
     _FactorizationMachinesParams,
+    HasIntermediateStorageLevel,
     JavaMLWritable,
     JavaMLReadable["FMClassifier"],
 ):
@@ -4111,13 +4192,15 @@ class FMClassifier(
         solver: str = "adamW",
         thresholds: Optional[List[float]] = None,
         seed: Optional[int] = None,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ):
         """
         __init__(self, \\*, featuresCol="features", labelCol="label", predictionCol="prediction", \
                  probabilityCol="probability", rawPredictionCol="rawPrediction", \
                  factorSize=8, fitIntercept=True, fitLinear=True, regParam=0.0, \
                  miniBatchFraction=1.0, initStd=0.01, maxIter=100, stepSize=1.0, \
-                 tol=1e-6, solver="adamW", thresholds=None, seed=None)
+                 tol=1e-6, solver="adamW", thresholds=None, seed=None, \
+                 intermediateStorageLevel="MEMORY_AND_DISK")
         """
         super().__init__()
         self._java_obj = self._new_java_obj(
@@ -4148,13 +4231,15 @@ class FMClassifier(
         solver: str = "adamW",
         thresholds: Optional[List[float]] = None,
         seed: Optional[int] = None,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ) -> "FMClassifier":
         """
         setParams(self, \\*, featuresCol="features", labelCol="label", predictionCol="prediction", \
                   probabilityCol="probability", rawPredictionCol="rawPrediction", \
                   factorSize=8, fitIntercept=True, fitLinear=True, regParam=0.0, \
                   miniBatchFraction=1.0, initStd=0.01, maxIter=100, stepSize=1.0, \
-                  tol=1e-6, solver="adamW", thresholds=None, seed=None)
+                  tol=1e-6, solver="adamW", thresholds=None, seed=None, \
+                  intermediateStorageLevel="MEMORY_AND_DISK")
         Sets Params for FMClassifier.
         """
         kwargs = self._input_kwargs
@@ -4240,10 +4325,18 @@ class FMClassifier(
         """
         return self._set(regParam=value)
 
+    @since("4.4.0")
+    def setIntermediateStorageLevel(self, value: str) -> "FMClassifier":
+        """
+        Sets the value of :py:attr:`intermediateStorageLevel`.
+        """
+        return self._set(intermediateStorageLevel=value)
+
 
 class FMClassificationModel(
     _JavaProbabilisticClassificationModel[Vector],
     _FactorizationMachinesParams,
+    HasIntermediateStorageLevel,
     JavaMLWritable,
     JavaMLReadable["FMClassificationModel"],
     HasTrainingSummary,
@@ -4336,6 +4429,7 @@ class FMClassificationTrainingSummary(FMClassificationSummary, _TrainingSummary)
 
 if __name__ == "__main__":
     import doctest
+
     import pyspark.ml.classification
     from pyspark.sql import SparkSession
 
@@ -4351,7 +4445,7 @@ if __name__ == "__main__":
     temp_path = tempfile.mkdtemp()
     globs["temp_path"] = temp_path
     try:
-        (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+        failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
         spark.stop()
     finally:
         from shutil import rmtree

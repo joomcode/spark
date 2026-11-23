@@ -86,14 +86,14 @@ object Encoders {
    *
    * @since 4.0.0
    */
-  def CHAR(length: Int): Encoder[java.lang.String] = CharEncoder(length)
+  def CHAR(length: Int): Encoder[java.lang.String] = CharEncoder(CharType(length))
 
   /**
    * An encoder for nullable varchar type.
    *
    * @since 4.0.0
    */
-  def VARCHAR(length: Int): Encoder[java.lang.String] = VarcharEncoder(length)
+  def VARCHAR(length: Int): Encoder[java.lang.String] = VarcharEncoder(VarcharType(length))
 
   /**
    * An encoder for nullable string type.
@@ -153,7 +153,7 @@ object Encoders {
    *
    * @since 4.1.0
    */
-  def LOCALTIME: Encoder[java.time.LocalTime] = LocalTimeEncoder
+  def LOCALTIME: Encoder[java.time.LocalTime] = DEFAULT_LOCAL_TIME_ENCODER
 
   /**
    * An encoder for arrays of bytes.
@@ -195,7 +195,7 @@ object Encoders {
   /**
    * Creates an encoder for Java Bean of type T.
    *
-   * T must be publicly accessible.
+   * T must be a concrete class (not an interface), and must be publicly accessible.
    *
    * supported types for java bean field:
    *   - primitive types: boolean, int, double, etc.

@@ -23,14 +23,15 @@ import java.sql.{Date, Timestamp}
 import scala.reflect.runtime.universe.runtimeMirror
 import scala.util.Random
 
-import org.apache.spark.{QueryContextType, SPARK_DOC_ROOT, SparkException, SparkRuntimeException}
+import org.apache.spark.{QueryContextType, SPARK_DOC_ROOT, SparkArrayIndexOutOfBoundsException, SparkException, SparkRuntimeException}
 import org.apache.spark.sql.catalyst.{ExtendedAnalysisException, InternalRow}
 import org.apache.spark.sql.catalyst.analysis.FunctionRegistry
-import org.apache.spark.sql.catalyst.expressions.{Expression, Literal, UnaryExpression}
+import org.apache.spark.sql.catalyst.expressions.{ArrayExists, Expression, Literal, UnaryExpression}
 import org.apache.spark.sql.catalyst.expressions.Cast._
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
 import org.apache.spark.sql.catalyst.plans.logical.OneRowRelation
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.{withDefaultTimeZone, UTC}
+import org.apache.spark.sql.execution.WholeStageCodegenExec
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
@@ -41,7 +42,7 @@ import org.apache.spark.tags.ExtendedSQLTest
  * Test suite for functions in [[org.apache.spark.sql.functions]].
  */
 @ExtendedSQLTest
-class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
+class DataFrameFunctionsSuite extends SharedSparkSession {
   import testImplicits._
 
   test("DataFrame function and SQL function parity") {
@@ -83,6 +84,7 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
       "bucket", "days", "hours", "months", "years", // Datasource v2 partition transformations
       "product", // Discussed in https://github.com/apache/spark/pull/30745
       "unwrap_udt",
+      "wrap_udt",
       "timestamp_add",
       "timestamp_diff"
     )
@@ -350,6 +352,44 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
            "expression" -> "\"id\"",
            "expressionAnyValue" -> "\"any_value(id)\"")
         )
+
+        val nestedDf = Seq("error_multiple_providers", "openai")
+          .toDF("provider")
+          .select(struct(col("provider")).as("c"))
+        checkAnswer(
+          nestedDf.select(nullif(col("c.provider"), lower(lit("ERROR_MULTIPLE_PROVIDERS")))),
+          Seq(Row(null), Row("openai")))
+      }
+    }
+  }
+
+  test("nullif keeps the coerced type of its first argument") {
+    Seq(true, false).foreach { alwaysInlineCommonExpr =>
+      Seq(true, false).foreach { ansiEnabled =>
+        withSQLConf(
+          SQLConf.ALWAYS_INLINE_COMMON_EXPR.key -> alwaysInlineCommonExpr.toString,
+          SQLConf.ANSI_ENABLED.key -> ansiEnabled.toString,
+          SQLConf.CONCAT_BINARY_AS_STRING.key -> "true") {
+          // The analyzers apply different comparison coercions to binary concat. Exercise result
+          // typing under each analyzer independently. Pure single-pass does not support the RDD
+          // deserialization check performed by the suite's checkAnswer helper.
+          Seq(false, true).foreach { singlePassResolverEnabled =>
+            withSQLConf(
+              SQLConf.ANALYZER_DUAL_RUN_LEGACY_AND_SINGLE_PASS_RESOLVER.key -> "false",
+              SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED_TENTATIVELY.key -> "false",
+              SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key ->
+                singlePassResolverEnabled.toString) {
+              QueryTest.checkAnswer(
+                sql("SELECT nullif(concat(X'61', X'62'), 'z')"),
+                Row("ab") :: Nil,
+                checkToRDD = false)
+            }
+          }
+
+          val result = sql("SELECT nullif(1, 2.1D)")
+          checkAnswer(result, Row(1))
+          assert(result.schema.head.dataType == IntegerType)
+        }
       }
     }
   }
@@ -483,6 +523,23 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
         "inputType" -> "integer",
         "inputExpr" -> "\"a\"",
         "sqlExpr" -> "\"randstr(a, 10)\""),
+      context = ExpectedContext(
+        contextType = QueryContextType.DataFrame,
+        fragment = "randstr",
+        objectType = "",
+        objectName = "",
+        callSitePattern = "",
+        startIndex = 0,
+        stopIndex = 0))
+    expr = randstr(lit(-1), lit(0))
+    checkError(
+      intercept[AnalysisException](df.select(expr)),
+      condition = "DATATYPE_MISMATCH.VALUE_OUT_OF_RANGE",
+      parameters = Map(
+        "sqlExpr" -> "\"randstr(-1, 0)\"",
+        "exprName" -> "`length`",
+        "valueRange" -> "[0, 2147483647]",
+        "currentValue" -> "-1"),
       context = ExpectedContext(
         contextType = QueryContextType.DataFrame,
         fragment = "randstr",
@@ -654,6 +711,42 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
     checkAnswer(
       df.selectExpr("crc32(a)", "crc32(b)"),
       Row(2743272264L, 2180413220L))
+  }
+
+  test("misc xxh3_64 and xxh3_128 function") {
+    val df = Seq(("ABC", Array[Byte](1, 2, 3, 4, 5, 6))).toDF("a", "b")
+    checkAnswer(
+      df.select(xxh3_64($"a"), xxh3_64($"b")),
+      Row(2615927343983396622L, -4044731995552965649L))
+    checkAnswer(
+      df.select(xxh3_128($"a"), xxh3_128($"b")),
+      Row("9e947f00ecd6acb2244da40f405c870e", "866737830f560dbf3e1f439d2d785f44"))
+
+    checkAnswer(
+      df.selectExpr("xxh3_64(a)", "xxh3_64(b)"),
+      Row(2615927343983396622L, -4044731995552965649L))
+    checkAnswer(
+      df.selectExpr("xxh3_128(a)", "xxh3_128(b)"),
+      Row("9e947f00ecd6acb2244da40f405c870e", "866737830f560dbf3e1f439d2d785f44"))
+  }
+
+  test("SPARK-61770: misc farm_fingerprint function") {
+    val df = Seq(("ABC", Array[Byte](1, 2, 3, 4, 5, 6)), (null, null))
+      .toDF("a", "b")
+    val expected = Seq(Row(228873345217803866L, 8673355959317488908L), Row(null, null))
+    checkAnswer(df.select(farm_fingerprint($"a"), farm_fingerprint($"b")), expected)
+    checkAnswer(df.selectExpr("farm_fingerprint(a)", "farm_fingerprint(b)"), expected)
+    // A string and its UTF-8 bytes produce the same fingerprint.
+    checkAnswer(
+      df.filter($"a".isNotNull).select(farm_fingerprint($"a".cast("binary"))),
+      Row(228873345217803866L))
+    // Non-ASCII text is hashed as UTF-8: the CJK string U+6570 U+636E, same value as its bytes.
+    val cjk = new String(Array(0x6570, 0x636e), 0, 2)
+    checkAnswer(Seq(cjk).toDF("s").select(farm_fingerprint($"s")), Row(-7555523796863189993L))
+    // Collation is ignored: 'ABC' under UTF8_LCASE hashes like plain 'ABC', not like 'abc'.
+    checkAnswer(
+      sql("SELECT farm_fingerprint('ABC' COLLATE UTF8_LCASE), farm_fingerprint('abc')"),
+      Row(228873345217803866L, 2640714258260161385L))
   }
 
   test("misc aes function") {
@@ -1360,6 +1453,94 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
     checkAnswer(res, Row(Seq(Row(1, 3), Row(2, 4))))
   }
 
+  testWithWholeStageCodegenOnAndOff("arrays_zip with map key expressions") { codegen =>
+    val factoryMode = if (codegen.toBoolean) "CODEGEN_ONLY" else "NO_CODEGEN"
+    withSQLConf(SQLConf.CODEGEN_FACTORY_MODE.key -> factoryMode) {
+      def checkZip(result: DataFrame, names: Seq[String], expected: Seq[Row]): Unit = {
+        val fields = names.map(StructField(_, IntegerType, nullable = true))
+        val expectedSchema = StructType(Seq(StructField(
+          "zipped", ArrayType(StructType(fields), containsNull = false), nullable = true)))
+        assert(result.schema === expectedSchema)
+        checkAnswer(result, expected)
+      }
+
+      // Range keeps the map values and key selection from becoming a local relation.
+      val df = spark.range(2).selectExpr(
+        "map('temp', array(cast(id as int) + 1, cast(id as int) + 2), " +
+          "'hum', array(3, 4)) as readings",
+        "if(id = 0, 'temp', 'hum') as metric")
+      val dynamicRows = Seq(
+        Row(Seq(Row(1, 3), Row(2, 4))),
+        Row(Seq(Row(3, 3), Row(4, 4))))
+      val tempRows = Seq(
+        Row(Seq(Row(1, 3), Row(2, 4))),
+        Row(Seq(Row(2, 3), Row(3, 4))))
+
+      checkZip(
+        df.selectExpr("arrays_zip(readings[metric], readings['hum']) as zipped"),
+        Seq("0", "hum"), dynamicRows)
+      checkZip(
+        df.selectExpr("arrays_zip(readings[concat('te', 'mp')], readings['hum']) as zipped"),
+        Seq("0", "hum"), tempRows)
+      checkZip(
+        df.selectExpr("arrays_zip(readings[cast(null as string)], readings['hum']) as zipped"),
+        Seq("0", "hum"), Seq(Row(null), Row(null)))
+      checkZip(
+        df.selectExpr("arrays_zip(readings['temp'], readings.hum) as zipped"),
+        Seq("temp", "hum"), tempRows)
+      checkZip(
+        df.select(arrays_zip(expr("readings[metric]").as("selected"),
+          expr("readings['hum']")).as("zipped")),
+        Seq("selected", "hum"), dynamicRows)
+
+      val typedKeyRows = Seq(
+        Row(Seq(Row(1), Row(2))),
+        Row(Seq(Row(2), Row(3))))
+      Seq("1", "DATE '2020-01-02'", "TIMESTAMP '2020-01-02 03:04:05'", "X'CAFE'")
+        .foreach { key =>
+          withClue(s"map key: $key") {
+            val typedMap = spark.range(2).selectExpr(
+              s"map($key, array(cast(id as int) + 1, cast(id as int) + 2)) as readings")
+            checkZip(typedMap.selectExpr(s"arrays_zip(readings[$key]) as zipped"),
+              Seq("0"), typedKeyRows)
+          }
+        }
+    }
+  }
+
+  test("arrays_zip with implicitly collated map keys in views") {
+    withSQLConf(
+      SQLConf.ANALYZER_DUAL_RUN_LEGACY_AND_SINGLE_PASS_RESOLVER.key -> "false",
+      SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key -> "false",
+      SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED_TENTATIVELY.key -> "false") {
+      withTable("arrays_zip_names_table") {
+        sql("CREATE TABLE arrays_zip_names_table " +
+          "(m MAP<STRING COLLATE UTF8_BINARY, ARRAY<INT>>) USING parquet")
+        sql("INSERT INTO arrays_zip_names_table VALUES (map('a', array(1)))")
+        // The view's default collation adds a cast even to the direct literal key.
+        withView("arrays_zip_names_view") {
+          sql("CREATE VIEW arrays_zip_names_view DEFAULT COLLATION UTF8_LCASE AS " +
+            "SELECT to_json(arrays_zip(m['a'])) AS x FROM arrays_zip_names_table")
+          Seq((false, false), (false, true), (true, false)).foreach {
+            case (singlePass, tentative) =>
+              withSQLConf(
+                SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key -> singlePass.toString,
+                SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED_TENTATIVELY.key ->
+                  tentative.toString) {
+                withClue(s"singlePass=$singlePass, tentative=$tentative") {
+                  // Forced single-pass analysis does not support RDD deserialization.
+                  QueryTest.checkAnswer(
+                    sql("SELECT x FROM arrays_zip_names_view"),
+                    Row("""[{"0":1}]""") :: Nil,
+                    checkToRDD = false)
+                }
+              }
+          }
+        }
+      }
+    }
+  }
+
   def testSizeOfMap(sizeOfNull: Any): Unit = {
     val df = Seq(
       (Map[Int, Int](1 -> 1, 2 -> 2), "x"),
@@ -1986,6 +2167,40 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
     )
   }
 
+  test("array_join with nullable nullReplacement under whole-stage codegen") {
+    // With a nullable nullReplacement column and an upstream IsNotNull
+    // filter that tightens the array (and delimiter) to non-nullable, whole-stage codegen used to
+    // build the joined string but leave ev.isNull = true, discarding every row as NULL. The result
+    // must match interpreted eval(). The source is materialized via a cached temp view (an
+    // InMemoryRelation), so the plan is not folded to interpreted eval by ConvertToLocalRelation.
+    withTempView("array_join_codegen") {
+      Seq(
+        (Seq[String]("a", null, "b"), ",", "NR"),
+        (Seq[String]("a", null, "b"), ",", null),
+        (Seq[String]("x", "y"), "-", "NR")
+      ).toDF("arr", "delim_col", "repl_col").createOrReplaceTempView("array_join_codegen")
+      spark.catalog.cacheTable("array_join_codegen")
+
+      val query =
+        "SELECT array_join(arr, delim_col, repl_col) FROM array_join_codegen " +
+          "WHERE arr IS NOT NULL AND delim_col IS NOT NULL"
+
+      withSQLConf(SQLConf.CODEGEN_FACTORY_MODE.key -> "CODEGEN_ONLY") {
+        val df = sql(query)
+        assert(
+          df.queryExecution.executedPlan.exists(_.isInstanceOf[WholeStageCodegenExec]),
+          "expected the array_join query to run inside whole-stage codegen")
+        checkAnswer(df, Seq(Row("a,NR,b"), Row(null), Row("x-y")))
+      }
+
+      withSQLConf(
+          SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
+          SQLConf.CODEGEN_FACTORY_MODE.key -> "NO_CODEGEN") {
+        checkAnswer(sql(query), Seq(Row("a,NR,b"), Row(null), Row("x-y")))
+      }
+    }
+  }
+
   test("array_min function") {
     val df = Seq(
       Seq[Option[Int]](Some(1), Some(3), Some(2)),
@@ -2086,6 +2301,9 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
         Timestamp.valueOf("2018-01-02 00:00:00")))))
 
     // test invalid data types
+    val nanosSeqStartType =
+      "(\"TIMESTAMP\" or \"TIMESTAMP_NTZ\" or " +
+        "\"(TIMESTAMP_LTZ(P) OR TIMESTAMP_NTZ(P) WITH P IN [7, 9])\" or \"DATE\")"
     checkError(
       exception = intercept[AnalysisException] {
         Seq((true, false)).toDF().selectExpr("sequence(_1, _2)")
@@ -2094,7 +2312,7 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
       parameters = Map(
         "sqlExpr" -> "\"sequence(_1, _2)\"",
         "functionName" -> "`sequence`",
-        "startType" -> "(\"TIMESTAMP\" or \"TIMESTAMP_NTZ\" or \"DATE\")",
+        "startType" -> nanosSeqStartType,
         "stepType" -> "(\"INTERVAL\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL DAY TO SECOND\")",
         "otherStartType" -> "\"INTEGRAL\""
       ),
@@ -2108,7 +2326,7 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
       parameters = Map(
         "sqlExpr" -> "\"sequence(_1, _2, _3)\"",
         "functionName" -> "`sequence`",
-        "startType" -> "(\"TIMESTAMP\" or \"TIMESTAMP_NTZ\" or \"DATE\")",
+        "startType" -> nanosSeqStartType,
         "stepType" -> "(\"INTERVAL\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL DAY TO SECOND\")",
         "otherStartType" -> "\"INTEGRAL\""
       ),
@@ -2122,7 +2340,7 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
       parameters = Map(
         "sqlExpr" -> "\"sequence(_1, _2, _3)\"",
         "functionName" -> "`sequence`",
-        "startType" -> "(\"TIMESTAMP\" or \"TIMESTAMP_NTZ\" or \"DATE\")",
+        "startType" -> nanosSeqStartType,
         "stepType" -> "(\"INTERVAL\" or \"INTERVAL YEAR TO MONTH\" or \"INTERVAL DAY TO SECOND\")",
         "otherStartType" -> "\"INTEGRAL\""
       ),
@@ -2145,6 +2363,45 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
     // Test with cached relation, the Project will be evaluated with codegen
     oneRowDF.cache()
     testString()
+  }
+
+  test("reverse function - binary") {
+    val df = Seq(
+      Array[Byte](0xCA.toByte, 0xFE.toByte),
+      Array[Byte](),
+      Array[Byte](0x01.toByte),
+      null
+    ).toDF("b")
+
+    def testBinary(): Unit = {
+      checkAnswer(
+        df.select(reverse($"b")),
+        Seq(
+          Row(Array[Byte](0xFE.toByte, 0xCA.toByte)),
+          Row(Array[Byte]()),
+          Row(Array[Byte](0x01.toByte)),
+          Row(null)))
+      checkAnswer(
+        df.selectExpr("reverse(b)"),
+        Seq(
+          Row(Array[Byte](0xFE.toByte, 0xCA.toByte)),
+          Row(Array[Byte]()),
+          Row(Array[Byte](0x01.toByte)),
+          Row(null)))
+    }
+
+    testBinary()
+    df.cache()
+    testBinary()
+
+    // Verify that reverse preserves BinaryType and does not cast to StringType
+    val resultType = df.select(reverse($"b")).schema.head.dataType
+    assert(resultType === BinaryType,
+      s"reverse on BinaryType column should return BinaryType, but got $resultType")
+    df.createOrReplaceTempView("binary_test")
+    val sqlResultType = spark.sql("SELECT reverse(b) FROM binary_test").schema.head.dataType
+    assert(sqlResultType === BinaryType,
+      s"reverse(b) via SQL should return BinaryType, but got $sqlResultType")
   }
 
   test("reverse function - array for primitive type not containing null") {
@@ -2240,7 +2497,7 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
         "paramIndex" -> "first",
         "inputSql" -> "\"struct(1, a)\"",
         "inputType" -> "\"STRUCT<col1: INT NOT NULL, col2: STRING NOT NULL>\"",
-        "requiredType" -> "(\"STRING\" or \"ARRAY\")"
+        "requiredType" -> "(\"STRING\" or \"BINARY\" or \"ARRAY\")"
       ),
       queryContext = Array(ExpectedContext("", "", 7, 29, "reverse(struct(1, 'a'))"))
     )
@@ -2255,7 +2512,7 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
         "paramIndex" -> "first",
         "inputSql" -> "\"map(1, a)\"",
         "inputType" -> "\"MAP<INT, STRING>\"",
-        "requiredType" -> "(\"STRING\" or \"ARRAY\")"
+        "requiredType" -> "(\"STRING\" or \"BINARY\" or \"ARRAY\")"
       ),
       queryContext = Array(ExpectedContext("", "", 7, 26, "reverse(map(1, 'a'))"))
     )
@@ -2384,6 +2641,48 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
       ),
       queryContext = Array(ExpectedContext("", "", 0, 28, "array_position(array(1), '1')"))
     )
+  }
+
+  test("SPARK-59992: coalesce over element_at with a null index is not simplified away") {
+    // Under ANSI, element_at was marked non-nullable for a non-null array regardless of the
+    // index, so the optimizer dropped the coalesce and the null index leaked through.
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+      checkAnswer(
+        sql("SELECT coalesce(element_at(array('a', 'b'), CAST(nullif(id, 0) AS INT)), 'z'), " +
+          "coalesce(array('a', 'b')[CAST(nullif(id, 0) AS INT) - 1], 'z') FROM range(2)"),
+        Seq(Row("z", "z"), Row("a", "a")))
+    }
+  }
+
+  test("SPARK-60755: element_at and array index compile when the result is not nullable") {
+    // The first element cannot be NULL, but the array can contain NULL.
+    val df = spark.range(2).selectExpr("id", "if(id = 0, 'a', NULL) AS s")
+    val notNullable = "element_at(array(coalesce(s, 'z'), s), 1)"
+    Seq(true, false).foreach { ansiEnabled =>
+      withSQLConf(SQLConf.ANSI_ENABLED.key -> ansiEnabled.toString) {
+        checkAnswer(df.selectExpr(notNullable), Seq(Row("a"), Row("z")))
+        checkAnswer(df.where(s"$notNullable = 'z'").select("id"), Seq(Row(1)))
+        // The ordering of `TakeOrderedAndProjectExec` has no interpreted fallback.
+        checkAnswer(df.orderBy(expr(notNullable).desc).limit(1).select("id"), Seq(Row(1)))
+      }
+    }
+    // Under ANSI, an out-of-bounds index raises an error, so the result is not nullable.
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+      checkError(
+        exception = intercept[SparkArrayIndexOutOfBoundsException] {
+          df.where("element_at(array(s), 5) = 'x'").collect()
+        },
+        condition = "INVALID_ARRAY_INDEX_IN_ELEMENT_AT",
+        parameters = Map("indexValue" -> "5", "arraySize" -> "1"),
+        context = ExpectedContext(fragment = "element_at(array(s), 5)", start = 0, stop = 22))
+      checkError(
+        exception = intercept[SparkArrayIndexOutOfBoundsException] {
+          df.selectExpr("array(s)[5]").collect()
+        },
+        condition = "INVALID_ARRAY_INDEX",
+        parameters = Map("indexValue" -> "5", "arraySize" -> "1"),
+        context = ExpectedContext(fragment = "array(s)[5]", start = 0, stop = 10))
+    }
   }
 
   test("element_at function") {
@@ -4730,6 +5029,53 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
     testArrayOfPrimitiveTypeNotContainsNull()
   }
 
+  test("aggregate function - null array does not evaluate zero expression through CSE") {
+    withSQLConf(
+        SQLConf.ANSI_ENABLED.key -> "true",
+        SQLConf.CODEGEN_FACTORY_MODE.key -> "CODEGEN_ONLY",
+        SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true") {
+      checkAnswer(
+        spark.range(1).selectExpr(
+          """
+            |aggregate(
+            |  CAST(NULL AS ARRAY<INT>),
+            |  (CAST(id AS INT) / 0) + (CAST(id AS INT) / 0),
+            |  (acc, x) -> acc + x)
+            |""".stripMargin),
+        Row(null))
+    }
+  }
+
+  test("aggregate function - generated code clears accumulator null state within row") {
+    withSQLConf(SQLConf.CODEGEN_FACTORY_MODE.key -> "CODEGEN_ONLY") {
+      checkAnswer(
+        spark.range(1).selectExpr(
+          """
+            |aggregate(
+            |  array(CAST(id AS INT) + 1, CAST(id AS INT) + 2),
+            |  CAST(NULL AS INT),
+            |  (acc, x) -> coalesce(acc, 0) + x,
+            |  acc -> coalesce(acc, -1))
+            |""".stripMargin),
+        Row(3))
+    }
+  }
+
+  test("aggregate function - generated code clears accumulator null state across rows") {
+    withSQLConf(SQLConf.CODEGEN_FACTORY_MODE.key -> "CODEGEN_ONLY") {
+      checkAnswer(
+        spark.range(0, 2, 1, 1).selectExpr(
+          """
+            |aggregate(
+            |  CASE WHEN id = 0 THEN array(CAST(NULL AS INT)) ELSE array() END,
+            |  0,
+            |  (acc, x) -> acc + x,
+            |  acc -> coalesce(acc, -1))
+            |""".stripMargin),
+        Seq(Row(-1), Row(0)))
+    }
+  }
+
   test("aggregate function - array for primitive type containing null") {
     val df = Seq[Seq[Integer]](
       Seq(1, 9, 8, 7),
@@ -6003,6 +6349,40 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
     )
   }
 
+  test("SPARK-60508: nested higher-order functions capturing lambda variables") {
+    // A file source, because a `LocalRelation` is evaluated before the optimizer simplifies the
+    // expressions below.
+    withTable("t") {
+      sql("CREATE TABLE t USING parquet AS " +
+        "SELECT array(1, 5) AS xs1, array(3, 2) AS xs2, array(1, 2, 3, 4, 5) AS ys")
+      checkAnswer(
+        sql("SELECT zip_with(xs1, xs2, (x1, x2) -> " +
+          "IF(x1 > x2, filter(ys, y -> y > x1), filter(ys, y -> y > x2))) FROM t"),
+        Row(Seq(Seq(4, 5), Seq.empty)))
+      checkAnswer(
+        sql("SELECT zip_with(xs1, xs2, (x1, x2) -> " +
+          "CASE WHEN x1 > x2 THEN filter(ys, y -> y > x1) ELSE filter(ys, y -> y > x2) END) " +
+          "FROM t"),
+        Row(Seq(Seq(4, 5), Seq.empty)))
+      checkAnswer(
+        sql("SELECT zip_with(xs1, xs2, (x1, x2) -> " +
+          "exists(ys, y -> y > x1) OR exists(ys, y -> y > x2)) FROM t"),
+        Row(Seq(true, true)))
+      checkAnswer(
+        sql("SELECT zip_with(xs1, xs2, (x1, x2) -> " +
+          "filter(ys, y -> y > x1) <=> filter(ys, y -> y > x2)) FROM t"),
+        Row(Seq(false, false)))
+
+      // The functions capturing the same variable are still simplified into one.
+      val df = sql("SELECT transform(xs1, x -> " +
+        "exists(ys, y -> y > x) AND exists(ys, y -> y > x)) FROM t")
+      checkAnswer(df, Row(Seq(true, false)))
+      assert(df.queryExecution.optimizedPlan.expressions.flatMap(_.collect {
+        case e: ArrayExists => e
+      }).size == 1)
+    }
+  }
+
   test("from_json - invalid schema string") {
     checkError(
       exception = intercept[AnalysisException] {
@@ -6302,7 +6682,167 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
           call_function("spark_catalog.default.custom_sum", $"a")),
         Row(12.0, 12.0, 12.0))
     }
+  }
 
+  private def isPositiveZero(d: Double): Boolean =
+    java.lang.Double.doubleToRawLongBits(d) == 0L
+
+  test("SPARK-54918: array set ops normalize -0.0 and NaN via VALUES inline table") {
+    val r = sql("""
+      SELECT
+        array_distinct(a) AS d,
+        array_union(a, b) AS u,
+        array_intersect(a, b) AS i,
+        array_except(a, b) AS e,
+        arrays_overlap(a, b) AS o
+      FROM VALUES (array(-0.0d, 0.0d, double('NaN')), array(0.0d, double('NaN')))
+      AS t(a, b)
+    """).head()
+
+    val distinct = r.getSeq[Double](0)
+    assert(distinct.length == 2)
+    assert(distinct.exists(isPositiveZero))
+    assert(distinct.exists(_.isNaN))
+
+    val union = r.getSeq[Double](1)
+    assert(union.length == 2)
+    assert(union.exists(isPositiveZero))
+    assert(union.exists(_.isNaN))
+
+    val intersect = r.getSeq[Double](2)
+    assert(intersect.length == 2)
+    assert(intersect.exists(isPositiveZero))
+    assert(intersect.exists(_.isNaN))
+
+    val except = r.getSeq[Double](3)
+    assert(except.isEmpty)
+
+    assert(r.getBoolean(4))
+  }
+
+  test("SPARK-54918: array_distinct normalizes -0.0 to +0.0 - literals") {
+    val r1 = Seq(1).toDF()
+      .select(array_distinct(typedLit(Array(-0.0d, 0.0d)))).head().getSeq[Double](0)
+
+    assert(r1.length == 1)
+    assert(isPositiveZero(r1.head))
+
+    val r2 = Seq(1).toDF()
+      .select(array_distinct(
+        typedLit(Array(Double.NaN, 0.0d, -0.0d, Double.NaN)))
+      ).head().getSeq[Double](0)
+
+    assert(r2.length == 2)
+    assert(r2.exists(_.isNaN))
+    assert(r2.exists(isPositiveZero))
+  }
+
+  test("SPARK-59602: array_distinct normalizes nested floating-point values") {
+    val result = Seq(Seq(Seq(-0.0d), Seq(0.0d))).toDF("a")
+      .select(array_distinct($"a")).head().getSeq[Seq[Double]](0)
+
+    assert(result.length == 1)
+    assert(isPositiveZero(result.head.head))
+  }
+
+  test("SPARK-54918: array_distinct normalizes -0.0 to +0.0") {
+    val r1 = Seq(Array(-0.0d, 0.0d)).toDF("a")
+      .select(array_distinct($"a")).head().getSeq[Double](0)
+
+    assert(r1.length == 1)
+    assert(isPositiveZero(r1.head))
+
+    val r2 = Seq(Array(Double.NaN, 0.0d, -0.0d, Double.NaN)).toDF("a")
+      .select(array_distinct($"a")).head().getSeq[Double](0)
+
+    assert(r2.length == 2)
+    assert(r2.exists(_.isNaN))
+    assert(r2.exists(isPositiveZero))
+  }
+
+  test("SPARK-54918: array_union normalizes -0.0 to +0.0 - literals") {
+    val r = Seq(1).toDF()
+      .select(array_union(
+        typedLit(Array(-0.0d)),
+        typedLit(Array(0.0d)))
+      ).head().getSeq[Double](0)
+
+    assert(r.length == 1)
+    assert(isPositiveZero(r.head))
+  }
+
+  test("SPARK-54918: array_union normalizes -0.0 to +0.0") {
+    val r = Seq((Array(-0.0d), Array(0.0d))).toDF("a", "b")
+      .select(array_union($"a", $"b")).head().getSeq[Double](0)
+
+    assert(r.length == 1)
+    assert(isPositiveZero(r.head))
+  }
+
+  test("SPARK-54918: array_intersect normalizes -0.0 to +0.0 - literals") {
+    val r = Seq(1).toDF()
+      .select(array_intersect(
+        typedLit(Array(-0.0d)),
+        typedLit(Array(0.0d)))
+      ).head().getSeq[Double](0)
+
+    assert(r.length == 1)
+    assert(isPositiveZero(r.head))
+  }
+
+  test("SPARK-54918: array_intersect normalizes -0.0 to +0.0") {
+    val r = Seq((Array(-0.0d), Array(0.0d))).toDF("a", "b")
+      .select(array_intersect($"a", $"b")).head().getSeq[Double](0)
+
+    assert(r.length == 1)
+    assert(isPositiveZero(r.head))
+  }
+
+  test("SPARK-54918: array_except normalizes -0.0 to +0.0 - literals") {
+    val r1 = Seq(1).toDF()
+      .select(array_except(
+        typedLit(Array(-0.0d)),
+        typedLit(Array(0.0d)))
+      ).head().getSeq[Double](0)
+
+    assert(r1.isEmpty)
+
+    val r2 = Seq(1).toDF()
+      .select(array_except(
+        typedLit(Array(0.0d)),
+        typedLit(Array(-0.0d)))
+      ).head().getSeq[Double](0)
+
+    assert(r2.isEmpty)
+  }
+
+  test("SPARK-54918: array_except normalizes -0.0 to +0.0") {
+    val r1 = Seq((Array(-0.0d), Array(0.0d))).toDF("a", "b")
+      .select(array_except($"a", $"b")).head().getSeq[Double](0)
+
+    assert(r1.isEmpty)
+
+    val r2 = Seq((Array(0.0d), Array(-0.0d))).toDF("a", "b")
+      .select(array_except($"a", $"b")).head().getSeq[Double](0)
+
+    assert(r2.isEmpty)
+  }
+
+  test("SPARK-54918: arrays_overlap normalizes -0.0 to +0.0 - literals") {
+    val r = Seq(1).toDF()
+      .select(arrays_overlap(
+        typedLit(Array(-0.0d)),
+        typedLit(Array(0.0d)))
+      ).head().getBoolean(0)
+
+    assert(r)
+  }
+
+  test("SPARK-54918: arrays_overlap normalizes -0.0 to +0.0") {
+    val r = Seq((Array(-0.0d), Array(0.0d))).toDF("a", "b")
+      .select(arrays_overlap($"a", $"b")).head().getBoolean(0)
+
+    assert(r)
   }
 }
 

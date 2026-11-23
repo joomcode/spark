@@ -20,13 +20,14 @@ import org.apache.spark.{JobArtifactSet, SparkException, SparkUnsupportedOperati
 import org.apache.spark.api.python.{ChainedPythonFunctions, PythonEvalType}
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.analysis.WidenStatefulOpNullability
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.logical.{EventTimeTimeout, ProcessingTimeTimeout}
 import org.apache.spark.sql.catalyst.plans.physical.Distribution
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.execution.{GroupedIterator, SparkPlan, UnaryExecNode}
-import org.apache.spark.sql.execution.python.ArrowPythonRunner
+import org.apache.spark.sql.execution.python.{ArrowPythonRunner, PythonPhaseMetrics}
 import org.apache.spark.sql.execution.python.PandasGroupUtils.resolveArgOffsets
 import org.apache.spark.sql.execution.streaming.operators.stateful._
 import org.apache.spark.sql.execution.streaming.operators.stateful.flatmapgroupswithstate.{FlatMapGroupsWithStateExecBase, GroupStateImpl}
@@ -68,7 +69,8 @@ case class FlatMapGroupsInPandasWithStateExec(
     eventTimeWatermarkForLateEvents: Option[Long],
     eventTimeWatermarkForEviction: Option[Long],
     skipEmittingInitialStateKeys: Boolean,
-    child: SparkPlan) extends UnaryExecNode with FlatMapGroupsWithStateExecBase {
+    child: SparkPlan)
+  extends UnaryExecNode with FlatMapGroupsWithStateExecBase with PythonPhaseMetrics {
 
   // TODO(SPARK-40444): Add the support of initial state.
   override protected val initialStateDeserializer: Expression = null
@@ -81,7 +83,8 @@ case class FlatMapGroupsInPandasWithStateExec(
   override protected val stateEncoder: ExpressionEncoder[Any] =
     ExpressionEncoder(stateType).resolveAndBind().asInstanceOf[ExpressionEncoder[Any]]
 
-  override def output: Seq[Attribute] = outAttributes
+  override def output: Seq[Attribute] =
+    WidenStatefulOpNullability.widenOutputForStatefulOp(outAttributes)
 
   private val sessionLocalTimeZone = conf.sessionLocalTimeZone
   private val pythonRunnerConf = ArrowPythonRunner.getPythonRunnerConfMap(conf)

@@ -24,26 +24,25 @@ import net.razorvine.pickle.{Pickler, Unpickler}
 
 import org.apache.spark.SparkContext
 import org.apache.spark.api.python.DechunkedInputStream
-import org.apache.spark.internal.Logging
-import org.apache.spark.internal.LogKeys.CLASS_LOADER
 import org.apache.spark.security.SocketAuthServer
-import org.apache.spark.sql.{internal, Column, DataFrame, Row, SparkSession, TableArg}
+import org.apache.spark.sql.{internal, Column, DataFrame, DataFrameReader, Dataset, Encoders, Row, SparkSession, TableArg}
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.catalyst.analysis.{FunctionRegistry, TableFunctionRegistry}
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.classic.{DataFrameReader => ClassicDataFrameReader}
 import org.apache.spark.sql.classic.ClassicConversions._
 import org.apache.spark.sql.classic.ExpressionUtils.expression
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.{ExplainMode, QueryExecution}
 import org.apache.spark.sql.execution.arrow.ArrowConverters
 import org.apache.spark.sql.execution.python.EvaluatePython
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{DataType, StructType}
 import org.apache.spark.storage.PythonWorkerLogBlockId
-import org.apache.spark.util.{MutableURLClassLoader, Utils}
 
-private[sql] object PythonSQLUtils extends Logging {
+private[sql] object PythonSQLUtils {
   private def withInternalRowPickler(f: Pickler => Array[Byte]): Array[Byte] = {
     EvaluatePython.registerPicklers()
     val pickler = new Pickler(true, false)
@@ -132,19 +131,6 @@ private[sql] object PythonSQLUtils extends Logging {
     deserializer(internalRow)
   }
 
-  /**
-   * Internal-only helper for Spark Connect's local mode. This is only used for
-   * local development, not for production. This method should not be used in
-   * production code path.
-   */
-  def addJarToCurrentClassLoader(path: String): Unit = {
-    Utils.getContextOrSparkClassLoader match {
-      case cl: MutableURLClassLoader => cl.addURL(Utils.resolveURI(path).toURL)
-      case cl => logWarning(log"Unsupported class loader ${MDC(CLASS_LOADER, cl)} will not " +
-        log"update jars in the thread class loader.")
-    }
-  }
-
   def jsonToDDL(json: String): String = {
     DataType.fromJson(json).asInstanceOf[StructType].toDDL
   }
@@ -192,6 +178,39 @@ private[sql] object PythonSQLUtils extends Logging {
 
   @scala.annotation.varargs
   def internalFn(name: String, inputs: Column*): Column = Column.internalFn(name, inputs: _*)
+
+  /**
+   * Validates that the input [[DataFrame]] has exactly one column of StringType
+   * and converts it to a Dataset[String].
+   */
+  private def toStringDataset(df: DataFrame): Dataset[String] = {
+    val fields = df.schema.fields
+    if (fields.length != 1) {
+      throw QueryCompilationErrors.dataframeInputNotSingleColumnError(fields.length)
+    }
+    if (fields.head.dataType != org.apache.spark.sql.types.StringType) {
+      throw QueryCompilationErrors.dataframeInputNotStringTypeError(fields.head.dataType)
+    }
+    df.as(Encoders.STRING)
+  }
+
+  def jsonFromDataFrame(
+      reader: DataFrameReader,
+      df: DataFrame): DataFrame = {
+    reader.asInstanceOf[ClassicDataFrameReader].json(toStringDataset(df))
+  }
+
+  def csvFromDataFrame(
+      reader: DataFrameReader,
+      df: DataFrame): DataFrame = {
+    reader.asInstanceOf[ClassicDataFrameReader].csv(toStringDataset(df))
+  }
+
+  def xmlFromDataFrame(
+      reader: DataFrameReader,
+      df: DataFrame): DataFrame = {
+    reader.asInstanceOf[ClassicDataFrameReader].xml(toStringDataset(df))
+  }
 
   def cleanupPythonWorkerLogs(sessionUUID: String, sparkContext: SparkContext): Unit = {
     if (!sparkContext.isStopped) {

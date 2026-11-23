@@ -185,13 +185,12 @@ abstract class ExternalCatalogSuite extends SparkFunSuite {
 
   test("drop table when database/table does not exist") {
     val catalog = newBasicCatalog()
-    // Should always throw exception when the database does not exist
+    // Should throw exception when the database does not exist and ignoreIfNotExists is false
     intercept[AnalysisException] {
       catalog.dropTable("unknown_db", "unknown_table", ignoreIfNotExists = false, purge = false)
     }
-    intercept[AnalysisException] {
-      catalog.dropTable("unknown_db", "unknown_table", ignoreIfNotExists = true, purge = false)
-    }
+    // Should succeed (no-op) when the database does not exist and ignoreIfNotExists is true
+    catalog.dropTable("unknown_db", "unknown_table", ignoreIfNotExists = true, purge = false)
     // Should throw exception when the table does not exist, if ignoreIfNotExists is false
     intercept[AnalysisException] {
       catalog.dropTable("db2", "unknown_table", ignoreIfNotExists = false, purge = false)
@@ -371,6 +370,17 @@ abstract class ExternalCatalogSuite extends SparkFunSuite {
       catalog.createPartitions("db2", "tbl2", Seq(part1), ignoreIfExists = false)
     }
     catalog.createPartitions("db2", "tbl2", Seq(part1), ignoreIfExists = true)
+  }
+
+  test("create partitions with ignoreIfExists does not alter existing partitions") {
+    val catalog = newBasicCatalog()
+    val oldLocation = catalog.getPartition("db2", "tbl2", part1.spec).location
+    val newLocation = newUriForPartition(Seq("a=1", "b=2"))
+    val newPart1 = part1.copy(storage = storageFormat.copy(locationUri = Some(newLocation)))
+    val newPart = CatalogTablePartition(Map("a" -> "7", "b" -> "8"), storageFormat)
+    catalog.createPartitions("db2", "tbl2", Seq(newPart1, newPart), ignoreIfExists = true)
+    assert(catalog.getPartition("db2", "tbl2", part1.spec).location == oldLocation)
+    assert(catalog.getPartitionOption("db2", "tbl2", newPart.spec).isDefined)
   }
 
   test("create partitions without location") {

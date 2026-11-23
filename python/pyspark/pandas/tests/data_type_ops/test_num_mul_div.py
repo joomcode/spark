@@ -17,13 +17,14 @@
 
 import unittest
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 from pyspark import pandas as ps
-from pyspark.testing.utils import is_ansi_mode_test
-from pyspark.testing.pandasutils import PandasOnSparkTestCase
+from pyspark.loose_version import LooseVersion
 from pyspark.pandas.tests.data_type_ops.testing_utils import OpsTestBase
+from pyspark.testing.pandasutils import PandasOnSparkTestCase
+from pyspark.testing.utils import is_ansi_mode_test
 
 
 class NumMulDivTestsMixin:
@@ -39,17 +40,25 @@ class NumMulDivTestsMixin:
         pdf, psdf = self.pdf, self.psdf
         for col in self.numeric_df_cols:
             pser, psser = pdf[col], psdf[col]
-            self.assert_eq(pser * pser, psser * psser, check_exact=False)
-            self.assert_eq(pser * pser.astype(bool), psser * psser.astype(bool), check_exact=False)
-            self.assert_eq(pser * True, psser * True, check_exact=False)
-            self.assert_eq(pser * False, psser * False, check_exact=False)
+            ignore_null = self.ignore_null(col)
+            self.assert_eq(pser * pser, psser * psser, check_exact=False, ignore_null=ignore_null)
+            self.assert_eq(
+                pser * pser.astype(bool),
+                psser * psser.astype(bool),
+                check_exact=False,
+                ignore_null=ignore_null,
+            )
+            self.assert_eq(pser * True, psser * True, check_exact=False, ignore_null=ignore_null)
+            self.assert_eq(pser * False, psser * False, check_exact=False, ignore_null=ignore_null)
 
             if psser.dtype in [int, np.int32]:
                 self.assert_eq(pser * pdf["string"], psser * psdf["string"])
             else:
                 self.assertRaises(TypeError, lambda: psser * psdf["string"])
 
-            self.assert_eq(pser * pdf["bool"], psser * psdf["bool"], check_exact=False)
+            self.assert_eq(
+                pser * pdf["bool"], psser * psdf["bool"], check_exact=False, ignore_null=ignore_null
+            )
 
             self.assertRaises(TypeError, lambda: psser * psdf["datetime"])
             self.assertRaises(TypeError, lambda: psser * psdf["date"])
@@ -111,6 +120,55 @@ class NumMulDivTestsMixin:
             self.assertRaises(TypeError, lambda: psdf["decimal"] // 0.1)
             self.assertRaises(TypeError, lambda: 0.1 // psdf["decimal"])
 
+        # A divisor that is not exactly representable: 1.0 / 0.1 rounds up to exactly 10.0,
+        # so flooring the quotient gives 10 where pandas returns 9.
+        pser = pd.Series([1.0, 10.0, -1.0, 2.5])
+        psser = ps.from_pandas(pser)
+        self.assert_eq(pser // 0.1, psser // 0.1)
+
+        # An integral operand above 2**53 loses its low bits when divided as double. pandas
+        # returns int64 here, which Spark's division cannot, so compare the values.
+        pser = pd.Series([9007199254740993, -9007199254740993])
+        psser = ps.from_pandas(pser)
+        self.assert_eq((pser // 2).astype(float), psser // 2)
+        self.assert_eq((pser // 3).astype(float), psser // 3)
+
+        # An infinite divisor leaves a quotient of 0 or -1, and an infinite dividend has no
+        # finite floor, which pandas reports as nan.
+        pser = pd.Series([1.0, -1.0, np.inf, -np.inf])
+        psser = ps.from_pandas(pser)
+        self.assert_eq(pser // np.inf, psser // np.inf)
+        self.assert_eq(pser // -np.inf, psser // -np.inf)
+        pser = pd.Series([np.inf, -np.inf, np.nan, 1.0])
+        psser = ps.from_pandas(pser)
+        self.assert_eq(pser // 2.0, psser // 2.0)
+
+        # Finite operands whose quotient overflows to an infinity, which is its own floor.
+        edge_pdf = pd.DataFrame({"a": [1e300, -1e300], "b": [1e-300, 1e-300]})
+        edge_psdf = ps.from_pandas(edge_pdf)
+        self.assert_eq(edge_pdf.a // edge_pdf.b, edge_psdf.a // edge_psdf.b)
+
+        # A negative zero divisor negates the result, and a zero dividend keeps its own sign.
+        pser = pd.Series([1.0, -1.0, 2.5])
+        psser = ps.from_pandas(pser)
+        self.assert_eq(pser // -0.0, psser // -0.0)
+        pser = pd.Series([-0.0, 0.0])
+        psser = ps.from_pandas(pser)
+        self.assert_eq(pser // 3.0, psser // 3.0)
+        # An equality check cannot see the sign of a zero, so compare it directly.
+        self.assertEqual(
+            np.signbit(pser // 3.0).tolist(), np.signbit((psser // 3.0).to_pandas()).tolist()
+        )
+
+    @unittest.skipIf(
+        LooseVersion(np.__version__) < LooseVersion("1.24.0"),
+        "NumPy < 1.24 leaves integer floor division overflow undefined",
+    )
+    def test_floordiv_integer_overflow(self):
+        pser = pd.Series([-(2**63)])
+        psser = ps.from_pandas(pser)
+        self.assert_eq((pser // -1).astype(float), psser // -1)
+
     def test_mod(self):
         pdf, psdf = self.pdf, self.psdf
 
@@ -150,12 +208,6 @@ class NumMulDivTests(
 
 
 if __name__ == "__main__":
-    from pyspark.pandas.tests.data_type_ops.test_num_mul_div import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

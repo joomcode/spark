@@ -15,9 +15,10 @@
 # limitations under the License.
 #
 
-from pyspark.sql import Column, functions as F, is_remote
+from typing import TYPE_CHECKING, Union
 
-from typing import Union, TYPE_CHECKING
+from pyspark.sql import Column, is_remote
+from pyspark.sql import functions as F
 
 if TYPE_CHECKING:
     from pyspark.sql._typing import ColumnOrName
@@ -36,13 +37,14 @@ class InternalFunction:
             return _invoke_function_over_columns(name, *cols)
 
         else:
-            from pyspark.sql.classic.column import Column, _to_seq, _to_java_column
             from pyspark import SparkContext
+            from pyspark.sql.classic.column import Column, _to_java_column, _to_seq
 
             sc = SparkContext._active_spark_context
             return Column(
                 sc._jvm.PythonSQLUtils.internalFn(  # type: ignore
-                    name, _to_seq(sc, cols, _to_java_column)  # type: ignore
+                    name,
+                    _to_seq(sc, cols, _to_java_column),  # type: ignore
                 )
             )
 
@@ -55,6 +57,10 @@ class InternalFunction:
         return InternalFunction._invoke_internal_function_over_columns(
             "pandas_product", col, F.lit(dropna)
         )
+
+    @staticmethod
+    def mod(left: Column, right: Column) -> Column:
+        return InternalFunction._invoke_internal_function_over_columns("pandas_mod", left, right)
 
     @staticmethod
     def stddev(col: Column, ddof: int) -> Column:
@@ -104,7 +110,9 @@ class InternalFunction:
 
     @staticmethod
     def distributed_sequence_id() -> Column:
-        return InternalFunction._invoke_internal_function_over_columns("distributed_sequence_id")
+        return InternalFunction._invoke_internal_function_over_columns(
+            "distributed_sequence_id", F.lit(True)
+        )
 
     @staticmethod
     def collect_top_k(col: Column, num: int, reverse: bool) -> Column:

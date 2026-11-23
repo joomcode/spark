@@ -48,12 +48,21 @@ class BisectingKMeansSuite extends MLTest with DefaultReadWriteTest {
     assert(bkm.getPredictionCol === "prediction")
     assert(bkm.getMaxIter === 20)
     assert(bkm.getMinDivisibleClusterSize === 1.0)
+    assert(bkm.getIntermediateStorageLevel === "MEMORY_AND_DISK")
     val model = bkm.setMaxIter(1).fit(dataset)
 
     MLTestingUtils.checkCopyAndUids(bkm, model)
     assert(model.hasSummary)
     val copiedModel = model.copy(ParamMap.empty)
     assert(copiedModel.hasSummary)
+  }
+
+  test("BisectingKMeansModel estimated size") {
+    val model = new BisectingKMeans().setK(2).fit(dataset)
+    val maxSize = 1024 * 16
+    assert(
+      model.estimatedSize < maxSize,
+      s"Estimation (${model.estimatedSize}) should be less than $maxSize")
   }
 
   test("BisectingKMeans validate input dataset") {
@@ -88,6 +97,7 @@ class BisectingKMeansSuite extends MLTest with DefaultReadWriteTest {
       .setPredictionCol("test_prediction")
       .setMaxIter(33)
       .setSeed(123)
+      .setIntermediateStorageLevel("DISK_ONLY")
 
     assert(bkm.getK === 9)
     assert(bkm.getFeaturesCol === "test_feature")
@@ -95,6 +105,7 @@ class BisectingKMeansSuite extends MLTest with DefaultReadWriteTest {
     assert(bkm.getMaxIter === 33)
     assert(bkm.getMinDivisibleClusterSize === 2.0)
     assert(bkm.getSeed === 123)
+    assert(bkm.getIntermediateStorageLevel === "DISK_ONLY")
 
     intercept[IllegalArgumentException] {
       new BisectingKMeans().setK(1)
@@ -347,6 +358,7 @@ object BisectingKMeansSuite {
     "k" -> 3,
     "maxIter" -> 2,
     "seed" -> -1L,
-    "minDivisibleClusterSize" -> 2.0
+    "minDivisibleClusterSize" -> 2.0,
+    "intermediateStorageLevel" -> "DISK_ONLY"
   )
 }

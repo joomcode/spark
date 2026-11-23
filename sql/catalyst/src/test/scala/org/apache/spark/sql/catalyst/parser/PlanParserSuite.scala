@@ -19,16 +19,22 @@ package org.apache.spark.sql.catalyst.parser
 
 import scala.annotation.nowarn
 
+import org.antlr.v4.runtime.{CharStreams, CommonTokenStream}
+import org.antlr.v4.runtime.atn.PredictionMode
+
 import org.apache.spark.SparkThrowable
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
-import org.apache.spark.sql.catalyst.analysis.{AnalysisTest, RelationTimeTravel, UnresolvedAlias, UnresolvedAttribute, UnresolvedFunction, UnresolvedGenerator, UnresolvedInlineTable, UnresolvedRelation, UnresolvedStar, UnresolvedSubqueryColumnAliases, UnresolvedTableValuedFunction, UnresolvedTVFAliases}
+import org.apache.spark.sql.catalyst.analysis.{AnalysisTest, RelationChanges, RelationTimeTravel, UnresolvedAlias, UnresolvedAttribute, UnresolvedFunction, UnresolvedGenerator, UnresolvedInlineTable, UnresolvedOrdinal, UnresolvedPipeAggregateOrdinal, UnresolvedRelation, UnresolvedStar, UnresolvedStarExceptOrReplace, UnresolvedSubqueryColumnAliases, UnresolvedTableValuedFunction, UnresolvedTVFAliases}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
-import org.apache.spark.sql.catalyst.util.{EvaluateUnresolvedInlineTable, IntervalUtils}
+import org.apache.spark.sql.catalyst.util.{DateTimeUtils, EvaluateUnresolvedInlineTable, IntervalUtils}
+import org.apache.spark.sql.connector.catalog.{ChangelogContext, ChangelogRange}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{Decimal, DecimalType, IntegerType, LongType, StringType}
+import org.apache.spark.sql.types.{Decimal, DecimalType, IntegerType, LongType, StringType, TimestampType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.unsafe.types.UTF8String
 
 /**
  * Parser test cases for rules defined in [[CatalystSqlParser]] / [[AstBuilder]].
@@ -68,7 +74,7 @@ class PlanParserSuite extends AnalysisTest {
         } else {
           UnresolvedSubqueryColumnAliases(columnAliases, cte)
         }
-        (name, SubqueryAlias(name, subquery), None)
+        UnresolvedCTERelation(name, SubqueryAlias(name, subquery))
     }
     UnresolvedWith(plan, ctes, allowRecursion)
   }
@@ -193,6 +199,32 @@ class PlanParserSuite extends AnalysisTest {
       """.stripMargin, plan)
   }
 
+  test("SPARK-59536: nested bracketed comment containing a hint") {
+    val plan = OneRowRelation().select(Literal(1).as("col1"))
+    assertEqual("SELECT /* outer /*+ inner */ outer tail */ 1 AS col1", plan)
+    assertEqual(
+      "SELECT /* outer /*+ first */ between /*+ second */ outer tail */ 1 AS col1",
+      plan)
+    assertEqual(
+      "SELECT /* level one /* level two /*+ inner */ level two */ level one */ 1 AS col1",
+      plan)
+    assertEqual(
+      "SELECT /* outer /*+ inner */ outer tail */ /*+ HINT */ 1 AS col1",
+      UnresolvedHint("HINT", Seq.empty, plan))
+
+    Seq(
+      "SELECT 1 /* outer /*+ inner",
+      "SELECT /* outer /*+ inner */ outer tail 1 AS col1",
+      "SELECT /* outer /*+ inner outer tail */ 1 AS col1",
+      "/* SELECT /*+ HINT() 4; */ SELECT 1;"
+    ).foreach { query =>
+      checkError(
+        exception = parseException(query),
+        condition = "UNCLOSED_BRACKETED_COMMENT",
+        parameters = Map.empty)
+    }
+  }
+
   test("unclosed bracketed comment one") {
     val query = """/*abc*/
                   |select 1 as a
@@ -294,15 +326,25 @@ class PlanParserSuite extends AnalysisTest {
       cte(table("cte2").select(star()), false,
         "cte1" -> ((OneRowRelation().select(1), Seq.empty)),
         "cte2" -> ((table("cte1").select(star()), Seq.empty))))
-    val sql = "with cte1 (select 1), cte1 as (select 1 from cte1) select * from cte1"
+    val sql1 = "with cte1 (select 1), cte1 as (select 1 from cte1) select * from cte1"
     checkError(
-      exception = parseException(sql),
+      exception = parseException(sql1),
       condition = "DUPLICATED_CTE_NAMES",
       parameters = Map("duplicateNames" -> "`cte1`"),
       context = ExpectedContext(
-        fragment = sql,
+        fragment = sql1,
         start = 0,
         stop = 68))
+    // Case-insensitive duplicate CTE names should also be detected.
+    val sql2 = "with CTE1 (select 1), cte1 as (select 2) select * from cte1"
+    checkError(
+      exception = parseException(sql2),
+      condition = "DUPLICATED_CTE_NAMES",
+      parameters = Map("duplicateNames" -> "`cte1`"),
+      context = ExpectedContext(
+        fragment = sql2,
+        start = 0,
+        stop = 58))
   }
 
   test("simple select query") {
@@ -364,9 +406,9 @@ class PlanParserSuite extends AnalysisTest {
     val limitWindowClauses = Seq(
       ("", (p: LogicalPlan) => p),
       (" limit 10", (p: LogicalPlan) => p.limit(10)),
-      (" window w1 as ()", (p: LogicalPlan) => WithWindowDefinition(ws, p, forPipeSQL = false)),
+      (" window w1 as ()", (p: LogicalPlan) => WithWindowDefinition(ws, p)),
       (" window w1 as () limit 10", (p: LogicalPlan) =>
-        WithWindowDefinition(ws, p, forPipeSQL = false).limit(10))
+        WithWindowDefinition(ws, p).limit(10))
     )
 
     val orderSortDistrClusterClauses = Seq(
@@ -422,6 +464,18 @@ class PlanParserSuite extends AnalysisTest {
         fragment = "order by a distribute by a",
         start = 16,
         stop = 41))
+  }
+
+  test("DISTRIBUTE BY is not supported in the Catalyst parser") {
+    val sql = "select * from t distribute by a"
+    checkError(
+      exception = parseException(sql),
+      condition = "UNSUPPORTED_FEATURE.DISTRIBUTE_BY",
+      parameters = Map.empty,
+      context = ExpectedContext(
+        fragment = "distribute by a",
+        start = 16,
+        stop = 30))
   }
 
   test("insert into") {
@@ -496,6 +550,135 @@ class PlanParserSuite extends AnalysisTest {
       parameters = Map("error" -> "'b'", "hint" -> ": extra input 'b'"))
   }
 
+  test("pipe AGGREGATE rejects aliases on GROUP BY ordinals") {
+    for {
+      ordinal <- Seq("0", "1", "2", "3", "-1", "(2)")
+      alias <- Seq("AS grp", "grp")
+      prefix <- Seq("", "g, ")
+    } {
+      val groupingExpression = s"$ordinal $alias"
+      val query = s"TABLE t |> AGGREGATE sum(x) AS s GROUP BY $prefix$groupingExpression"
+      val start = query.lastIndexOf(groupingExpression)
+      checkError(
+        exception = parseException(query),
+        condition = "UNSUPPORTED_FEATURE.PIPE_OPERATOR_AGGREGATE_UNSUPPORTED_CASE",
+        sqlState = Some("0A000"),
+        parameters = Map("case" -> "aliases on GROUP BY ordinals"),
+        context = ExpectedContext(
+          fragment = groupingExpression,
+          start = start,
+          stop = start + groupingExpression.length - 1))
+
+      // Regular GROUP BY rejects every alias with a syntax error.
+      checkError(
+        exception = parseException(s"SELECT x, sum(x) FROM t GROUP BY $prefix$groupingExpression"),
+        condition = "PARSE_SYNTAX_ERROR",
+        sqlState = Some("42601"),
+        parameters = Map("error" -> "'grp'", "hint" -> ": extra input 'grp'"))
+    }
+  }
+
+  test("pipe AGGREGATE preserves unaliased GROUP BY ordinals") {
+    Seq(1, 2, 3).foreach { ordinal =>
+      val query = s"TABLE t |> AGGREGATE sum(x) AS s GROUP BY $ordinal"
+      val aggregate = parsePlan(query).asInstanceOf[Aggregate]
+      assert(aggregate.groupingExpressions == Seq(UnresolvedOrdinal(1)))
+      assert(aggregate.aggregateExpressions.head == UnresolvedPipeAggregateOrdinal(ordinal))
+    }
+  }
+
+  test("pipe AGGREGATE preserves aliases on non-ordinal GROUP BY expressions") {
+    Seq("g", "1 + 1", "CAST(2 AS INT)", "2L", "2.0").foreach { expression =>
+      val query = s"TABLE t |> AGGREGATE sum(x) AS s GROUP BY $expression AS grp"
+      val aggregate = parsePlan(query).asInstanceOf[Aggregate]
+      val alias = aggregate.groupingExpressions.head.asInstanceOf[Alias]
+      assert(alias.child == parseExpression(expression))
+      assert(alias.name == "grp")
+      assert(aggregate.aggregateExpressions.head == alias)
+    }
+  }
+
+  test("pipe AGGREGATE groups by aliased integer literals as constants with the legacy config " +
+    "or without GROUP BY ordinals") {
+    Seq(
+      SQLConf.LEGACY_ALLOW_ALIASED_PIPE_AGGREGATE_ORDINALS.key -> "true",
+      SQLConf.GROUP_BY_ORDINAL.key -> "false").foreach { sqlConf =>
+      withSQLConf(sqlConf) {
+        Seq("AS grp", "grp").foreach { alias =>
+          val query = s"TABLE t |> AGGREGATE sum(x) AS s GROUP BY 2 $alias"
+          val aggregate = parsePlan(query).asInstanceOf[Aggregate]
+          val groupingAlias = aggregate.groupingExpressions.head.asInstanceOf[Alias]
+          assert(groupingAlias.child == Literal(2))
+          assert(groupingAlias.name == "grp")
+          assert(aggregate.aggregateExpressions.head == groupingAlias)
+
+          checkError(
+            exception = parseException(s"SELECT x, sum(x) FROM t GROUP BY 2 $alias"),
+            condition = "PARSE_SYNTAX_ERROR",
+            sqlState = Some("42601"),
+            parameters = Map("error" -> "'grp'", "hint" -> ": extra input 'grp'"))
+        }
+      }
+    }
+  }
+
+  private def pipeAssignmentStars(plan: LogicalPlan): Seq[UnresolvedStarExceptOrReplace] =
+    plan.collect { case Project(Seq(star: UnresolvedStarExceptOrReplace), _) => star }.reverse
+
+  test("pipe EVAL appends assigned columns that do not exist, and SET does not") {
+    val evalStars = pipeAssignmentStars(parsePlan("TABLE t |> EVAL z = 1, x = z + 1"))
+    assert(evalStars.map(_.excepts) == Seq(Seq(Seq("z")), Seq(Seq("x"))))
+    assert(evalStars.forall(_.appendMissingReplacements))
+    assert(evalStars.flatMap(_.replacements.get).map(_.name) == Seq("z", "x"))
+
+    val setStars = pipeAssignmentStars(parsePlan("TABLE t |> SET z = 1, x = z + 1"))
+    assert(setStars.map(_.excepts) == evalStars.map(_.excepts))
+    assert(!setStars.exists(_.appendMissingReplacements))
+
+    // EVAL is non-reserved, so it also works as a column name.
+    val selfStars = pipeAssignmentStars(parsePlan("SELECT 1 AS eval |> EVAL eval = eval + 1"))
+    assert(selfStars.map(_.excepts) == Seq(Seq(Seq("eval"))))
+  }
+
+  test("pipe EVAL after the single-character pipe") {
+    withSQLConf(SQLConf.SINGLE_CHARACTER_PIPE_OPERATOR_ENABLED.key -> "true") {
+      val stars = pipeAssignmentStars(parsePlan("TABLE t | EVAL z = 1 | WHERE z > 0"))
+      assert(stars.map(_.excepts) == Seq(Seq(Seq("z"))))
+      assert(stars.forall(_.appendMissingReplacements))
+      val identifierStars = pipeAssignmentStars(parsePlan("TABLE t | EVAL IDENTIFIER('z') = 1"))
+      assert(identifierStars.map(_.excepts) == Seq(Seq(Seq("z"))))
+      checkError(
+        exception = parseException("SELECT col FROM st | EVAL col.i1 = 42"),
+        condition = "_LEGACY_ERROR_TEMP_0035",
+        parameters = Map("message" -> ("SQL pipe syntax |> EVAL operator with multi-part " +
+          "assignment key (only single-part keys are allowed)")),
+        context = ExpectedContext(fragment = "col.i1 = 42", start = 26, stop = 36))
+      // Without an assignment after it, `| eval` is a bitwise OR with a column named eval.
+      assertEqual("SELECT 1 | eval FROM t", table("t").select(Literal(1) | $"eval"))
+      assertEqual("SELECT a | eval AS b FROM t", table("t").select(($"a" | $"eval").as("b")))
+      assertEqual("SELECT a | eval b FROM t", table("t").select(($"a" | $"eval").as("b")))
+      assertEqual(
+        "SELECT a | eval IDENTIFIER('b') FROM t", table("t").select(($"a" | $"eval").as("b")))
+      assertEqual("SELECT a | eval.f FROM t", table("t").select($"a" | $"eval.f"))
+      // Also when `=` follows a token that ends the expression.
+      Seq(
+        "(a | eval) = 1",
+        "(a | eval) == 1",
+        "(a | eval).f = 1",
+        "abs(a | eval) = 1",
+        "arr[a | eval] = 1",
+        "CASE WHEN c THEN a | eval END = 1").foreach { condition =>
+        val filters = parsePlan(s"SELECT * FROM t WHERE $condition").collect {
+          case f: Filter => f.condition
+        }
+        assert(filters.exists(_.exists(_ == ($"a" | $"eval"))), condition)
+      }
+    }
+    withSQLConf(SQLConf.SINGLE_CHARACTER_PIPE_OPERATOR_ENABLED.key -> "false") {
+      assert(parseException("TABLE t | EVAL z = 1").getCondition == "PARSE_SYNTAX_ERROR")
+    }
+  }
+
   test("limit") {
     val sql = "select * from t"
     val plan = table("t").select(star())
@@ -517,7 +700,7 @@ class PlanParserSuite extends AnalysisTest {
          |window w1 as (partition by a, b order by c rows between 1 preceding and 1 following),
          |       w2 as w1,
          |       w3 as w1""".stripMargin,
-      WithWindowDefinition(ws1, plan, forPipeSQL = false))
+      WithWindowDefinition(ws1, plan))
   }
 
   test("lateral view") {
@@ -646,6 +829,85 @@ class PlanParserSuite extends AnalysisTest {
         fragment = fragment3,
         start = 9,
         stop = 115))
+  }
+
+  test("unnest in FROM clause") {
+    def unnest(
+        exprs: Seq[Expression],
+        withOrdinality: Boolean = false): LogicalPlan =
+      Generate(
+        Unnest(exprs, withOrdinality),
+        unrequiredChildIndex = Nil,
+        outer = false,
+        qualifier = None,
+        generatorOutput = Nil,
+        child = OneRowRelation())
+
+    // Single array.
+    assertEqual(
+      "select * from unnest(array(1, 2, 3))",
+      unnest(Seq(UnresolvedFunction("array", Seq(Literal(1), Literal(2), Literal(3)),
+        isDistinct = false))).select(star()))
+
+    // Multiple arrays.
+    assertEqual(
+      "select * from unnest(a, b)",
+      unnest(Seq(UnresolvedAttribute("a"), UnresolvedAttribute("b"))).select(star()))
+
+    // WITH ORDINALITY.
+    assertEqual(
+      "select * from unnest(a) with ordinality",
+      unnest(Seq(UnresolvedAttribute("a")), withOrdinality = true).select(star()))
+
+    // Table alias only.
+    assertEqual(
+      "select * from unnest(a) t",
+      unnest(Seq(UnresolvedAttribute("a"))).as("t").select(star()))
+
+    // Table alias with column aliases.
+    assertEqual(
+      "select * from unnest(a, b) t(x, y)",
+      SubqueryAlias(
+        "t",
+        UnresolvedSubqueryColumnAliases(
+          Seq("x", "y"),
+          unnest(Seq(UnresolvedAttribute("a"), UnresolvedAttribute("b"))))).select(star()))
+
+    // Correlated via LATERAL, with WITH ORDINALITY and column aliases.
+    assertEqual(
+      "select * from t, lateral unnest(t.arr) with ordinality u(v, o)",
+      table("t").lateralJoin(
+        SubqueryAlias(
+          "u",
+          UnresolvedSubqueryColumnAliases(
+            Seq("v", "o"),
+            unnest(Seq(UnresolvedAttribute(Seq("t", "arr"))), withOrdinality = true))))
+        .select(star()))
+
+    // With no arguments the dedicated UNNEST relation rule does not match; the statement instead
+    // parses as a generic table-valued function call named `unnest`, which is not registered and
+    // therefore fails later during analysis rather than at parse time.
+    assertEqual(
+      "select * from unnest()",
+      UnresolvedTableValuedFunction("unnest", Nil).select(star()))
+
+    // `UNNEST` and `ORDINALITY` are non-reserved keywords, so they remain usable as regular
+    // table and column identifiers for backwards compatibility.
+    assertEqual(
+      "select ordinality from unnest",
+      table("unnest").select($"ordinality"))
+    assertEqual(
+      "select unnest.ordinality from unnest",
+      table("unnest").select($"unnest.ordinality"))
+
+    // Quoting the name bypasses the UNNEST relation syntax, so a table-valued function named
+    // `unnest` can still be invoked. This is the escape hatch for the non-reserved keyword.
+    assertEqual(
+      "select * from `unnest`(array(1, 2))",
+      UnresolvedTableValuedFunction(
+        "unnest",
+        Seq(UnresolvedFunction("array", Seq(Literal(1), Literal(2)), isDistinct = false)))
+        .select(star()))
   }
 
   test("joins") {
@@ -814,21 +1076,471 @@ class PlanParserSuite extends AnalysisTest {
     )
   }
 
+  test("nearest-by join") {
+    assertEqual(
+      "select * from t join u approx nearest 5 by similarity t.a + u.a",
+      NearestByJoin(
+        table("t"),
+        table("u"),
+        Inner,
+        approx = true,
+        numResults = 5,
+        rankingExpression = $"t.a" + $"u.a",
+        direction = NearestBySimilarity).select(star()))
+
+    assertEqual(
+      "select * from t inner join u exact nearest 3 by distance t.a - u.a",
+      NearestByJoin(
+        table("t"),
+        table("u"),
+        Inner,
+        approx = false,
+        numResults = 3,
+        rankingExpression = $"t.a" - $"u.a",
+        direction = NearestByDistance).select(star()))
+
+    assertEqual(
+      "select * from t left outer join u approx nearest by similarity t.a + u.a",
+      NearestByJoin(
+        table("t"),
+        table("u"),
+        LeftOuter,
+        approx = true,
+        numResults = 1,
+        rankingExpression = $"t.a" + $"u.a",
+        direction = NearestBySimilarity).select(star()))
+
+    // Unsupported join type.
+    val sqlRightOuter =
+      "select * from t right outer join u approx nearest 1 by similarity t.a"
+    checkError(
+      exception = parseException(sqlRightOuter),
+      condition = "NEAREST_BY_JOIN.UNSUPPORTED_JOIN_TYPE",
+      parameters = Map(
+        "joinType" -> "RIGHT OUTER",
+        "supported" -> "'INNER', 'LEFT OUTER'"),
+      context = ExpectedContext(
+        fragment = "right outer join u approx nearest 1 by similarity t.a",
+        start = 16,
+        stop = 68))
+
+    val sqlFullOuter =
+      "select * from t full outer join u approx nearest 1 by similarity t.a"
+    checkError(
+      exception = parseException(sqlFullOuter),
+      condition = "NEAREST_BY_JOIN.UNSUPPORTED_JOIN_TYPE",
+      parameters = Map(
+        "joinType" -> "FULL OUTER",
+        "supported" -> "'INNER', 'LEFT OUTER'"),
+      context = ExpectedContext(
+        fragment = "full outer join u approx nearest 1 by similarity t.a",
+        start = 16,
+        stop = 67))
+
+    val sqlCross =
+      "select * from t cross join u approx nearest 1 by similarity t.a"
+    checkError(
+      exception = parseException(sqlCross),
+      condition = "NEAREST_BY_JOIN.UNSUPPORTED_JOIN_TYPE",
+      parameters = Map(
+        "joinType" -> "CROSS",
+        "supported" -> "'INNER', 'LEFT OUTER'"),
+      context = ExpectedContext(
+        fragment = "cross join u approx nearest 1 by similarity t.a",
+        start = 16,
+        stop = 62))
+
+    // LATERAL + NEAREST BY not allowed.
+    val sqlLateral =
+      "select * from t join lateral (select * from u) uu approx nearest 1 by similarity 1"
+    checkError(
+      exception = parseException(sqlLateral),
+      condition = "UNSUPPORTED_FEATURE.LATERAL_JOIN_NEAREST_BY",
+      parameters = Map.empty,
+      context = ExpectedContext(
+        fragment = "join lateral (select * from u) uu approx nearest 1 by similarity 1",
+        start = 16,
+        stop = 81))
+
+    // num_results out of range.
+    val sqlTooSmall =
+      "select * from t join u approx nearest 0 by similarity t.a"
+    checkError(
+      exception = parseException(sqlTooSmall),
+      condition = "NEAREST_BY_JOIN.NUM_RESULTS_OUT_OF_RANGE",
+      parameters = Map("numResults" -> "0", "min" -> "1", "max" -> "100000"),
+      context = ExpectedContext(
+        fragment = "join u approx nearest 0 by similarity t.a",
+        start = 16,
+        stop = 56))
+
+    val sqlTooLarge =
+      "select * from t join u approx nearest 100001 by distance t.a"
+    checkError(
+      exception = parseException(sqlTooLarge),
+      condition = "NEAREST_BY_JOIN.NUM_RESULTS_OUT_OF_RANGE",
+      parameters = Map("numResults" -> "100001", "min" -> "1", "max" -> "100000"),
+      context = ExpectedContext(
+        fragment = "join u approx nearest 100001 by distance t.a",
+        start = 16,
+        stop = 59))
+
+    // Literal that overflows Long (>19 digits) should surface as the standard out-of-range
+    // error, not an unwrapped NumberFormatException.
+    val sqlOverflow =
+      "select * from t join u approx nearest 99999999999999999999 by distance t.a"
+    checkError(
+      exception = parseException(sqlOverflow),
+      condition = "NEAREST_BY_JOIN.NUM_RESULTS_OUT_OF_RANGE",
+      parameters = Map(
+        "numResults" -> "99999999999999999999",
+        "min" -> "1",
+        "max" -> "100000"),
+      context = ExpectedContext(
+        fragment = "join u approx nearest 99999999999999999999 by distance t.a",
+        start = 16,
+        stop = 73))
+  }
+
+  test("asof join") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      assertEqual(
+        "select * from t asof join u match_condition (t.a >= u.a)",
+        AsOfJoin.fromMatchCondition(
+          table("t"),
+          table("u"),
+          $"t.a",
+          GreaterThanOrEqualOp,
+          $"u.a",
+          None,
+          Inner).select(star()))
+    }
+  }
+
+  test("asof join - explicit left join type with on condition") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      assertEqual(
+        "select * from t left asof join u match_condition (t.a >= u.a) on t.b = u.b",
+        AsOfJoin.fromMatchCondition(
+          table("t"),
+          table("u"),
+          $"t.a",
+          GreaterThanOrEqualOp,
+          $"u.a",
+          Some($"t.b" === $"u.b"),
+          LeftOuter).select(star()))
+    }
+  }
+
+  test("asof join - using with a single join column") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      assertEqual(
+        "select * from t asof join u match_condition (t.a >= u.a) using (b)",
+        AsOfJoin.fromMatchCondition(
+          table("t"),
+          table("u"),
+          $"t.a",
+          GreaterThanOrEqualOp,
+          $"u.a",
+          None,
+          Inner,
+          usingColumns = Some(Seq("b"))).select(star()))
+    }
+  }
+
+  test("asof join - using with multiple join columns") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      assertEqual(
+        "select * from t asof join u match_condition (t.a >= u.a) using (a, b)",
+        AsOfJoin.fromMatchCondition(
+          table("t"),
+          table("u"),
+          $"t.a",
+          GreaterThanOrEqualOp,
+          $"u.a",
+          None,
+          Inner,
+          usingColumns = Some(Seq("a", "b"))).select(star()))
+    }
+  }
+
+  test("asof join - less than or equal match operator") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      assertEqual(
+        "select * from t asof join u match_condition (u.a <= t.a)",
+        AsOfJoin.fromMatchCondition(
+          table("t"),
+          table("u"),
+          $"u.a",
+          LessThanOrEqualOp,
+          $"t.a",
+          None,
+          Inner).select(star()))
+    }
+  }
+
+  test("asof join - greater than match operator") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      assertEqual(
+        "select * from t asof join u match_condition (t.a > u.a)",
+        AsOfJoin.fromMatchCondition(
+          table("t"),
+          table("u"),
+          $"t.a",
+          GreaterThanOp,
+          $"u.a",
+          None,
+          Inner).select(star()))
+    }
+  }
+
+  test("asof join - less than match operator") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      assertEqual(
+        "select * from t asof join u match_condition (t.a < u.a)",
+        AsOfJoin.fromMatchCondition(
+          table("t"),
+          table("u"),
+          $"t.a",
+          LessThanOp,
+          $"u.a",
+          None,
+          Inner).select(star()))
+    }
+  }
+
+  test("asof join - explicit inner join type") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      assertEqual(
+        "select * from t inner asof join u match_condition (t.a >= u.a)",
+        AsOfJoin.fromMatchCondition(
+          table("t"),
+          table("u"),
+          $"t.a",
+          GreaterThanOrEqualOp,
+          $"u.a",
+          None,
+          Inner).select(star()))
+    }
+  }
+
+  test("asof join - explicit left outer join type") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      assertEqual(
+        "select * from t left outer asof join u match_condition (t.a >= u.a)",
+        AsOfJoin.fromMatchCondition(
+          table("t"),
+          table("u"),
+          $"t.a",
+          GreaterThanOrEqualOp,
+          $"u.a",
+          None,
+          LeftOuter).select(star()))
+    }
+  }
+
+  test("asof join - struct match condition") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      // A multi-column MATCH_CONDITION: `(a, b)` parses to a row constructor (CreateStruct),
+      // and the top-level comparison must still be extracted as the match operator so that
+      // STRUCT operands compare lexicographically (see the SQL reference for ASOF JOIN).
+      assertEqual(
+        "select * from t asof join u match_condition ((t.a, t.b) >= (u.a, u.b))",
+        AsOfJoin.fromMatchCondition(
+          table("t"),
+          table("u"),
+          CreateStruct($"t.a" :: $"t.b" :: Nil),
+          GreaterThanOrEqualOp,
+          CreateStruct($"u.a" :: $"u.b" :: Nil),
+          None,
+          Inner).select(star()))
+    }
+  }
+
+  test("asof join - invalid match operator") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      val sql =
+        "select * from t asof join u match_condition (t.a = u.a)"
+      checkError(
+        exception = parseException(sql),
+        condition = "ASOF_JOIN_MATCH_CONDITION_INVALID_OPERATOR",
+        sqlState = Some("42K0E"),
+        parameters = Map("operator" -> "="),
+        queryContext = Array(
+          ExpectedContext(
+            fragment = "asof join u match_condition (t.a = u.a)",
+            start = 16,
+            stop = 54)))
+    }
+  }
+
+  test("asof join - not equal match operator") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      checkError(
+        exception = parseException(
+          "select * from t asof join u match_condition (t.a <> u.a)"),
+        condition = "ASOF_JOIN_MATCH_CONDITION_INVALID_OPERATOR",
+        sqlState = Some("42K0E"),
+        parameters = Map("operator" -> "<>"),
+        queryContext = Array(
+          ExpectedContext(
+            fragment = "asof join u match_condition (t.a <> u.a)",
+            start = 16,
+            stop = 55)))
+      checkError(
+        exception = parseException(
+          "select * from t asof join u match_condition (t.a != u.a)"),
+        condition = "ASOF_JOIN_MATCH_CONDITION_INVALID_OPERATOR",
+        sqlState = Some("42K0E"),
+        parameters = Map("operator" -> "!="),
+        queryContext = Array(
+          ExpectedContext(
+            fragment = "asof join u match_condition (t.a != u.a)",
+            start = 16,
+            stop = 55)))
+    }
+  }
+
+  test("asof join - null-safe equal match operator") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      checkError(
+        exception = parseException(
+          "select * from t asof join u match_condition (t.a <=> u.a)"),
+        condition = "ASOF_JOIN_MATCH_CONDITION_INVALID_OPERATOR",
+        sqlState = Some("42K0E"),
+        parameters = Map("operator" -> "<=>"),
+        queryContext = Array(
+          ExpectedContext(
+            fragment = "asof join u match_condition (t.a <=> u.a)",
+            start = 16,
+            stop = 56)))
+      checkError(
+        exception = parseException(
+          "select * from t asof join u match_condition (t.a is not distinct from u.a)"),
+        condition = "ASOF_JOIN_MATCH_CONDITION_INVALID_OPERATOR",
+        sqlState = Some("42K0E"),
+        parameters = Map("operator" -> "IS NOT DISTINCT FROM"),
+        queryContext = Array(
+          ExpectedContext(
+            fragment = "asof join u match_condition (t.a is not distinct from u.a)",
+            start = 16,
+            stop = 73)))
+    }
+  }
+
+  test("asof join - is distinct from match operator") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      checkError(
+        exception = parseException(
+          "select * from t asof join u match_condition (t.a is distinct from u.a)"),
+        condition = "ASOF_JOIN_MATCH_CONDITION_INVALID_OPERATOR",
+        sqlState = Some("42K0E"),
+        parameters = Map("operator" -> "IS DISTINCT FROM"),
+        queryContext = Array(
+          ExpectedContext(
+            fragment = "asof join u match_condition (t.a is distinct from u.a)",
+            start = 16,
+            stop = 69)))
+    }
+  }
+
+  test("asof join - compound match condition rejected") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      checkError(
+        exception = parseException(
+          "select * from t asof join u match_condition (t.a >= u.a and t.b >= u.b)"),
+        condition = "ASOF_JOIN_MATCH_CONDITION_INVALID_OPERATOR",
+        sqlState = Some("42K0E"),
+        parameters = Map("operator" -> "AND"),
+        queryContext = Array(
+          ExpectedContext(
+            fragment = "asof join u match_condition (t.a >= u.a and t.b >= u.b)",
+            start = 16,
+            stop = 70)))
+    }
+  }
+
+  test("asof join - disjunction match condition rejected") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      checkError(
+        exception = parseException(
+          "select * from t asof join u match_condition (t.a >= u.a or t.b >= u.b)"),
+        condition = "ASOF_JOIN_MATCH_CONDITION_INVALID_OPERATOR",
+        sqlState = Some("42K0E"),
+        parameters = Map("operator" -> "OR"),
+        queryContext = Array(
+          ExpectedContext(
+            fragment = "asof join u match_condition (t.a >= u.a or t.b >= u.b)",
+            start = 16,
+            stop = 69)))
+    }
+  }
+
+  test("asof join - non-comparison match condition rejected") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      // A MATCH_CONDITION that is not a top-level comparison (here a bare column reference)
+      // is rejected, and the original expression text is echoed back as the operator.
+      checkError(
+        exception = parseException(
+          "select * from t asof join u match_condition (t.a)"),
+        condition = "ASOF_JOIN_MATCH_CONDITION_INVALID_OPERATOR",
+        sqlState = Some("42K0E"),
+        parameters = Map("operator" -> "t.a"),
+        queryContext = Array(
+          ExpectedContext(
+            fragment = "asof join u match_condition (t.a)",
+            start = 16,
+            stop = 48)))
+    }
+  }
+
+  test("asof join disabled by default") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "false") {
+      checkError(
+        exception = parseException("select * from t asof join u match_condition (t.a >= u.a)"),
+        condition = "UNSUPPORTED_FEATURE.ASOF_JOIN",
+        sqlState = "0A000",
+        parameters = Map("config" -> "\"spark.sql.join.asofJoin.enabled\""),
+        context = ExpectedContext(
+          fragment = "asof join u match_condition (t.a >= u.a)",
+          start = 16,
+          stop = 55))
+    }
+  }
+
+  test("nearest-by keywords are non-reserved (usable as identifiers)") {
+    // Spark-specific join keywords must remain non-reserved so they can be used as identifiers.
+    Seq("approx", "asof", "distance", "exact", "nearest", "similarity").foreach { kw =>
+      // As a column identifier in the SELECT list.
+      parsePlan(s"select $kw from t")
+      // As a table identifier in the FROM clause.
+      parsePlan(s"select * from $kw")
+    }
+    // All six together in a single SELECT list.
+    parsePlan("select approx, asof, distance, exact, nearest, similarity from t")
+  }
+
   test("sampled relations") {
     val sql = "select * from t"
     assertEqual(s"$sql tablesample(100 rows)",
       table("t").limit(100).select(star()))
     assertEqual(s"$sql tablesample(43 percent) as x",
-      Sample(0, .43d, withReplacement = false, 10L, table("t").as("x")).select(star()))
+      Sample(0, .43d, withReplacement = false, None, table("t").as("x")).select(star()))
     assertEqual(s"$sql tablesample(bucket 4 out of 10) as x",
-      Sample(0, .4d, withReplacement = false, 10L, table("t").as("x")).select(star()))
+      Sample(0, .4d, withReplacement = false, None, table("t").as("x")).select(star()))
+    // REPEATABLE clause produces Some(seed)
+    assertEqual(s"$sql tablesample(43 percent) repeatable (10) as x",
+      Sample(0, .43d, withReplacement = false, 10L, table("t").as("x")).select(star()))
+    assertEqual(s"$sql tablesample(bucket 4 out of 10) repeatable (99) as x",
+      Sample(0, .4d, withReplacement = false, 99L, table("t").as("x")).select(star()))
 
     val sql1 = s"$sql tablesample(bucket 4 out of 10 on x) as x"
     val fragment1 = "tablesample(bucket 4 out of 10 on x)"
     checkError(
       exception = parseException(sql1),
-      condition = "_LEGACY_ERROR_TEMP_0015",
-      parameters = Map("msg" -> "BUCKET x OUT OF y ON colname"),
+      condition = "UNSUPPORTED_FEATURE.TABLESAMPLE_METHOD",
+      sqlState = "0A000",
+      parameters = Map("sampleMethod" -> "BUCKET x OUT OF y ON column"),
       context = ExpectedContext(
         fragment = fragment1,
         start = 16,
@@ -838,8 +1550,8 @@ class PlanParserSuite extends AnalysisTest {
     val fragment2 = "tablesample(bucket 11 out of 10)"
     checkError(
       exception = parseException(sql2),
-      condition = "_LEGACY_ERROR_TEMP_0064",
-      parameters = Map("msg" -> "Sampling fraction (1.1) must be on interval [0, 1]"),
+      condition = "INVALID_TABLESAMPLE_FRACTION",
+      parameters = Map("fraction" -> "1.1"),
       context = ExpectedContext(
         fragment = fragment2,
         start = 16,
@@ -849,8 +1561,9 @@ class PlanParserSuite extends AnalysisTest {
     val fragment3 = "TABLESAMPLE(300M)"
     checkError(
       exception = parseException(sql3),
-      condition = "_LEGACY_ERROR_TEMP_0015",
-      parameters = Map("msg" -> "byteLengthLiteral"),
+      condition = "UNSUPPORTED_FEATURE.TABLESAMPLE_METHOD",
+      sqlState = "0A000",
+      parameters = Map("sampleMethod" -> "BYTES"),
       context = ExpectedContext(
         fragment = fragment3,
         start = 25,
@@ -860,12 +1573,225 @@ class PlanParserSuite extends AnalysisTest {
     val fragment4 = "TABLESAMPLE(BUCKET 3 OUT OF 32 ON rand())"
     checkError(
       exception = parseException(sql4),
-      condition = "_LEGACY_ERROR_TEMP_0015",
-      parameters = Map("msg" -> "BUCKET x OUT OF y ON function"),
+      condition = "UNSUPPORTED_FEATURE.TABLESAMPLE_METHOD",
+      sqlState = "0A000",
+      parameters = Map("sampleMethod" -> "BUCKET x OUT OF y ON function()"),
       context = ExpectedContext(
         fragment = fragment4,
         start = 25,
         stop = 65))
+
+    val sql5 = "SELECT * FROM t TABLESAMPLE(CAST(1 AS INT))"
+    checkError(
+      exception = parseException(sql5),
+      condition = "INVALID_SQL_SYNTAX.INVALID_TABLESAMPLE_METHOD",
+      sqlState = "42000",
+      parameters = Map("sampleMethod" -> "CAST(1 AS INT)"),
+      context = ExpectedContext(
+        fragment = "TABLESAMPLE(CAST(1 AS INT))",
+        start = 16,
+        stop = 42))
+  }
+
+  test("SPARK-55978: TABLESAMPLE SYSTEM and BERNOULLI - basic parsing") {
+    val sql = "select * from t"
+    // SYSTEM produces SampleMethod.System
+    assertEqual(
+      s"$sql tablesample system (43 percent) as x",
+      Sample(0, .43d, withReplacement = false, None,
+        table("t").as("x"), SampleMethod.System).select(star()))
+    // BERNOULLI produces SampleMethod.Bernoulli
+    assertEqual(
+      s"$sql tablesample bernoulli (43 percent) as x",
+      Sample(0, .43d, withReplacement = false, None,
+        table("t").as("x"), SampleMethod.Bernoulli).select(star()))
+    // No qualifier defaults to Bernoulli (backward compat)
+    assertEqual(
+      s"$sql tablesample(43 percent) as x",
+      Sample(0, .43d, withReplacement = false, None,
+        table("t").as("x")).select(star()))
+  }
+
+  test("SPARK-55978: TABLESAMPLE SYSTEM - case insensitivity") {
+    val sql = "select * from t"
+    // Keywords are case-insensitive
+    assertEqual(
+      s"$sql TABLESAMPLE SYSTEM (43 PERCENT) as x",
+      Sample(0, .43d, withReplacement = false, None,
+        table("t").as("x"), SampleMethod.System).select(star()))
+    assertEqual(
+      s"$sql TabLeSaMpLe SyStEm (43 PeRcEnT) as x",
+      Sample(0, .43d, withReplacement = false, None,
+        table("t").as("x"), SampleMethod.System).select(star()))
+    assertEqual(
+      s"$sql TABLESAMPLE BERNOULLI (43 PERCENT) as x",
+      Sample(0, .43d, withReplacement = false, None,
+        table("t").as("x"), SampleMethod.Bernoulli).select(star()))
+  }
+
+  test("SPARK-55978: TABLESAMPLE SYSTEM - boundary fractions") {
+    val sql = "select * from t"
+    // 0 PERCENT
+    assertEqual(
+      s"$sql tablesample system (0 percent) as x",
+      Sample(0, 0d, withReplacement = false, None,
+        table("t").as("x"), SampleMethod.System).select(star()))
+    // 100 PERCENT
+    assertEqual(
+      s"$sql tablesample system (100 percent) as x",
+      Sample(0, 1d, withReplacement = false, None,
+        table("t").as("x"), SampleMethod.System).select(star()))
+    // Fractional percent
+    assertEqual(
+      s"$sql tablesample system (0.1 percent) as x",
+      Sample(0, 0.001d, withReplacement = false, None,
+        table("t").as("x"), SampleMethod.System).select(star()))
+  }
+
+  test("SPARK-55978: TABLESAMPLE SYSTEM - unsupported sample methods") {
+    val sql = "select * from t"
+    // SYSTEM + ROWS -> error
+    checkError(
+      exception = parseException(s"$sql tablesample system (100 rows)"),
+      condition = "UNSUPPORTED_FEATURE.TABLESAMPLE_SYSTEM_SAMPLE_METHOD",
+      sqlState = "0A000",
+      parameters = Map("sampleMethod" -> "ROWS"),
+      context = ExpectedContext(
+        fragment = "tablesample system (100 rows)",
+        start = 16,
+        stop = 44))
+    // SYSTEM + BYTES -> error
+    checkError(
+      exception = parseException(s"$sql tablesample system (300M)"),
+      condition = "UNSUPPORTED_FEATURE.TABLESAMPLE_SYSTEM_SAMPLE_METHOD",
+      sqlState = "0A000",
+      parameters = Map("sampleMethod" -> "BYTES"),
+      context = ExpectedContext(
+        fragment = "tablesample system (300M)",
+        start = 16,
+        stop = 40))
+    // SYSTEM + BUCKET -> error
+    checkError(
+      exception = parseException(s"$sql tablesample system (bucket 4 out of 10)"),
+      condition = "UNSUPPORTED_FEATURE.TABLESAMPLE_SYSTEM_SAMPLE_METHOD",
+      sqlState = "0A000",
+      parameters = Map("sampleMethod" -> "BUCKET"),
+      context = ExpectedContext(
+        fragment = "tablesample system (bucket 4 out of 10)",
+        start = 16,
+        stop = 54))
+    // SYSTEM + BUCKET ON colname -> error
+    checkError(
+      exception = parseException(s"$sql tablesample system (bucket 4 out of 10 on x)"),
+      condition = "UNSUPPORTED_FEATURE.TABLESAMPLE_SYSTEM_SAMPLE_METHOD",
+      sqlState = "0A000",
+      parameters = Map("sampleMethod" -> "BUCKET"),
+      context = ExpectedContext(
+        fragment = "tablesample system (bucket 4 out of 10 on x)",
+        start = 16,
+        stop = 59))
+    // SYSTEM + BUCKET ON function -> error
+    checkError(
+      exception = parseException(s"$sql tablesample system (bucket 3 out of 32 on rand())"),
+      condition = "UNSUPPORTED_FEATURE.TABLESAMPLE_SYSTEM_SAMPLE_METHOD",
+      sqlState = "0A000",
+      parameters = Map("sampleMethod" -> "BUCKET"),
+      context = ExpectedContext(
+        fragment = "tablesample system (bucket 3 out of 32 on rand())",
+        start = 16,
+        stop = 64))
+  }
+
+  test("SPARK-55978: TABLESAMPLE BERNOULLI - REPEATABLE is supported") {
+    assertEqual(
+      "select * from t tablesample bernoulli (43 percent) repeatable (123) as x",
+      Sample(0, .43d, withReplacement = false, 123L,
+        table("t").as("x"), SampleMethod.Bernoulli).select(star()))
+  }
+
+  test("SPARK-55978: TABLESAMPLE SYSTEM - REPEATABLE not supported") {
+    val sql = "select * from t"
+    checkError(
+      exception = parseException(s"$sql tablesample system (43 percent) repeatable (123)"),
+      condition = "UNSUPPORTED_FEATURE.TABLESAMPLE_SYSTEM_REPEATABLE",
+      sqlState = "0A000",
+      context = ExpectedContext(
+        fragment = "tablesample system (43 percent) repeatable (123)",
+        start = 16,
+        stop = 63))
+  }
+
+  test("SPARK-55978: TABLESAMPLE SYSTEM - fraction out of range") {
+    val sql = "select * from t"
+    // > 100 PERCENT
+    checkError(
+      exception = parseException(s"$sql tablesample system (150 percent) as x"),
+      condition = "INVALID_TABLESAMPLE_FRACTION",
+      parameters = Map("fraction" -> "1.5"),
+      context = ExpectedContext(
+        fragment = "tablesample system (150 percent)",
+        start = 16,
+        stop = 47))
+    // Negative PERCENT
+    checkError(
+      exception = parseException(s"$sql tablesample system (-10 percent) as x"),
+      condition = "INVALID_TABLESAMPLE_FRACTION",
+      parameters = Map("fraction" -> "-0.1"),
+      context = ExpectedContext(
+        fragment = "tablesample system (-10 percent)",
+        start = 16,
+        stop = 47))
+  }
+
+  test("SPARK-55978: TABLESAMPLE SYSTEM and BERNOULLI as identifiers") {
+    // SYSTEM usable as column name (nonReserved)
+    assertEqual("SELECT system FROM t",
+      table("t").select($"system"))
+    // BERNOULLI usable as column name
+    assertEqual("SELECT bernoulli FROM t",
+      table("t").select($"bernoulli"))
+    // Usable as table alias
+    assertEqual("SELECT * FROM t system",
+      table("t").as("system").select(star()))
+    assertEqual("SELECT * FROM t bernoulli",
+      table("t").as("bernoulli").select(star()))
+    // SYSTEM as table name with default (Bernoulli) TABLESAMPLE
+    assertEqual("SELECT * FROM system TABLESAMPLE(10 PERCENT) AS x",
+      Sample(0, .1d, withReplacement = false, None,
+        table("system").as("x")).select(star()))
+    // SYSTEM as table name with TABLESAMPLE SYSTEM qualifier
+    assertEqual("SELECT * FROM system TABLESAMPLE SYSTEM (10 PERCENT) AS x",
+      Sample(0, .1d, withReplacement = false, None,
+        table("system").as("x"), SampleMethod.System).select(star()))
+    // SYSTEM as both table name and alias with TABLESAMPLE
+    assertEqual("SELECT * FROM system TABLESAMPLE(10 PERCENT) system",
+      Sample(0, .1d, withReplacement = false, None,
+        table("system").as("system")).select(star()))
+    // BERNOULLI as table name with TABLESAMPLE BERNOULLI qualifier
+    assertEqual("SELECT * FROM bernoulli TABLESAMPLE BERNOULLI (10 PERCENT) AS x",
+      Sample(0, .1d, withReplacement = false, None,
+        table("bernoulli").as("x"), SampleMethod.Bernoulli).select(star()))
+    // SYSTEM as table name with TABLESAMPLE BERNOULLI (cross-keyword)
+    assertEqual("SELECT * FROM system TABLESAMPLE BERNOULLI (10 PERCENT) AS x",
+      Sample(0, .1d, withReplacement = false, None,
+        table("system").as("x"), SampleMethod.Bernoulli).select(star()))
+    // BERNOULLI as both table name and alias with TABLESAMPLE
+    assertEqual("SELECT * FROM bernoulli TABLESAMPLE(10 PERCENT) bernoulli",
+      Sample(0, .1d, withReplacement = false, None,
+        table("bernoulli").as("bernoulli")).select(star()))
+    // Schema-qualified SYSTEM table name with TABLESAMPLE SYSTEM
+    assertEqual("SELECT * FROM mydb.system TABLESAMPLE SYSTEM (10 PERCENT) AS x",
+      Sample(0, .1d, withReplacement = false, None,
+        table("mydb", "system").as("x"), SampleMethod.System).select(star()))
+  }
+
+  test("SPARK-55978: TABLESAMPLE SYSTEM - subquery and join contexts") {
+    // SYSTEM sample in subquery
+    assertEqual(
+      "SELECT * FROM (SELECT * FROM t TABLESAMPLE SYSTEM (50 PERCENT)) sub",
+      Sample(0, .5d, withReplacement = false, None,
+        table("t"), SampleMethod.System)
+        .select(star()).as("sub").select(star()))
   }
 
   test("sub-query") {
@@ -913,29 +1839,19 @@ class PlanParserSuite extends AnalysisTest {
       "select * from range(2)",
       UnresolvedTableValuedFunction("range", Literal(2) :: Nil).select(star()))
 
-    // SPARK-34627
-    val sql1 = "select * from default.range(2)"
-    val fragment1 = "default.range(2)"
-    checkError(
-      exception = parseException(sql1),
-      condition = "INVALID_SQL_SYNTAX.INVALID_TABLE_VALUED_FUNC_NAME",
-      parameters = Map("funcName" -> "`default`.`range`"),
-      context = ExpectedContext(
-        fragment = fragment1,
-        start = 14,
-        stop = 29))
+    // SPARK-34627 - Qualified table-valued functions are now supported
+    assertEqual(
+      "select * from default.range(2)",
+      UnresolvedTableValuedFunction(
+        Seq("default", "range"),
+        Literal(2) :: Nil).select(star()))
 
-    // SPARK-38957
-    val sql2 = "select * from spark_catalog.default.range(2)"
-    val fragment2 = "spark_catalog.default.range(2)"
-    checkError(
-      exception = parseException(sql2),
-      condition = "INVALID_SQL_SYNTAX.INVALID_TABLE_VALUED_FUNC_NAME",
-      parameters = Map("funcName" -> "`spark_catalog`.`default`.`range`"),
-      context = ExpectedContext(
-        fragment = fragment2,
-        start = 14,
-        stop = 43))
+    // SPARK-38957 - Fully qualified table-valued functions are now supported
+    assertEqual(
+      "select * from spark_catalog.default.range(2)",
+      UnresolvedTableValuedFunction(
+        Seq("spark_catalog", "default", "range"),
+        Literal(2) :: Nil).select(star()))
   }
 
   test("SPARK-20311 range(N) as alias") {
@@ -1395,7 +2311,7 @@ class PlanParserSuite extends AnalysisTest {
     checkError(
       exception = parseException(sql2),
       condition = "PARSE_SYNTAX_ERROR",
-      parameters = Map("error" -> "'IN'", "hint" -> ""))
+      parameters = Map("error" -> "'INTO'", "hint" -> ""))
   }
 
   test("relation in v2 catalog") {
@@ -1419,6 +2335,45 @@ class PlanParserSuite extends AnalysisTest {
     assertEqual(
       "WITH t(x) AS (SELECT c FROM a) SELECT * FROM t",
       cte(table("t").select(star()), false, "t" -> ((table("a").select($"c"), Seq("x")))))
+  }
+
+  test("CTE with materialization option") {
+    def cteWithOption(materialized: Option[Boolean]): UnresolvedWith = {
+      UnresolvedWith(
+        table("t").select(star()),
+        Seq(UnresolvedCTERelation(
+          "t", SubqueryAlias("t", table("a").select($"c")), materialized = materialized)))
+    }
+    assertEqual(
+      "WITH t AS MATERIALIZED (SELECT c FROM a) SELECT * FROM t",
+      cteWithOption(Some(true)))
+    assertEqual(
+      "WITH t AS NOT MATERIALIZED (SELECT c FROM a) SELECT * FROM t",
+      cteWithOption(Some(false)))
+    // AS is optional.
+    assertEqual(
+      "WITH t MATERIALIZED (SELECT c FROM a) SELECT * FROM t",
+      cteWithOption(Some(true)))
+    assertEqual(
+      "WITH t NOT MATERIALIZED (SELECT c FROM a) SELECT * FROM t",
+      cteWithOption(Some(false)))
+    // Combined with column aliases and recursion options.
+    assertEqual(
+      "WITH RECURSIVE r(x) MAX RECURSION LEVEL 5 AS MATERIALIZED (SELECT c FROM a) " +
+        "SELECT * FROM r",
+      UnresolvedWith(
+        table("r").select(star()),
+        Seq(UnresolvedCTERelation(
+          "r",
+          SubqueryAlias("r", UnresolvedSubqueryColumnAliases(Seq("x"), table("a").select($"c"))),
+          maxDepth = Some(5),
+          materialized = Some(true))),
+        allowRecursion = true))
+    // MATERIALIZED is a non-reserved keyword and can still be used as a CTE name.
+    assertEqual(
+      "WITH materialized AS (SELECT c FROM a) SELECT * FROM materialized",
+      cte(table("materialized").select(star()), false,
+        "materialized" -> ((table("a").select($"c"), Seq.empty))))
   }
 
   test("Recursive CTE") {
@@ -1650,17 +2605,24 @@ class PlanParserSuite extends AnalysisTest {
         val sql8 = s"select * from my_tvf(arg1 => $sql8tableArg $sql8partition)"
         checkError(
           exception = parseException(sql8),
-          condition = "_LEGACY_ERROR_TEMP_0064",
-          parameters = Map(
-            "msg" ->
-              ("The table function call includes a table argument with an invalid " +
-              "partitioning/ordering specification: the PARTITION BY clause included multiple " +
-              "expressions without parentheses surrounding them; please add parentheses around " +
-              "these expressions and then retry the query again")),
+          condition = "INVALID_SQL_SYNTAX.INVALID_TABLE_FUNCTION_TABLE_ARGUMENT_PARTITIONING",
+          parameters = Map("clause" -> "PARTITION BY"),
           context = ExpectedContext(
             fragment = s"$sql8tableArg $sql8partition",
             start = 29,
             stop = 110 + partition.length)
+        )
+        val sql9tableArg = "table(select col1, col2, col3 from v2)"
+        val sql9partition = s"$partition by col1 $order by col2 asc, col3 desc"
+        val sql9 = s"select * from my_tvf(arg1 => $sql9tableArg $sql9partition)"
+        checkError(
+          exception = parseException(sql9),
+          condition = "INVALID_SQL_SYNTAX.INVALID_TABLE_FUNCTION_TABLE_ARGUMENT_PARTITIONING",
+          parameters = Map("clause" -> "ORDER BY"),
+          context = ExpectedContext(
+            fragment = s"$sql9tableArg $sql9partition",
+            start = 29,
+            stop = 99 + partition.length + order.length)
         )
       }
     }
@@ -1831,12 +2793,395 @@ class PlanParserSuite extends AnalysisTest {
     val fragment = "TIMESTAMP AS OF col"
     checkError(
       exception = parseException(sql),
-      condition = "_LEGACY_ERROR_TEMP_0056",
-      parameters = Map("reason" -> "timestamp expression cannot refer to any columns"),
+      condition = "INVALID_TIME_TRAVEL_TIMESTAMP_EXPR.COLUMN_REFERENCE",
+      sqlState = "42K0E",
+      parameters = Map("expr" -> "\"col\""),
       context = ExpectedContext(
         fragment = fragment,
         start = 20,
         stop = 38))
+
+    val sql2 = "SELECT * FROM a.b.c TIMESTAMP AS OF col + INTERVAL 1 DAY"
+    val fragment2 = "TIMESTAMP AS OF col + INTERVAL 1 DAY"
+    checkError(
+      exception = parseException(sql2),
+      condition = "INVALID_TIME_TRAVEL_TIMESTAMP_EXPR.COLUMN_REFERENCE",
+      sqlState = "42K0E",
+      parameters = Map("expr" -> "\"col + INTERVAL 1 DAY\""),
+      context = ExpectedContext(
+        fragment = fragment2,
+        start = 20,
+        stop = 55))
+  }
+
+  test("at syntax time travel") {
+    def versionPlan(version: String): LogicalPlan = {
+      Project(Seq(UnresolvedStar(None)),
+        RelationTimeTravel(UnresolvedRelation(Seq("a", "b", "c")), None, Some(version)))
+    }
+    assertEqual("SELECT * FROM a.b.c@v123456789", versionPlan("123456789"))
+    assertEqual("SELECT * FROM a.b.c@V123456789", versionPlan("123456789"))
+    assertEqual("SELECT * FROM a.b.c @v123456789", versionPlan("123456789"))
+    assertEqual("SELECT * FROM a.b.c@v'Snapshot123456789'", versionPlan("Snapshot123456789"))
+
+    val micros = DateTimeUtils.stringToTimestampAnsi(
+      UTF8String.fromString("2019-01-29 00:37:58"),
+      DateTimeUtils.getZoneId(SQLConf.get.sessionLocalTimeZone))
+    assertEqual("SELECT * FROM a.b.c@20190129003758000",
+      Project(Seq(UnresolvedStar(None)),
+        RelationTimeTravel(
+          UnresolvedRelation(Seq("a", "b", "c")),
+          Some(Literal(micros, TimestampType)),
+          None)))
+
+    val microsWithMillis = DateTimeUtils.stringToTimestampAnsi(
+      UTF8String.fromString("2019-01-29 00:37:58.123"),
+      DateTimeUtils.getZoneId(SQLConf.get.sessionLocalTimeZone))
+    assertEqual("SELECT * FROM a.b.c@20190129003758123",
+      Project(Seq(UnresolvedStar(None)),
+        RelationTimeTravel(
+          UnresolvedRelation(Seq("a", "b", "c")),
+          Some(Literal(microsWithMillis, TimestampType)),
+          None)))
+
+    assertEqual("SELECT * FROM `t@v1`",
+      Project(Seq(UnresolvedStar(None)), UnresolvedRelation(Seq("t@v1"))))
+
+    // A non-time-travel '@' suffix is always a parse error.
+    Seq("SELECT * FROM a@foo", "SELECT * FROM a@", "SELECT * FROM a@v").foreach { q =>
+      assert(intercept[ParseException](parsePlan(q)).getCondition == "PARSE_SYNTAX_ERROR",
+        s"expected PARSE_SYNTAX_ERROR for: $q")
+    }
+
+    // The '@' suffix conflicts with an AS OF clause.
+    checkError(
+      exception = parseException("SELECT * FROM t@v1 VERSION AS OF 2"),
+      condition = "MULTIPLE_TIME_TRAVEL_SPEC",
+      parameters = Map.empty,
+      context = ExpectedContext(fragment = "VERSION AS OF 2", start = 19, stop = 33))
+    checkError(
+      exception = parseException("SELECT * FROM t@v1 TIMESTAMP AS OF '2019-01-29'"),
+      condition = "MULTIPLE_TIME_TRAVEL_SPEC",
+      parameters = Map.empty,
+      context = ExpectedContext(fragment = "TIMESTAMP AS OF '2019-01-29'", start = 19, stop = 46))
+    checkError(
+      exception = parseException("SELECT * FROM t@20190129003758000 VERSION AS OF 2"),
+      condition = "MULTIPLE_TIME_TRAVEL_SPEC",
+      parameters = Map.empty,
+      context = ExpectedContext(fragment = "VERSION AS OF 2", start = 34, stop = 48))
+    checkError(
+      exception = parseException("SELECT * FROM t@20190129003758000 TIMESTAMP AS OF '2019-01-29'"),
+      condition = "MULTIPLE_TIME_TRAVEL_SPEC",
+      parameters = Map.empty,
+      context = ExpectedContext(fragment = "TIMESTAMP AS OF '2019-01-29'", start = 34, stop = 61))
+
+    checkError(
+      exception = parseException("SELECT * FROM t@123"),
+      condition = "INVALID_TIME_TRAVEL_TIMESTAMP_FORMAT",
+      parameters = Map("timestamp" -> "123", "format" -> "yyyyMMddHHmmssSSS"),
+      context = ExpectedContext(fragment = "t@123", start = 14, stop = 18))
+
+    checkError(
+      exception = parseException("SELECT * FROM t@20191301000000000"),
+      condition = "INVALID_TIME_TRAVEL_TIMESTAMP_FORMAT",
+      parameters = Map("timestamp" -> "20191301000000000", "format" -> "yyyyMMddHHmmssSSS"),
+      context = ExpectedContext(fragment = "t@20191301000000000", start = 14, stop = 32))
+
+    // Wrong-length timestamps are rejected.
+    checkError(
+      exception = parseException("SELECT * FROM t@20190129003758"),
+      condition = "INVALID_TIME_TRAVEL_TIMESTAMP_FORMAT",
+      parameters = Map("timestamp" -> "20190129003758", "format" -> "yyyyMMddHHmmssSSS"),
+      context = ExpectedContext(fragment = "t@20190129003758", start = 14, stop = 29))
+    checkError(
+      exception = parseException("SELECT * FROM t@20190129"),
+      condition = "INVALID_TIME_TRAVEL_TIMESTAMP_FORMAT",
+      parameters = Map("timestamp" -> "20190129", "format" -> "yyyyMMddHHmmssSSS"),
+      context = ExpectedContext(fragment = "t@20190129", start = 14, stop = 23))
+
+    assert(intercept[ParseException] {
+      parsePlan("INSERT INTO t@v1 VALUES (1)")
+    }.getCondition == "PARSE_SYNTAX_ERROR")
+
+    withSQLConf(SQLConf.TIME_TRAVEL_AT_SYNTAX_ENABLED.key -> "false") {
+      checkError(
+        exception = parseException("SELECT * FROM t@v1"),
+        condition = "UNSUPPORTED_FEATURE.TIME_TRAVEL_AT_SYNTAX",
+        parameters = Map("config" -> "\"spark.sql.timeTravel.atSyntax.enabled\""),
+        context = ExpectedContext(fragment = "t@v1", start = 14, stop = 17))
+    }
+  }
+
+  test("parseTemporalTableIdentifier") {
+    assert(parseTemporalTableIdentifier("a.b") ===
+      TemporalIdentifier(Seq("a", "b"), None, None))
+    assert(parseTemporalTableIdentifier("a.b@v5") ===
+      TemporalIdentifier(Seq("a", "b"), None, Some("5")))
+    assert(parseTemporalTableIdentifier("`t@v1`") ===
+      TemporalIdentifier(Seq("t@v1"), None, None))
+    val micros = DateTimeUtils.stringToTimestampAnsi(
+      UTF8String.fromString("2019-01-29 00:37:58"),
+      DateTimeUtils.getZoneId(SQLConf.get.sessionLocalTimeZone))
+    assert(parseTemporalTableIdentifier("t@20190129003758000") ===
+      TemporalIdentifier(Seq("t"), Some(Literal(micros, TimestampType)), None))
+    Seq("a.b@x", "a@foo", "a@", "a@v").foreach { s =>
+      intercept[ParseException](parseTemporalTableIdentifier(s))
+    }
+  }
+
+  test("CHANGES clause - version range") {
+    def changesFromVersion(
+        startVersion: String,
+        endVersion: Option[String] = None,
+        startInclusive: Boolean = true,
+        endInclusive: Boolean = true): RelationChanges = {
+      RelationChanges(
+        UnresolvedRelation(Seq("a", "b", "c")),
+        new ChangelogContext(
+          new ChangelogRange.VersionRange(
+            startVersion,
+            endVersion.map(java.util.Optional.of[String])
+              .getOrElse(java.util.Optional.empty[String]),
+            startInclusive,
+            endInclusive),
+          ChangelogContext.DeduplicationMode.DROP_CARRYOVERS,
+          false))
+    }
+
+    // Basic version range: CHANGES FROM VERSION 10 TO VERSION 20
+    Seq("VERSION", "SYSTEM_VERSION").foreach { keyword =>
+      comparePlans(
+        parsePlan(s"SELECT * FROM a.b.c CHANGES FROM $keyword 10 TO $keyword 20"),
+        Project(Seq(UnresolvedStar(None)),
+          changesFromVersion("10", Some("20"))))
+    }
+
+    // Version range with string version
+    comparePlans(
+      parsePlan("SELECT * FROM a.b.c CHANGES FROM VERSION '5765898212649545898' " +
+        "TO VERSION '8439568982649545102'"),
+      Project(Seq(UnresolvedStar(None)),
+        changesFromVersion("5765898212649545898", Some("8439568982649545102"))))
+
+    // No ending version: CHANGES FROM VERSION 5
+    comparePlans(
+      parsePlan("SELECT * FROM a.b.c CHANGES FROM VERSION 5"),
+      Project(Seq(UnresolvedStar(None)),
+        changesFromVersion("5")))
+
+    // EXCLUSIVE starting bound
+    comparePlans(
+      parsePlan("SELECT * FROM a.b.c CHANGES FROM VERSION 10 EXCLUSIVE TO VERSION 20"),
+      Project(Seq(UnresolvedStar(None)),
+        changesFromVersion("10", Some("20"), startInclusive = false)))
+
+    // EXCLUSIVE ending bound
+    comparePlans(
+      parsePlan("SELECT * FROM a.b.c CHANGES FROM VERSION 10 TO VERSION 20 EXCLUSIVE"),
+      Project(Seq(UnresolvedStar(None)),
+        changesFromVersion("10", Some("20"), endInclusive = false)))
+
+    // Both bounds EXCLUSIVE
+    comparePlans(
+      parsePlan(
+        "SELECT * FROM a.b.c CHANGES FROM VERSION 10 EXCLUSIVE TO VERSION 20 EXCLUSIVE"),
+      Project(Seq(UnresolvedStar(None)),
+        changesFromVersion("10", Some("20"),
+          startInclusive = false, endInclusive = false)))
+
+    // INCLUSIVE is explicit (but default)
+    comparePlans(
+      parsePlan(
+        "SELECT * FROM a.b.c CHANGES FROM VERSION 10 INCLUSIVE TO VERSION 20 INCLUSIVE"),
+      Project(Seq(UnresolvedStar(None)),
+        changesFromVersion("10", Some("20"))))
+  }
+
+  test("CHANGES clause - timestamp range") {
+    def assertTimestampRange(sql: String): ChangelogRange.TimestampRange = {
+      val plan = parsePlan(sql)
+      val project = plan.asInstanceOf[Project]
+      val changes = project.child match {
+        case rc: RelationChanges => rc
+        case sa: SubqueryAlias => sa.child.asInstanceOf[RelationChanges]
+      }
+      changes.changelogContext.range().asInstanceOf[ChangelogRange.TimestampRange]
+    }
+
+    // Basic timestamp range
+    val range1 = assertTimestampRange(
+      "SELECT * FROM a.b.c CHANGES FROM TIMESTAMP '2026-01-01' TO TIMESTAMP '2026-02-01'")
+    assert(range1.startingBoundInclusive())
+    assert(range1.endingBoundInclusive())
+    assert(range1.endingTimestamp().isPresent)
+
+    // SYSTEM_TIME synonym
+    val range2 = assertTimestampRange(
+      "SELECT * FROM a.b.c CHANGES FROM SYSTEM_TIME '2026-01-01' TO SYSTEM_TIME '2026-02-01'")
+    assert(range2.startingTimestamp() == range1.startingTimestamp())
+    assert(range2.endingTimestamp() == range1.endingTimestamp())
+
+    // No ending timestamp
+    val range3 = assertTimestampRange(
+      "SELECT * FROM a.b.c CHANGES FROM TIMESTAMP '2026-01-01'")
+    assert(!range3.endingTimestamp().isPresent)
+
+    // EXCLUSIVE bounds on timestamp
+    val range4 = assertTimestampRange(
+      "SELECT * FROM a.b.c CHANGES FROM TIMESTAMP '2026-01-01' EXCLUSIVE " +
+        "TO TIMESTAMP '2026-02-01' EXCLUSIVE")
+    assert(!range4.startingBoundInclusive())
+    assert(!range4.endingBoundInclusive())
+
+    // INCLUSIVE is explicit but same as default
+    val range5 = assertTimestampRange(
+      "SELECT * FROM a.b.c CHANGES FROM TIMESTAMP '2026-01-01' INCLUSIVE " +
+        "TO TIMESTAMP '2026-02-01' INCLUSIVE")
+    assert(range5.startingBoundInclusive())
+    assert(range5.endingBoundInclusive())
+    assert(range5.startingTimestamp() == range1.startingTimestamp())
+  }
+
+  test("CHANGES clause - with options") {
+    def assertChangelogContext(sql: String): ChangelogContext = {
+      val plan = parsePlan(sql)
+      val project = plan.asInstanceOf[Project]
+      val changes = project.child match {
+        case rc: RelationChanges => rc
+        case sa: SubqueryAlias => sa.child.asInstanceOf[RelationChanges]
+      }
+      changes.changelogContext
+    }
+
+    // Default: DROP_CARRYOVERS and computeUpdates = false
+    val info1 = assertChangelogContext(
+      "SELECT * FROM a.b.c CHANGES FROM VERSION 10 TO VERSION 20")
+    assert(info1.deduplicationMode() == ChangelogContext.DeduplicationMode.DROP_CARRYOVERS)
+    assert(!info1.computeUpdates())
+
+    // deduplicationMode = none
+    val info2 = assertChangelogContext(
+      "SELECT * FROM a.b.c CHANGES FROM VERSION 10 TO VERSION 20 " +
+        "WITH (deduplicationMode = 'none')")
+    assert(info2.deduplicationMode() == ChangelogContext.DeduplicationMode.NONE)
+    assert(!info2.computeUpdates())
+
+    // deduplicationMode = netChanges
+    val info3 = assertChangelogContext(
+      "SELECT * FROM a.b.c CHANGES FROM VERSION 10 TO VERSION 20 " +
+        "WITH (deduplicationMode = 'netChanges')")
+    assert(info3.deduplicationMode() == ChangelogContext.DeduplicationMode.NET_CHANGES)
+
+    // computeUpdates = true
+    val info4 = assertChangelogContext(
+      "SELECT * FROM a.b.c CHANGES FROM VERSION 10 TO VERSION 20 " +
+        "WITH (computeUpdates = 'true')")
+    assert(info4.deduplicationMode() == ChangelogContext.DeduplicationMode.DROP_CARRYOVERS)
+    assert(info4.computeUpdates())
+
+    // Both options together
+    val info5 = assertChangelogContext(
+      "SELECT * FROM a.b.c CHANGES FROM VERSION 10 TO VERSION 20 " +
+        "WITH (deduplicationMode = 'none', computeUpdates = 'true')")
+    assert(info5.deduplicationMode() == ChangelogContext.DeduplicationMode.NONE)
+    assert(info5.computeUpdates())
+
+    // Case-insensitive deduplicationMode value
+    val info6 = assertChangelogContext(
+      "SELECT * FROM a.b.c CHANGES FROM VERSION 10 TO VERSION 20 " +
+        "WITH (deduplicationMode = 'DROPCARRYOVERS')")
+    assert(info6.deduplicationMode() == ChangelogContext.DeduplicationMode.DROP_CARRYOVERS)
+  }
+
+  test("CHANGES clause - invalid deduplicationMode") {
+    checkError(
+      intercept[AnalysisException] {
+        parsePlan(
+          "SELECT * FROM a.b.c CHANGES FROM VERSION 10 TO VERSION 20 " +
+            "WITH (deduplicationMode = 'invalid')")
+      },
+      condition = "INVALID_CDC_OPTION.INVALID_DEDUPLICATION_MODE",
+      parameters = Map("mode" -> "invalid"))
+  }
+
+  test("CHANGES clause - aliased table") {
+    // CHANGES with table alias
+    val plan = parsePlan(
+      "SELECT t.* FROM a.b.c CHANGES FROM VERSION 10 TO VERSION 20 AS t")
+    assert(plan.isInstanceOf[Project])
+    val project = plan.asInstanceOf[Project]
+    val alias = project.child.asInstanceOf[SubqueryAlias]
+    assert(alias.identifier.name == "t")
+    assert(alias.child.isInstanceOf[RelationChanges])
+  }
+
+  test("CHANGES clause - simple table name") {
+    comparePlans(
+      parsePlan("SELECT * FROM my_table CHANGES FROM VERSION 1"),
+      Project(Seq(UnresolvedStar(None)),
+        RelationChanges(
+          UnresolvedRelation(Seq("my_table")),
+          new ChangelogContext(
+            new ChangelogRange.VersionRange(
+              "1", java.util.Optional.empty[String], true, true),
+            ChangelogContext.DeduplicationMode.DROP_CARRYOVERS,
+            false))))
+  }
+
+  test("CHANGES clause - in subquery") {
+    val plan = parsePlan(
+      "SELECT * FROM (SELECT * FROM t CHANGES FROM VERSION 1 TO VERSION 5) sub")
+    assert(plan.isInstanceOf[Project])
+  }
+
+  test("CHANGES clause - in join") {
+    val plan = parsePlan(
+      "SELECT * FROM t1 CHANGES FROM VERSION 1 TO VERSION 5 AS a " +
+        "JOIN t2 CHANGES FROM VERSION 1 TO VERSION 5 AS b ON a.id = b.id")
+    assert(plan.isInstanceOf[Project])
+  }
+
+  test("CHANGES clause - error: column reference in timestamp") {
+    val sql = "SELECT * FROM t CHANGES FROM TIMESTAMP col_name"
+    checkError(
+      exception = parseException(sql),
+      condition = "INVALID_TIME_TRAVEL_TIMESTAMP_EXPR.COLUMN_REFERENCE",
+      sqlState = "42K0E",
+      parameters = Map("expr" -> "\"col_name\""),
+      context = ExpectedContext(
+        fragment = "t CHANGES FROM TIMESTAMP col_name",
+        start = 14,
+        stop = 46))
+
+    val sqlEnd = "SELECT * FROM t CHANGES FROM TIMESTAMP '2026-01-01' TO TIMESTAMP col_name"
+    checkError(
+      exception = parseException(sqlEnd),
+      condition = "INVALID_TIME_TRAVEL_TIMESTAMP_EXPR.COLUMN_REFERENCE",
+      sqlState = "42K0E",
+      parameters = Map("expr" -> "\"col_name\""),
+      context = ExpectedContext(
+        fragment = "t CHANGES FROM TIMESTAMP '2026-01-01' TO TIMESTAMP col_name",
+        start = 14,
+        stop = 72))
+  }
+
+  test("CHANGES clause - error: subquery in starting timestamp") {
+    checkError(
+      intercept[AnalysisException] {
+        parsePlan(
+          "SELECT * FROM t CHANGES FROM TIMESTAMP (SELECT MAX(ts) FROM other_table)")
+      },
+      condition = "INVALID_CDC_OPTION.INVALID_TIMESTAMP_EXPR")
+  }
+
+  test("CHANGES clause - error: subquery in ending timestamp") {
+    checkError(
+      intercept[AnalysisException] {
+        parsePlan(
+          "SELECT * FROM t CHANGES FROM TIMESTAMP '2026-01-01' " +
+            "TO TIMESTAMP (SELECT MAX(ts) FROM other_table)")
+      },
+      condition = "INVALID_CDC_OPTION.INVALID_TIMESTAMP_EXPR")
   }
 
   test("PERCENTILE_CONT & PERCENTILE_DISC") {
@@ -2161,6 +3506,626 @@ class PlanParserSuite extends AnalysisTest {
       parameters = Map("error" -> "'ts'", "hint" -> ""))
   }
 
+  test("BIN BY: clause parses into the expected UnresolvedBinBy") {
+    // Minimal clause: all optionals (ALIGN TO, output renames) omitted.
+    val minimal = singleBinBy(parsePlan(
+      """SELECT * FROM metrics BIN BY (
+        |  RANGE ts_start TO ts_end
+        |  BIN WIDTH INTERVAL '5' MINUTE
+        |  DISTRIBUTE UNIFORM (value)
+        |)""".stripMargin))
+    assert(minimal.rangeStartCol == UnresolvedAttribute(Seq("ts_start")))
+    assert(minimal.rangeEndCol == UnresolvedAttribute(Seq("ts_end")))
+    assert(minimal.originExpr.isEmpty)
+    assert(minimal.distributeColumns == Seq(UnresolvedAttribute(Seq("value"))))
+    assert(minimal.outputAliases == BinByOutputAliases.empty)
+
+    // Qualified column references and a partial HOUR TO MINUTE interval as BIN WIDTH.
+    val qualified = singleBinBy(parsePlan(
+      """SELECT * FROM t1 JOIN t2 ON t1.id = t2.id BIN BY (
+        |  RANGE t1.ts_start TO t1.ts_end
+        |  BIN WIDTH INTERVAL '5:30' HOUR TO MINUTE
+        |  DISTRIBUTE UNIFORM (t1.value)
+        |)""".stripMargin))
+    assert(qualified.rangeStartCol == UnresolvedAttribute(Seq("t1", "ts_start")))
+    assert(qualified.rangeEndCol == UnresolvedAttribute(Seq("t1", "ts_end")))
+    assert(qualified.distributeColumns == Seq(UnresolvedAttribute(Seq("t1", "value"))))
+
+    // Maximal clause: explicit ALIGN TO, multiple DISTRIBUTE UNIFORM columns, all three renames.
+    val maximal = singleBinBy(parsePlan(
+      """SELECT * FROM metrics BIN BY (
+        |  RANGE ts_start TO ts_end
+        |  BIN WIDTH INTERVAL '1' HOUR
+        |  ALIGN TO TIMESTAMP '2024-01-01 00:30:00'
+        |  DISTRIBUTE UNIFORM (bytes_sent, requests)
+        |  BIN_START AS ws
+        |  BIN_END AS we
+        |  BIN_DISTRIBUTE_RATIO AS frac
+        |)""".stripMargin))
+    assert(maximal.originExpr.contains(parseExpression("TIMESTAMP '2024-01-01 00:30:00'")))
+    assert(maximal.distributeColumns == Seq(
+      UnresolvedAttribute(Seq("bytes_sent")),
+      UnresolvedAttribute(Seq("requests"))))
+    assert(maximal.outputAliases.binStart.contains("ws"))
+    assert(maximal.outputAliases.binEnd.contains("we"))
+    assert(maximal.outputAliases.binRatio.contains("frac"))
+  }
+
+  test("BIN BY: malformed clauses raise PARSE_SYNTAX_ERROR") {
+    def assertSyntaxError(query: String): Unit =
+      assert(parseException(query).getCondition == "PARSE_SYNTAX_ERROR")
+
+    // BIN WIDTH missing.
+    assertSyntaxError(
+      """SELECT * FROM metrics BIN BY (
+        |  RANGE ts_start TO ts_end
+        |  DISTRIBUTE UNIFORM (value)
+        |)""".stripMargin)
+
+    // DISTRIBUTE UNIFORM missing.
+    assertSyntaxError(
+      """SELECT * FROM metrics BIN BY (
+        |  RANGE ts_start TO ts_end
+        |  BIN WIDTH INTERVAL '5' MINUTE
+        |)""".stripMargin)
+
+    // DISTRIBUTE UNIFORM with an empty column list.
+    assertSyntaxError(
+      """SELECT * FROM metrics BIN BY (
+        |  RANGE ts_start TO ts_end
+        |  BIN WIDTH INTERVAL '5' MINUTE
+        |  DISTRIBUTE UNIFORM ()
+        |)""".stripMargin)
+
+    // RANGE missing.
+    assertSyntaxError(
+      """SELECT * FROM metrics BIN BY (
+        |  BIN WIDTH INTERVAL '5' MINUTE
+        |  DISTRIBUTE UNIFORM (value)
+        |)""".stripMargin)
+
+    // Clauses out of order: BIN WIDTH must come after RANGE.
+    assertSyntaxError(
+      """SELECT * FROM metrics BIN BY (
+        |  BIN WIDTH INTERVAL '5' MINUTE
+        |  RANGE ts_start TO ts_end
+        |  DISTRIBUTE UNIFORM (value)
+        |)""".stripMargin)
+  }
+
+  test("BIN BY: new keywords stay non-reserved and `bin` still parses as a table alias") {
+    // The seven new keywords are in `ansiNonReserved`, so they stay usable as plain identifiers
+    // outside a BIN BY clause.
+    assert(binByNodes(parsePlan(
+      "SELECT bin, width, uniform, align, bin_start, bin_end, bin_distribute_ratio " +
+        "FROM t WHERE bin > 0")).isEmpty)
+
+    // `bin` not followed by BY stays a table alias, both bare and when referenced downstream.
+    assert(binByNodes(parsePlan("SELECT * FROM t bin")).isEmpty)
+    assert(binByNodes(parsePlan("SELECT bin.x FROM t bin WHERE bin.x > 0")).isEmpty)
+  }
+
+  test("BIN BY: composition, chaining, trailing alias, and pipe operator") {
+    // Composes with a subquery in FROM and a downstream WHERE.
+    assert(binByNodes(parsePlan(
+      """SELECT * FROM (SELECT * FROM metrics) BIN BY (
+        |  RANGE ts_start TO ts_end
+        |  BIN WIDTH INTERVAL '5' MINUTE
+        |  DISTRIBUTE UNIFORM (value)
+        |) WHERE value > 0""".stripMargin)).size == 1)
+
+    // Composes after PIVOT.
+    assert(binByNodes(parsePlan(
+      """SELECT * FROM events
+        |PIVOT (sum(amount) FOR category IN ('a', 'b'))
+        |BIN BY (
+        |  RANGE ts_start TO ts_end
+        |  BIN WIDTH INTERVAL '5' MINUTE
+        |  DISTRIBUTE UNIFORM (a, b)
+        |)""".stripMargin)).size == 1)
+
+    // Two BIN BY clauses chain on the same relation.
+    assert(binByNodes(parsePlan(
+      """SELECT * FROM metrics
+        |BIN BY (
+        |  RANGE ts_start TO ts_end
+        |  BIN WIDTH INTERVAL '5' MINUTE
+        |  DISTRIBUTE UNIFORM (value)
+        |)
+        |BIN BY (
+        |  RANGE bin_start TO bin_end
+        |  BIN WIDTH INTERVAL '1' HOUR
+        |  DISTRIBUTE UNIFORM (value)
+        |  BIN_START AS hr_start
+        |  BIN_END AS hr_end
+        |  BIN_DISTRIBUTE_RATIO AS hr_ratio
+        |)""".stripMargin)).size == 2)
+
+    // Trailing alias, with and without the AS keyword, wraps the BinBy in a SubqueryAlias.
+    Seq(") AS binned", ") binned").foreach { tail =>
+      val parsed = parsePlan(
+        s"""SELECT * FROM metrics BIN BY (
+           |  RANGE ts_start TO ts_end
+           |  BIN WIDTH INTERVAL '5' MINUTE
+           |  DISTRIBUTE UNIFORM (value)
+           |$tail""".stripMargin)
+      val aliases = parsed.collect { case s: SubqueryAlias if s.alias == "binned" => s }
+      assert(aliases.size == 1, s"alias tail '$tail' did not produce a SubqueryAlias")
+      assert(aliases.head.child.isInstanceOf[UnresolvedBinBy])
+    }
+
+    // Works as a SQL pipe-operator stage with |>.
+    assert(binByNodes(parsePlan(
+      """FROM metrics
+        ||> BIN BY (
+        |  RANGE ts_start TO ts_end
+        |  BIN WIDTH INTERVAL '5' MINUTE
+        |  DISTRIBUTE UNIFORM (value)
+        |)""".stripMargin)).size == 1)
+  }
+
+  test("BIN BY: a join keyword after the clause starts the join, not a table alias") {
+    val binBy = "metrics BIN BY (RANGE ts_start TO ts_end BIN WIDTH INTERVAL '1' HOUR " +
+      "DISTRIBUTE UNIFORM (value))"
+    Seq("false", "true").foreach { enforceReserved =>
+      withSQLConf(
+          SQLConf.ANSI_ENABLED.key -> "true",
+          SQLConf.ENFORCE_RESERVED_KEYWORDS.key -> enforceReserved) {
+        Seq(
+          "LEFT JOIN t ON metrics.k = t.k" -> LeftOuter,
+          "RIGHT JOIN t ON metrics.k = t.k" -> RightOuter,
+          "FULL JOIN t ON metrics.k = t.k" -> FullOuter,
+          "INNER JOIN t ON metrics.k = t.k" -> Inner,
+          "LEFT SEMI JOIN t ON metrics.k = t.k" -> LeftSemi,
+          "LEFT ANTI JOIN t ON metrics.k = t.k" -> LeftAnti,
+          "CROSS JOIN t" -> Cross,
+          "NATURAL JOIN t" -> NaturalJoin(Inner),
+          "NATURAL LEFT JOIN t" -> NaturalJoin(LeftOuter)).foreach { case (join, joinType) =>
+          val clue = s"$join, enforceReservedKeywords=$enforceReserved"
+          val joins = parsePlan(s"SELECT * FROM $binBy $join").collect { case j: Join => j }
+          assert(joins.map(_.joinType) == Seq(joinType), clue)
+          assert(joins.head.left.isInstanceOf[UnresolvedBinBy], clue)
+        }
+
+        // A table alias before the join keyword still names the BIN BY output.
+        val aliasedJoins = parsePlan(s"SELECT * FROM $binBy b LEFT JOIN t ON b.k = t.k")
+          .collect { case j: Join => j }
+        assert(aliasedJoins.map(_.joinType) == Seq(LeftOuter))
+        aliasedJoins.head.left match {
+          case SubqueryAlias(alias, _: UnresolvedBinBy) => assert(alias.name == "b")
+          case other => fail(s"expected an aliased BIN BY, got:\n$other")
+        }
+
+        // A quoted join keyword is still a valid table alias.
+        val quoted = parsePlan(s"SELECT * FROM $binBy AS `left`")
+        val aliases = quoted.collect { case s: SubqueryAlias if s.alias == "left" => s }
+        assert(aliases.size == 1)
+        assert(aliases.head.child.isInstanceOf[UnresolvedBinBy])
+      }
+    }
+  }
+
+  test("GAP FILL: clause parses into the expected UnresolvedGapFill") {
+    // Minimal clause without PARTITION BY, optional clauses or a table alias.
+    val minimal = singleGapFill(parsePlan(
+      """SELECT * FROM metrics GAP FILL (
+        |  ORDER BY ts
+        |  BIN WIDTH INTERVAL '5' MINUTE
+        |)""".stripMargin))
+    assert(minimal.partitionColumns.isEmpty)
+    assert(minimal.timeColumn == UnresolvedAttribute(Seq("ts")))
+    assert(minimal.binWidthExpr == parseExpression("INTERVAL '5' MINUTE"))
+    assert(minimal.originExpr.isEmpty)
+    assert(minimal.rangeStartExpr.isEmpty && minimal.rangeEndExpr.isEmpty)
+    assert(minimal.fillColumns.isEmpty)
+    assert(minimal.maxGapExpr.isEmpty)
+    assert(minimal.binStart.isEmpty && minimal.isGenerated.isEmpty)
+
+    // Qualified columns and several PARTITION BY columns.
+    val partitioned = singleGapFill(parsePlan(
+      """SELECT * FROM t1 GAP FILL (
+        |  PARTITION BY t1.region, t1.device_id
+        |  ORDER BY t1.ts
+        |  BIN WIDTH INTERVAL '5' MINUTE
+        |)""".stripMargin))
+    assert(partitioned.partitionColumns == Seq(
+      UnresolvedAttribute(Seq("t1", "region")),
+      UnresolvedAttribute(Seq("t1", "device_id"))))
+    assert(partitioned.timeColumn == UnresolvedAttribute(Seq("t1", "ts")))
+  }
+
+  test("GAP FILL: every clause and fill method parses, with optional clauses in any order") {
+    val maximal = singleGapFill(parsePlan(
+      """SELECT * FROM metrics GAP FILL (
+        |  PARTITION BY device_id
+        |  ORDER BY ts
+        |  BIN WIDTH INTERVAL '5' MINUTE
+        |  ALIGN TO TIMESTAMP '2024-01-01 00:02:00'
+        |  RANGE BETWEEN TIMESTAMP '2024-01-01 00:00:00' AND TIMESTAMP '2024-01-02 00:00:00'
+        |  FILL (a LINEAR, b FFILL, c FORWARD FILL, d BFILL, e BACKWARD FILL,
+        |    f CONSTANT 'unknown', g NULL)
+        |  MAX GAP INTERVAL '40' MINUTE
+        |  BIN_START AS bin_begin
+        |  IS_GENERATED AS gen
+        |)""".stripMargin))
+    assert(maximal.partitionColumns == Seq(UnresolvedAttribute(Seq("device_id"))))
+    assert(maximal.originExpr.contains(parseExpression("TIMESTAMP '2024-01-01 00:02:00'")))
+    assert(maximal.rangeStartExpr.contains(parseExpression("TIMESTAMP '2024-01-01 00:00:00'")))
+    assert(maximal.rangeEndExpr.contains(parseExpression("TIMESTAMP '2024-01-02 00:00:00'")))
+    def fill(name: String, method: GapFillMethod): GapFillColumn =
+      GapFillColumn(UnresolvedAttribute(Seq(name)), method)
+    assert(maximal.fillColumns == Seq(
+      fill("a", GapFillMethod.Linear),
+      fill("b", GapFillMethod.ForwardFill),
+      fill("c", GapFillMethod.ForwardFill),
+      fill("d", GapFillMethod.BackwardFill),
+      fill("e", GapFillMethod.BackwardFill),
+      fill("f", GapFillMethod.Constant(parseExpression("'unknown'"))),
+      fill("g", GapFillMethod.Null)))
+    assert(maximal.maxGapExpr.contains(parseExpression("INTERVAL '40' MINUTE")))
+    assert(maximal.binStart.contains(GapFillOutputColumn(Some("bin_begin"))))
+    assert(maximal.isGenerated.contains(GapFillOutputColumn(Some("gen"))))
+
+    // The same clauses in another order give the same node.
+    val shuffled = singleGapFill(parsePlan(
+      """SELECT * FROM metrics GAP FILL (
+        |  PARTITION BY device_id
+        |  ORDER BY ts
+        |  BIN WIDTH INTERVAL '5' MINUTE
+        |  IS_GENERATED AS gen
+        |  MAX GAP INTERVAL '40' MINUTE
+        |  RANGE BETWEEN TIMESTAMP '2024-01-01 00:00:00' AND TIMESTAMP '2024-01-02 00:00:00'
+        |  BIN_START AS bin_begin
+        |  FILL (a LINEAR, b FFILL, c FORWARD FILL, d BFILL, e BACKWARD FILL,
+        |    f CONSTANT 'unknown', g NULL)
+        |  ALIGN TO TIMESTAMP '2024-01-01 00:02:00'
+        |)""".stripMargin))
+    assert(shuffled == maximal)
+  }
+
+  test("GAP FILL: BIN_START and IS_GENERATED without AS store no name") {
+    val gapFill = singleGapFill(parsePlan(
+      "SELECT * FROM t GAP FILL (ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE " +
+        "BIN_START IS_GENERATED)"))
+    // No name is stored, which requests the default name.
+    assert(gapFill.binStart.contains(GapFillOutputColumn(None)))
+    assert(gapFill.isGenerated.contains(GapFillOutputColumn(None)))
+  }
+
+  test("GAP FILL: a repeated clause raises DUPLICATE_CLAUSES") {
+    Seq(
+      "ALIGN TO TIMESTAMP '2024-01-01 00:02:00'" -> "ALIGN TO",
+      "RANGE BETWEEN TIMESTAMP '2024-01-01' AND TIMESTAMP '2024-01-02'" -> "RANGE BETWEEN",
+      "FILL (a FFILL)" -> "FILL",
+      "MAX GAP INTERVAL '40' MINUTE" -> "MAX GAP",
+      "BIN_START" -> "BIN_START",
+      "IS_GENERATED" -> "IS_GENERATED").foreach { case (clause, clauseName) =>
+      val sql = s"""SELECT * FROM t GAP FILL (
+         |  ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE
+         |  $clause
+         |  $clause
+         |)""".stripMargin
+      val start = sql.indexOf("GAP")
+      checkError(
+        exception = parseException(sql),
+        condition = "DUPLICATE_CLAUSES",
+        parameters = Map("clauseName" -> clauseName),
+        context = ExpectedContext(
+          fragment = sql.substring(start),
+          start = start,
+          stop = sql.length - 1))
+    }
+  }
+
+  test("GAP FILL: clause words in names or expressions are not repeated clauses") {
+    // The duplicate check counts only the clause keywords of the GAP FILL rule itself.
+    val names = singleGapFill(parsePlan(
+      "SELECT * FROM t GAP FILL (ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE " +
+        "BIN_START AS bin_start IS_GENERATED AS is_generated ALIGN TO align MAX GAP max)"))
+    assert(names.binStart.contains(GapFillOutputColumn(Some("bin_start"))))
+    assert(names.isGenerated.contains(GapFillOutputColumn(Some("is_generated"))))
+    assert(names.originExpr.contains(parseExpression("align")))
+    assert(names.maxGapExpr.contains(parseExpression("max")))
+
+    val expressions = singleGapFill(parsePlan(
+      "SELECT * FROM t GAP FILL (ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE " +
+        "RANGE BETWEEN range AND range + INTERVAL '1' DAY MAX GAP max(ts))"))
+    assert(expressions.rangeStartExpr.contains(parseExpression("range")))
+    assert(expressions.rangeEndExpr.contains(parseExpression("range + INTERVAL '1' DAY")))
+    assert(expressions.maxGapExpr.contains(parseExpression("max(ts)")))
+  }
+
+  test("GAP FILL: several repeated clauses report the first one in a fixed order") {
+    // The order is ALIGN TO, RANGE BETWEEN, FILL, MAX GAP, BIN_START, IS_GENERATED, wherever the
+    // repeats are in the query.
+    val e = parseException("SELECT * FROM t GAP FILL (ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE " +
+      "IS_GENERATED IS_GENERATED ALIGN TO x ALIGN TO y)")
+    assert(e.getCondition == "DUPLICATE_CLAUSES")
+    assert(e.getMessageParameters.get("clauseName") == "ALIGN TO")
+  }
+
+  test("GAP FILL: a syntax error is reported before a repeated clause") {
+    val base = "SELECT * FROM t GAP FILL (ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE " +
+      "MAX GAP a MAX GAP b"
+    // The table alias takes no column list.
+    checkError(
+      exception = parseException(s"$base) AS g (c)"),
+      condition = "PARSE_SYNTAX_ERROR",
+      parameters = Map("error" -> "'('", "hint" -> ""))
+    checkError(
+      exception = parseException(s"$base BOGUS)"),
+      condition = "PARSE_SYNTAX_ERROR",
+      parameters = Map("error" -> "'BOGUS'", "hint" -> ": extra input 'BOGUS'"))
+  }
+
+  test("GAP FILL: column references carry their own position") {
+    // An error about a GAP FILL column, such as UNRESOLVED_COLUMN, points at that column.
+    val sql = "SELECT * FROM t GAP FILL (PARTITION BY p ORDER BY ts " +
+      "BIN WIDTH INTERVAL '5' MINUTE FILL (a FFILL))"
+    val gapFill = singleGapFill(parsePlan(sql))
+    assert(gapFill.partitionColumns.head.origin.startIndex.contains(sql.indexOf(" p ") + 1))
+    assert(gapFill.timeColumn.origin.startIndex.contains(sql.indexOf(" ts ") + 1))
+    assert(gapFill.fillColumns.head.column.origin.startIndex.contains(sql.indexOf("(a ") + 1))
+  }
+
+  test("GAP FILL: table alias with or without AS") {
+    Seq(") AS g", ") g").foreach { tail =>
+      val parsed = parsePlan(
+        s"""SELECT * FROM metrics GAP FILL (
+           |  ORDER BY ts
+           |  BIN WIDTH INTERVAL '5' MINUTE
+           |$tail""".stripMargin)
+      val aliases = parsed.collect { case s: SubqueryAlias if s.alias == "g" => s }
+      assert(aliases.size == 1, s"alias tail '$tail' did not produce a SubqueryAlias")
+      assert(aliases.head.child.isInstanceOf[UnresolvedGapFill])
+    }
+  }
+
+  test("GAP FILL: a join keyword after the clause starts a join, not a table alias") {
+    val gapFill = "metrics GAP FILL (ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE)"
+    Seq(
+      "LEFT JOIN t ON metrics.k = t.k" -> LeftOuter,
+      "RIGHT JOIN t ON metrics.k = t.k" -> RightOuter,
+      "FULL JOIN t ON metrics.k = t.k" -> FullOuter,
+      "INNER JOIN t ON metrics.k = t.k" -> Inner,
+      "LEFT SEMI JOIN t ON metrics.k = t.k" -> LeftSemi,
+      "LEFT ANTI JOIN t ON metrics.k = t.k" -> LeftAnti,
+      "CROSS JOIN t" -> Cross,
+      "NATURAL JOIN t" -> NaturalJoin(Inner)).foreach { case (join, joinType) =>
+      val joins = parsePlan(s"SELECT * FROM $gapFill $join").collect { case j: Join => j }
+      assert(joins.map(_.joinType) == Seq(joinType), join)
+      assert(joins.head.left.isInstanceOf[UnresolvedGapFill], join)
+    }
+  }
+
+  test("GAP FILL: works as a SQL pipe operator") {
+    val clause =
+      """GAP FILL (
+        |  PARTITION BY device_id
+        |  ORDER BY ts
+        |  BIN WIDTH INTERVAL '5' MINUTE
+        |  FILL (a FFILL)
+        |)""".stripMargin
+    val direct = singleGapFill(parsePlan(s"SELECT * FROM metrics $clause"))
+    val piped = singleGapFill(parsePlan(s"FROM metrics\n|> $clause"))
+    assert(piped.copy(child = direct.child) == direct)
+    assert(piped.child.collectFirst { case r: UnresolvedRelation => r.multipartIdentifier }
+      .contains(Seq("metrics")))
+
+    // A later pipe operator applies to the GAP FILL output.
+    val chained = parsePlan(s"FROM metrics\n|> $clause\n|> WHERE a > 0")
+    val filter = chained.collectFirst { case f: Filter => f }
+    assert(filter.exists(f => gapFillNodes(f).size == 1))
+  }
+
+  test("GAP FILL: works after the single-character pipe") {
+    val clause = "GAP FILL (ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE)"
+    val partitioned = "GAP FILL (PARTITION BY k ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE)"
+    withSQLConf(SQLConf.SINGLE_CHARACTER_PIPE_OPERATOR_ENABLED.key -> "true") {
+      assert(parsePlan(s"FROM t | $clause | WHERE a > 0") ==
+        parsePlan(s"FROM t |> $clause |> WHERE a > 0"))
+      assert(parsePlan(s"FROM t | $partitioned | WHERE a > 0") ==
+        parsePlan(s"FROM t |> $partitioned |> WHERE a > 0"))
+      // A column named gap after `|` is still a bitwise OR.
+      assert(gapFillNodes(parsePlan("SELECT 1 | gap FROM t")).isEmpty)
+      assert(gapFillNodes(parsePlan("SELECT a | gap fill FROM t")).isEmpty)
+    }
+    withSQLConf(SQLConf.SINGLE_CHARACTER_PIPE_OPERATOR_ENABLED.key -> "false") {
+      assert(parseException(s"FROM t | $clause").getCondition == "PARSE_SYNTAX_ERROR")
+      assert(gapFillNodes(parsePlan("SELECT 1 | gap FROM t")).isEmpty)
+    }
+  }
+
+  test("GAP FILL: an inline-table row ending in `| gap` keeps a table alias named fill") {
+    withSQLConf(SQLConf.SINGLE_CHARACTER_PIPE_OPERATOR_ENABLED.key -> "true") {
+      Seq("true", "false").foreach { enforceReserved =>
+        withSQLConf(
+            SQLConf.ANSI_ENABLED.key -> "true",
+            SQLConf.ENFORCE_RESERVED_KEYWORDS.key -> enforceReserved) {
+          // ORDER is reserved when reserved keywords are enforced.
+          val aliases = Seq("fill(a)", "fill(a, b)", "fill(partition)") ++
+            (if (enforceReserved == "false") Seq("fill(order, b)") else Nil)
+          for {
+            statement <- Seq("SELECT * FROM VALUES", "VALUES", "INSERT INTO t VALUES")
+            rows <- Seq("1", "1, 2")
+            alias <- aliases
+          } {
+            val sql = s"$statement $rows | gap $alias"
+            assert(parsePlan(sql) == parsePlan(s"$statement $rows | gap AS $alias"), sql)
+          }
+        }
+      }
+    }
+  }
+
+  test("GAP FILL: a range start can end in an interval literal") {
+    Seq("true", "false").foreach { enforceReserved =>
+      withSQLConf(
+          SQLConf.ANSI_ENABLED.key -> "true",
+          SQLConf.ENFORCE_RESERVED_KEYWORDS.key -> enforceReserved) {
+        Seq("s - INTERVAL '1' YEAR", "s - INTERVAL '1-2' YEAR TO MONTH").foreach { start =>
+          val gapFill = singleGapFill(parsePlan(
+            s"SELECT * FROM t GAP FILL (ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE " +
+              s"RANGE BETWEEN $start AND month)"))
+          assert(gapFill.rangeStartExpr.contains(parseExpression(start)))
+          assert(gapFill.rangeEndExpr.contains(UnresolvedAttribute(Seq("month"))))
+        }
+      }
+    }
+  }
+
+  test("GAP FILL: invalid interval literals keep their error in both keyword modes") {
+    // AstBuilder rejects a from-to part mixed with other units. GAP FILL must keep that error.
+    Seq("true", "false").foreach { enforceReserved =>
+      withSQLConf(
+          SQLConf.ANSI_ENABLED.key -> "true",
+          SQLConf.ENFORCE_RESERVED_KEYWORDS.key -> enforceReserved) {
+        Seq(
+          "SELECT (SELECT INTERVAL '1' DAY '2' HOUR TO MINUTE)",
+          "SELECT * FROM t WHERE d IN (SELECT INTERVAL '1' DAY '2' HOUR TO MINUTE)",
+          "SELECT * FROM (SELECT INTERVAL '1' DAY '2' HOUR TO MINUTE) s",
+          "SELECT (INTERVAL '1' DAY '2' HOUR TO MINUTE)",
+          "SELECT (SELECT INTERVAL '1 2' DAY TO HOUR '3 4' DAY TO HOUR)",
+          "SELECT * FROM (SELECT INTERVAL '1 2' DAY TO HOUR '3 4' DAY TO HOUR) s",
+          "SELECT extract(DAY FROM INTERVAL '1 2' DAY TO HOUR '3 4' DAY TO HOUR)"
+        ).foreach { query =>
+          assert(
+            parseException(query).getCondition ==
+              "INVALID_SQL_SYNTAX.FROM_TO_INTERVAL_WITH_OTHER_UNITS",
+            query)
+        }
+      }
+    }
+  }
+
+  test("GAP FILL: interval literals parse in SLL mode without the LL fallback") {
+    // Statements without GAP FILL must parse in the first (SLL) stage, in both keyword modes.
+    Seq(true, false).foreach { enforceReserved =>
+      Seq(
+        "SELECT * FROM T WHERE D IN (SELECT INTERVAL '1 2' DAY TO HOUR)",
+        "SELECT (SELECT INTERVAL '2-1' YEAR TO MONTH)",
+        "SELECT * FROM (SELECT INTERVAL '10:20' MINUTE TO SECOND) S",
+        "SELECT EXTRACT(YEAR FROM INTERVAL '2-1' YEAR TO MONTH)",
+        "SELECT (SELECT INTERVAL '1' DAY '2' HOUR TO MINUTE)",
+        "SELECT EXTRACT(DAY FROM INTERVAL '1' DAY '2' HOUR TO MINUTE)",
+        "SELECT (SELECT INTERVAL '1 2' DAY TO HOUR '3 4' DAY TO HOUR)",
+        "SELECT INTERVAL -1 MONTH 1 DAY -1 SECOND"
+      ).foreach { query =>
+        val parser = new SqlBaseParser(
+          new CommonTokenStream(new SqlBaseLexer(CharStreams.fromString(query))))
+        parser.SQL_standard_keyword_behavior = enforceReserved
+        parser.setErrorHandler(new SparkParserBailErrorStrategy())
+        parser.getInterpreter.setPredictionMode(PredictionMode.SLL)
+        parser.singleStatement()
+      }
+    }
+  }
+
+  test("GAP FILL: first-stage lookahead does not grow with the number of interval literals") {
+    // If TO could follow any expression in the GAP FILL clause, the first (SLL) stage would read
+    // to the end of the statement at each unit-to-unit interval literal, and parsing would be
+    // quadratic.
+    def maxLookahead(columns: Int): Long = {
+      val query = (0 until columns)
+        .map(i => s"count_if(ts > now() - INTERVAL '0 01:00:00' DAY TO SECOND) AS c_$i")
+        .mkString("SELECT ", ", ", " FROM t")
+      val parser = new SqlBaseParser(
+        new CommonTokenStream(new SqlBaseLexer(CharStreams.fromString(query))))
+      parser.setErrorHandler(new SparkParserBailErrorStrategy())
+      parser.getInterpreter.setPredictionMode(PredictionMode.SLL)
+      parser.setProfile(true)
+      parser.singleStatement()
+      parser.getParseInfo.getDecisionInfo.map(_.SLL_MaxLook).max
+    }
+    assert(maxLookahead(50) == maxLookahead(5))
+  }
+
+  test("GAP FILL: malformed clauses raise PARSE_SYNTAX_ERROR") {
+    Seq(
+      "SELECT * FROM t GAP FILL (BIN WIDTH INTERVAL '5' MINUTE)" -> ("'BIN'", ""),
+      "SELECT * FROM t GAP FILL (ORDER BY ts)" -> ("')'", ""),
+      "SELECT * FROM t GAP FILL (ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE FILL ())" -> ("')'", ""),
+      "SELECT * FROM t GAP FILL (ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE FILL (a))" ->
+        ("')'", ""),
+      "SELECT * FROM t GAP FILL (ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE " +
+        "MAX INTERVAL '40' MINUTE)" -> ("'INTERVAL'", ": missing 'GAP'")
+    ).foreach { case (query, (error, hint)) =>
+      checkError(
+        exception = parseException(query),
+        condition = "PARSE_SYNTAX_ERROR",
+        parameters = Map("error" -> error, "hint" -> hint))
+    }
+  }
+
+  test("GAP FILL: FILL columns and CONSTANT values are visible to plan walkers") {
+    // Analyzer rules find expressions through `expressions` and `transformExpressions`, so the
+    // FILL columns and the CONSTANT value must be reachable there.
+    val gapFill = singleGapFill(parsePlan(
+      """SELECT * FROM t GAP FILL (
+        |  ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE
+        |  FILL (a CONSTANT upper('x'), b LINEAR)
+        |)""".stripMargin))
+    val reachable = gapFill.expressions.flatMap(_.collect { case e => e })
+    assert(reachable.contains(UnresolvedAttribute(Seq("a"))))
+    assert(reachable.contains(UnresolvedAttribute(Seq("b"))))
+    assert(reachable.exists(_.isInstanceOf[UnresolvedFunction]))
+
+    val renamed = gapFill.transformExpressions {
+      case UnresolvedAttribute(Seq("a")) => UnresolvedAttribute(Seq("renamed"))
+    }.asInstanceOf[UnresolvedGapFill]
+    assert(renamed.fillColumns.head.column == UnresolvedAttribute(Seq("renamed")))
+
+    // Rewriting the CONSTANT value and a LINEAR column rebuilds both entries with their methods.
+    val rewritten = gapFill.transformExpressions {
+      case UnresolvedAttribute(Seq("b")) => UnresolvedAttribute(Seq("b2"))
+      case Literal(value, _) if value == UTF8String.fromString("x") => Literal("y")
+    }.asInstanceOf[UnresolvedGapFill]
+    assert(rewritten.fillColumns.size == 2)
+    val constantEntry = rewritten.fillColumns.head
+    val linearEntry = rewritten.fillColumns(1)
+    assert(constantEntry.column == UnresolvedAttribute(Seq("a")))
+    constantEntry.method match {
+      case GapFillMethod.Constant(value) =>
+        assert(value.collect { case l: Literal => l } == Seq(Literal("y")))
+      case other => fail(s"Expected a CONSTANT fill method, got $other")
+    }
+    assert(linearEntry == GapFillColumn(UnresolvedAttribute(Seq("b2")), GapFillMethod.Linear))
+  }
+
+  test("GAP FILL: new keywords stay usable as identifiers") {
+    // The new words are non-reserved, so they still work as column names and table aliases.
+    assert(gapFillNodes(parsePlan(
+      "SELECT gap, fill, ffill, forward, backward, bfill, linear, constant, is_generated " +
+        "FROM t WHERE gap > 0")).isEmpty)
+    assert(gapFillNodes(parsePlan("SELECT gap.x FROM t gap WHERE gap.x > 0")).isEmpty)
+    assert(gapFillNodes(parsePlan("SELECT fill.x FROM t AS fill")).isEmpty)
+
+    assert(gapFillNodes(parsePlan(
+      """SELECT * FROM metrics gap GAP FILL (
+        |  ORDER BY ts BIN WIDTH INTERVAL '5' MINUTE
+        |)""".stripMargin)).size == 1)
+  }
+
   private def intercept(sqlCommand: String, messages: String*): Unit =
     interceptParseException(parsePlan)(sqlCommand, messages: _*)()
+
+  // Helpers shared by the BIN BY parser tests.
+  private def binByNodes(plan: LogicalPlan): Seq[UnresolvedBinBy] =
+    plan.collect { case b: UnresolvedBinBy => b }
+
+  private def singleBinBy(plan: LogicalPlan): UnresolvedBinBy = {
+    val nodes = binByNodes(plan)
+    assert(nodes.size == 1, s"expected exactly one BIN BY node, got ${nodes.size}")
+    nodes.head
+  }
+
+  // Helpers shared by the GAP FILL parser tests.
+  private def gapFillNodes(plan: LogicalPlan): Seq[UnresolvedGapFill] =
+    plan.collect { case g: UnresolvedGapFill => g }
+
+  private def singleGapFill(plan: LogicalPlan): UnresolvedGapFill = {
+    val nodes = gapFillNodes(plan)
+    assert(nodes.size == 1, s"expected exactly one GAP FILL node, got ${nodes.size}")
+    nodes.head
+  }
 }

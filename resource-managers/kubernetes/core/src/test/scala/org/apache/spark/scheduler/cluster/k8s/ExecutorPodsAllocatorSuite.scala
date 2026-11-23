@@ -26,15 +26,15 @@ import scala.jdk.CollectionConverters._
 import io.fabric8.kubernetes.api.model._
 import io.fabric8.kubernetes.client.{KubernetesClient, KubernetesClientException}
 import io.fabric8.kubernetes.client.dsl.PodResource
-import org.mockito.{Mock, MockitoAnnotations}
+import org.mockito.{ArgumentCaptor, Mock, MockitoAnnotations}
 import org.mockito.ArgumentMatchers.{any, anyString, eq => meq}
-import org.mockito.Mockito.{never, times, verify, when}
+import org.mockito.Mockito.{clearInvocations, never, times, verify, when}
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
 import org.scalatest.BeforeAndAfter
 import org.scalatest.PrivateMethodTester._
 
-import org.apache.spark.{SecurityManager, SparkConf, SparkException, SparkFunSuite}
+import org.apache.spark.{SecurityManager, SparkConf, SparkException, SparkFunSuite, SSLOptions}
 import org.apache.spark.deploy.k8s.{KubernetesExecutorConf, KubernetesExecutorSpec}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
@@ -112,6 +112,9 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
   @Mock
   private var schedulerBackend: KubernetesClusterSchedulerBackend = _
 
+  @Mock
+  private var lifecycleManager: ExecutorPodsLifecycleManager = _
+
   private var snapshotsStore: DeterministicExecutorPodsSnapshotsStore = _
 
   private var podsAllocatorUnderTest: ExecutorPodsAllocator = _
@@ -136,12 +139,13 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     when(labeledPods.withField(anyString(), anyString())).thenReturn(labeledPods)
     when(driverPodOperations.get).thenReturn(driverPod)
     when(driverPodOperations.waitUntilReady(any(), any())).thenReturn(driverPod)
-    when(executorBuilder.buildFromFeatures(any(classOf[KubernetesExecutorConf]), meq(secMgr),
+    when(executorBuilder.buildFromFeatures(any(classOf[KubernetesExecutorConf]),
       meq(kubernetesClient), any(classOf[ResourceProfile]))).thenAnswer(executorPodAnswer())
     snapshotsStore = new DeterministicExecutorPodsSnapshotsStore()
     waitForExecutorPodsClock = new ManualClock(0L)
     podsAllocatorUnderTest = new ExecutorPodsAllocator(
       conf, secMgr, executorBuilder, kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    podsAllocatorUnderTest.setExecutorPodsLifecycleManager(lifecycleManager)
     when(schedulerBackend.getExecutorIds()).thenReturn(Seq.empty)
     podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
     when(kubernetesClient.persistentVolumeClaims()).thenReturn(persistentVolumeClaims)
@@ -150,6 +154,33 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     when(pvcWithNamespace.resource(any())).thenReturn(pvcResource)
     when(labeledPersistentVolumeClaims.list()).thenReturn(persistentVolumeClaimList)
     when(persistentVolumeClaimList.getItems).thenReturn(Seq.empty[PersistentVolumeClaim].asJava)
+  }
+
+  test("SPARK-58192: warn when recovery mode cannot isolate a single task") {
+    val confWithFractionalCpus = conf.clone.set(CPUS_PER_TASK, BigDecimal(0.5))
+    val allocator = new ExecutorPodsAllocator(confWithFractionalCpus, secMgr,
+      executorBuilder, kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    val logAppender = new LogAppender("recovery mode fractional cpus")
+    withLogAppender(logAppender) {
+      allocator.setRecoveryMode()
+      // the warning is logged at most once
+      allocator.setRecoveryMode()
+    }
+    val warnings = logAppender.loggingEvents
+      .map(_.getMessage.getFormattedMessage)
+      .filter(_.contains("instead of only one"))
+    assert(warnings.size === 1)
+    assert(warnings.head.contains("2 concurrent tasks"))
+
+    // no warning when a recovery-mode executor's single announced core fits exactly one task
+    val allocator2 = new ExecutorPodsAllocator(conf.clone, secMgr,
+      executorBuilder, kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    val logAppender2 = new LogAppender("recovery mode whole cpus")
+    withLogAppender(logAppender2) {
+      allocator2.setRecoveryMode()
+    }
+    assert(!logAppender2.loggingEvents.exists(
+      _.getMessage.getFormattedMessage.contains("instead of only one")))
   }
 
   test("SPARK-49447: Prevent small values less than 100 for batch delay") {
@@ -202,6 +233,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     val confWithLowMaxPendingPods = conf.clone.set(KUBERNETES_MAX_PENDING_PODS.key, "3")
     podsAllocatorUnderTest = new ExecutorPodsAllocator(confWithLowMaxPendingPods, secMgr,
       executorBuilder, kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    podsAllocatorUnderTest.setExecutorPodsLifecycleManager(lifecycleManager)
     podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
 
     podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 2, rp -> 3))
@@ -268,6 +300,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
       .set(KUBERNETES_MAX_PENDING_PODS_PER_RPID.key, "2")
     podsAllocatorUnderTest = new ExecutorPodsAllocator(confWithLowMaxPendingPodsPerRpId, secMgr,
       executorBuilder, kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    podsAllocatorUnderTest.setExecutorPodsLifecycleManager(lifecycleManager)
     podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
 
     // Request more than the max per rp for one rp
@@ -321,6 +354,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     val confWithAllocationMaximum = conf.clone.set(KUBERNETES_ALLOCATION_MAXIMUM.key, "1")
     podsAllocatorUnderTest = new ExecutorPodsAllocator(confWithAllocationMaximum, secMgr,
       executorBuilder, kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    podsAllocatorUnderTest.setExecutorPodsLifecycleManager(lifecycleManager)
     podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
 
     val counter = PrivateMethod[AtomicInteger](Symbol("EXECUTOR_ID_COUNTER"))()
@@ -330,6 +364,42 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
       podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 2))
     }.getMessage
     assert(m.contains("Exceed the pod creation limit: 1"))
+  }
+
+  test("SPARK-58776: executor conf carries the auth secret and SparkConf SSL RPC passwords") {
+    val sslConf = confWithAuthAndSslRpc(conf)
+    val sslAllocator = new ExecutorPodsAllocator(sslConf, new SecurityManager(sslConf),
+      executorBuilder, kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    sslAllocator.setExecutorPodsLifecycleManager(lifecycleManager)
+    sslAllocator.start(TEST_SPARK_APP_ID, schedulerBackend)
+    sslAllocator.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+
+    val captor = ArgumentCaptor.forClass(classOf[KubernetesExecutorConf])
+    verify(executorBuilder).buildFromFeatures(
+      captor.capture(), meq(kubernetesClient), any(classOf[ResourceProfile]))
+    assert(captor.getValue.authSecret === Some(TEST_AUTH_SECRET))
+    assert(captor.getValue.sslRpcPasswordEnvs ===
+      Map(SSLOptions.ENV_RPC_SSL_KEY_STORE_PASSWORD -> TEST_RPC_SSL_KEY_STORE_PASSWORD))
+  }
+
+  test("SPARK-52589: Prune scheduler-known newly created executors if " +
+    "removed from scheduler backend") {
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    verify(podsWithNamespace).resource(podWithAttachedContainerForId(1))
+
+    // Executor 1 is registered with schedulerBackend
+    when(schedulerBackend.getExecutorIds()).thenReturn(Seq("1"))
+    snapshotsStore.notifySubscribers()
+
+    // Executor 1 is decommissioned/removed from schedulerBackend without appearing in pod snapshot
+    when(schedulerBackend.getExecutorIds()).thenReturn(Seq.empty)
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 0))
+    snapshotsStore.notifySubscribers()
+
+    // Upscale to 1 executor; verify new executor 2 is requested
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    snapshotsStore.notifySubscribers()
+    verify(podsWithNamespace).resource(podWithAttachedContainerForId(2))
   }
 
   test("Request executors in batches. Allow another batch to be requested if" +
@@ -826,7 +896,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     pvc.getMetadata
       .setCreationTimestamp(Instant.now().minus(podCreationTimeout + 1, MILLIS).toString)
     when(persistentVolumeClaimList.getItems).thenReturn(Seq(pvc).asJava)
-    when(executorBuilder.buildFromFeatures(any(classOf[KubernetesExecutorConf]), meq(secMgr),
+    when(executorBuilder.buildFromFeatures(any(classOf[KubernetesExecutorConf]),
         meq(kubernetesClient), any(classOf[ResourceProfile])))
       .thenAnswer((invocation: InvocationOnMock) => {
       val k8sConf: KubernetesExecutorConf = invocation.getArgument(0)
@@ -838,6 +908,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     podsAllocatorUnderTest = new ExecutorPodsAllocator(
       confWithPVC, secMgr, executorBuilder,
       kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    podsAllocatorUnderTest.setExecutorPodsLifecycleManager(lifecycleManager)
     podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
 
     when(podsWithNamespace
@@ -887,11 +958,28 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
       " namespace default"))
   }
 
+  test("SPARK-58113: wait for driver readiness by default") {
+    // The allocator in `before` was started with the default conf.
+    verify(driverPodOperations, times(1)).waitUntilReady(any(), any())
+  }
+
+  test("SPARK-58113: skip driver readiness wait when publishNotReadyAddresses is enabled") {
+    clearInvocations(driverPodOperations)
+    val confWithPublishNotReady = conf.clone()
+      .set(KUBERNETES_DRIVER_SERVICE_PUBLISH_NOT_READY_ADDRESSES, true)
+    val podsAllocator = new ExecutorPodsAllocator(
+      confWithPublishNotReady, secMgr, executorBuilder, kubernetesClient, snapshotsStore,
+      waitForExecutorPodsClock)
+    podsAllocator.setExecutorPodsLifecycleManager(lifecycleManager)
+    podsAllocator.start(TEST_SPARK_APP_ID, schedulerBackend)
+    verify(driverPodOperations, never()).waitUntilReady(any(), any())
+  }
+
   test("SPARK-39688: getReusablePVCs should handle accounts with no PVC permission") {
     val getReusablePVCs =
       PrivateMethod[mutable.Buffer[PersistentVolumeClaim]](Symbol("getReusablePVCs"))
     when(persistentVolumeClaimList.getItems).thenThrow(new KubernetesClientException("Error"))
-    podsAllocatorUnderTest invokePrivate getReusablePVCs("appId", Seq.empty[String])
+    podsAllocatorUnderTest invokePrivate getReusablePVCs("appId", Set.empty[String])
   }
 
   test("SPARK-41388: getReusablePVCs should ignore recently created PVCs in the previous batch") {
@@ -906,7 +994,8 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     pvc2.getMetadata.setCreationTimestamp(now.toString)
 
     when(persistentVolumeClaimList.getItems).thenReturn(Seq(pvc1, pvc2).asJava)
-    val reusablePVCs = podsAllocatorUnderTest invokePrivate getReusablePVCs("appId", Seq.empty)
+    val reusablePVCs =
+      podsAllocatorUnderTest invokePrivate getReusablePVCs("appId", Set.empty[String])
     assert(reusablePVCs.size == 1)
     assert(reusablePVCs.head.getMetadata.getName == "pvc-1")
   }
@@ -924,7 +1013,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
       .set(s"$prefix.option.sizeLimit", "200Gi")
       .set(s"$prefix.option.storageClass", "gp3")
 
-    when(executorBuilder.buildFromFeatures(any(classOf[KubernetesExecutorConf]), meq(secMgr),
+    when(executorBuilder.buildFromFeatures(any(classOf[KubernetesExecutorConf]),
       meq(kubernetesClient), any(classOf[ResourceProfile])))
       .thenAnswer((invocation: InvocationOnMock) => {
         val k8sConf: KubernetesExecutorConf = invocation.getArgument(0)
@@ -936,6 +1025,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     podsAllocatorUnderTest = new ExecutorPodsAllocator(
       confWithPVC, secMgr, executorBuilder,
       kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    podsAllocatorUnderTest.setExecutorPodsLifecycleManager(lifecycleManager)
     podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
 
     when(podsWithNamespace
@@ -993,7 +1083,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
       .set(s"$prefix.option.sizeLimit", "200Gi")
       .set(s"$prefix.option.storageClass", "gp3")
 
-    when(executorBuilder.buildFromFeatures(any(classOf[KubernetesExecutorConf]), meq(secMgr),
+    when(executorBuilder.buildFromFeatures(any(classOf[KubernetesExecutorConf]),
       meq(kubernetesClient), any(classOf[ResourceProfile])))
       .thenAnswer((invocation: InvocationOnMock) => {
         val k8sConf: KubernetesExecutorConf = invocation.getArgument(0)
@@ -1005,6 +1095,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     podsAllocatorUnderTest = new ExecutorPodsAllocator(
       confWithPVC, secMgr, executorBuilder,
       kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    podsAllocatorUnderTest.setExecutorPodsLifecycleManager(lifecycleManager)
     podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
 
     val startTime = Instant.now.toEpochMilli
@@ -1021,10 +1112,80 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     assert(podsAllocatorUnderTest.invokePrivate(numOutstandingPods).get() == 0)
   }
 
+  test("SPARK-55496: replacePVCsIfNeeded should re-use disks with larger storage") {
+    val podToModify = podWithAttachedContainerForIdAndVolume(1)
+    val resourcesFromSpec: Seq[HasMetadata] = Seq(persistentVolumeClaim("pvc-0", "gp3", "200Gi"))
+    val existingPVCName = "pvc-existing"
+    val existingPVCs = mutable
+      .Buffer[PersistentVolumeClaim](persistentVolumeClaim(existingPVCName, "gp3", "400Gi"))
+
+    val replacePVCsIfNeeded =
+      PrivateMethod[Seq[HasMetadata]](Symbol("replacePVCsIfNeeded"))
+    val newResources = podsAllocatorUnderTest invokePrivate replacePVCsIfNeeded(
+      podToModify,
+      resourcesFromSpec,
+      existingPVCs
+    )
+
+    val podVolumes = podToModify.getSpec.getVolumes;
+    assert(existingPVCs.isEmpty)
+    assert(newResources.isEmpty)
+    assert(podVolumes.size() == 1)
+
+    val modifiedVolume = podVolumes.asScala
+      .find(v => v.getPersistentVolumeClaim.getClaimName.equals(existingPVCName))
+    assert(modifiedVolume.nonEmpty)
+  }
+
   private def executorPodAnswer(): Answer[KubernetesExecutorSpec] =
     (invocation: InvocationOnMock) => {
       val k8sConf: KubernetesExecutorConf = invocation.getArgument(0)
       KubernetesExecutorSpec(executorPodWithId(k8sConf.executorId.toInt,
         k8sConf.resourceProfileId.toInt), Seq.empty)
+  }
+
+  test("SPARK-55075: Pod creation failures are tracked by ExecutorFailureTracker") {
+    // Make all pod creation attempts fail
+    when(podResource.create()).thenThrow(new KubernetesClientException("Simulated pod" +
+      " creation failure"))
+
+    // Request 3 executors
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 3))
+
+    // Verify that pod creation was attempted 3 times (once per executor, no retries)
+    verify(podResource, times(3)).create()
+
+    // Verify that registerPodCreationFailure was called 3 times (once per failed executor)
+    verify(lifecycleManager, times(3)).registerExecutorFailure()
+
+    // Verify no pods were created since all attempts failed
+    assert(podsAllocatorUnderTest.invokePrivate(numOutstandingPods).get() == 0)
+  }
+
+  test("SPARK-55639: setRecoveryMode should not change recovery mode if it is already false") {
+    val newConf = conf.clone.set(KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED, false)
+    val podsAllocator = new ExecutorPodsAllocator(newConf, secMgr, executorBuilder,
+      kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    podsAllocator.setRecoveryMode()
+    assert(!newConf.get(KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED).get)
+  }
+
+  test("SPARK-59331: unsetRecoveryMode leaves the recovery mode that setRecoveryMode turned on") {
+    val newConf = conf.clone
+    val podsAllocator = new ExecutorPodsAllocator(newConf, secMgr, executorBuilder,
+      kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    podsAllocator.setRecoveryMode()
+    assert(newConf.get(KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED).contains(true))
+    podsAllocator.unsetRecoveryMode()
+    assert(newConf.get(KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED).isEmpty)
+  }
+
+  test("SPARK-59331: unsetRecoveryMode keeps a configured recovery mode") {
+    val newConf = conf.clone.set(KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED, true)
+    val podsAllocator = new ExecutorPodsAllocator(newConf, secMgr, executorBuilder,
+      kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    podsAllocator.setRecoveryMode()
+    podsAllocator.unsetRecoveryMode()
+    assert(newConf.get(KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED).contains(true))
   }
 }

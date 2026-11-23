@@ -18,13 +18,14 @@
 package org.apache.spark.sql.catalyst.analysis
 
 import org.apache.spark.{SPARK_DOC_ROOT, SparkException}
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Count, Max}
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
-import org.apache.spark.sql.catalyst.plans.{AsOfJoinDirection, Cross, Inner, LeftOuter, RightOuter}
+import org.apache.spark.sql.catalyst.plans.{AsOfJoinDirection, Cross, Inner, LeftOuter, NearestBySimilarity, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.errors.DataTypeErrorsBase
 import org.apache.spark.sql.internal.SQLConf
@@ -207,19 +208,6 @@ class AnalysisErrorSuite extends AnalysisTest with DataTypeErrorsBase {
          |"count(DISTINCT b) OVER (PARTITION BY a ORDER BY b ASC NULLS FIRST
          | RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
          |""".stripMargin.replaceAll("\n", "")))
-
-  errorTest(
-    "window aggregate function with filter predicate",
-    testRelation2.select(
-      WindowExpression(
-        Count(UnresolvedAttribute("b"))
-          .toAggregateExpression(isDistinct = false, filter = Some(UnresolvedAttribute("b") > 1)),
-        WindowSpecDefinition(
-          UnresolvedAttribute("a") :: Nil,
-          SortOrder(UnresolvedAttribute("b"), Ascending) :: Nil,
-          UnspecifiedFrame)).as("window")),
-    "window aggregate function with filter predicate is not supported" :: Nil
-  )
 
   test("distinct function") {
     assertAnalysisErrorCondition(
@@ -930,11 +918,40 @@ class AnalysisErrorSuite extends AnalysisTest with DataTypeErrorsBase {
       parameters = Map("message" ->
         """
           |Failure when resolving conflicting references in AsOfJoin:
-          |'AsOfJoin (a#x >= a#x), Inner
+          |'AsOfJoin true, Inner
           |:- LocalRelation <empty>, [a#x]
           |+- LocalRelation <empty>, [a#x]
           |
           |Conflicting attributes: "a".""".stripMargin))
+  }
+
+  test("NearestByJoin with a streaming input fails analysis") {
+    val streamingLeft = LocalRelation(
+      Seq(AttributeReference("a", IntegerType)()), Nil, isStreaming = true)
+    val batchRight = LocalRelation(AttributeReference("b", IntegerType)())
+    val nearestBy = NearestByJoin(
+      streamingLeft, batchRight, Inner, approx = true, numResults = 1,
+      rankingExpression = streamingLeft.output.head + batchRight.output.head,
+      direction = NearestBySimilarity)
+    assertAnalysisErrorCondition(
+      nearestBy,
+      expectedErrorCondition = "NEAREST_BY_JOIN.STREAMING_NOT_SUPPORTED",
+      expectedMessageParameters = Map.empty)
+  }
+
+  test("NearestByJoin is rejected when spark.sql.crossJoin.enabled is false") {
+    val left = LocalRelation(AttributeReference("a", IntegerType)())
+    val right = LocalRelation(AttributeReference("b", IntegerType)())
+    val nearestBy = NearestByJoin(
+      left, right, Inner, approx = true, numResults = 1,
+      rankingExpression = left.output.head + right.output.head,
+      direction = NearestBySimilarity)
+    withSQLConf(SQLConf.CROSS_JOINS_ENABLED.key -> "false") {
+      assertAnalysisErrorCondition(
+        nearestBy,
+        expectedErrorCondition = "NEAREST_BY_JOIN.CROSS_JOIN_NOT_ENABLED",
+        expectedMessageParameters = Map.empty)
+    }
   }
 
   test("check grouping expression data types") {
@@ -1079,10 +1096,10 @@ class AnalysisErrorSuite extends AnalysisTest with DataTypeErrorsBase {
     "it refers to non-existent table with same name") {
     val plan = UnresolvedWith(
       UnresolvedRelation(TableIdentifier("t")),
-      Seq(("t", SubqueryAlias("t",
+      Seq(UnresolvedCTERelation("t", SubqueryAlias("t",
         Project(
           Alias(Literal(1), "x")() :: Nil,
-          UnresolvedRelation(TableIdentifier("t", Option("nonexist"))))), None)))
+          UnresolvedRelation(TableIdentifier("t", Option("nonexist"))))))))
     assertAnalysisErrorCondition(plan,
       expectedErrorCondition = "TABLE_OR_VIEW_NOT_FOUND",
       Map("relationName" -> "`nonexist`.`t`"))
@@ -1313,6 +1330,54 @@ class AnalysisErrorSuite extends AnalysisTest with DataTypeErrorsBase {
     messageParameters = Map(
       "expr" -> "\"_w0\"",
       "exprType" -> "\"MAP<STRING, STRING>\""))
+
+  test("MATERIALIZED CTE cannot reference the outer query") {
+    val relation = LocalRelation($"a".int)
+    val a = relation.output.head
+    val innerRelation = LocalRelation($"c".int)
+    val c = innerRelation.output.head
+    def cteRef(cteDef: CTERelationDef): CTERelationRef = {
+      CTERelationRef(cteDef.id, cteDef.resolved, cteDef.output, cteDef.isStreaming)
+    }
+    def materializedCTEPlan(
+        cteChild: LogicalPlan,
+        referencedCTEDefs: Seq[CTERelationDef] = Nil): LogicalPlan = {
+      val cteDef = CTERelationDef(cteChild, materialized = Some(true))
+      WithCTE(cteRef(cteDef).select(cteDef.output.head), referencedCTEDefs :+ cteDef)
+    }
+    def assertMaterializedCTEError(plan: LogicalPlan, outerColName: String): Unit = {
+      checkError(
+        exception = intercept[AnalysisException](MaterializedCTECheck(plan)),
+        condition = "UNSUPPORTED_FEATURE.MATERIALIZED_CTE_WITH_OUTER_REFERENCE",
+        parameters = Map("colName" -> s"`$outerColName`"))
+    }
+    // A direct outer reference in the CTE definition.
+    val correlated = relation.where(OuterReference($"o".int) === 1)
+    assertMaterializedCTEError(materializedCTEPlan(correlated), "o")
+    // An outer-scope reference of a subquery in the CTE definition (nested correlation).
+    val subquery = ScalarSubquery(
+      innerRelation.select(c), outerAttrs = Seq(OuterScopeReference($"o".int)))
+    assertMaterializedCTEError(materializedCTEPlan(relation.select(subquery.as("s"))), "o")
+    // An outer reference in another CTE that the MATERIALIZED CTE definition references.
+    val correlatedCTEDef = CTERelationDef(correlated)
+    assertMaterializedCTEError(
+      materializedCTEPlan(
+        cteRef(correlatedCTEDef).select(correlatedCTEDef.output.head), Seq(correlatedCTEDef)),
+      "o")
+    // The same, referenced through a subquery of the MATERIALIZED CTE definition.
+    val referencingSubquery =
+      ScalarSubquery(cteRef(correlatedCTEDef).select(correlatedCTEDef.output.head))
+    assertMaterializedCTEError(
+      materializedCTEPlan(relation.select(referencingSubquery.as("s")), Seq(correlatedCTEDef)),
+      "o")
+    // A CTE nested in a subquery of the definition may be correlated to the definition's own
+    // relations: the outer reference does not cross the materialized boundary.
+    val innerCTEDef = CTERelationDef(innerRelation.where(c === OuterReference(a)))
+    val innerSubquery = ScalarSubquery(
+      WithCTE(cteRef(innerCTEDef).select(innerCTEDef.output.head), Seq(innerCTEDef)),
+      outerAttrs = Seq(a))
+    MaterializedCTECheck(materializedCTEPlan(relation.select(innerSubquery.as("s"))))
+  }
 
   test("SPARK-48871: SupportsNonDeterministicExpression allows non-deterministic expressions") {
     val nonDeterministicExpressions = Seq(new Rand())

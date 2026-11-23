@@ -15,24 +15,26 @@
 # limitations under the License.
 #
 
-from contextlib import redirect_stdout
 import datetime
-from enum import Enum
-from inspect import getmembers, isfunction, isclass
 import io
-from itertools import chain
 import math
 import re
 import unittest
+from contextlib import redirect_stdout
+from enum import Enum
+from inspect import getmembers, isclass, isfunction
+from itertools import chain
 
 from pyspark.errors import PySparkTypeError, PySparkValueError, SparkRuntimeException
-from pyspark.sql import Row, Window, functions as F, types
+from pyspark.errors.exceptions.base import IllegalArgumentException
+from pyspark.sql import Row, Window, types
+from pyspark.sql import functions as F
 from pyspark.sql.avro.functions import from_avro, to_avro
 from pyspark.sql.column import Column
 from pyspark.sql.functions.builtin import nullifzero, randstr, uniform, zeroifnull
-from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.types import StringType, StructField, StructType
 from pyspark.testing.sqlutils import ReusedSQLTestCase, SQLTestUtils
-from pyspark.testing.utils import have_numpy, assertDataFrameEqual
+from pyspark.testing.utils import assertDataFrameEqual, have_numpy
 
 
 class FunctionsTestsMixin:
@@ -64,7 +66,6 @@ class FunctionsTestsMixin:
             "not",  # equivalent to python ~expression
             "any",  # equivalent to python ~some
             "len",  # equivalent to python ~length
-            "udaf",  # used for creating UDAF's which are not supported in PySpark
             "partitioning$",  # partitioning expressions for DSv2
         ]
 
@@ -145,6 +146,7 @@ class FunctionsTestsMixin:
             "ByteType",  # should be imported from pyspark.sql.types
             "Column",  # should be imported from pyspark.sql
             "DataType",  # should be imported from pyspark.sql.types
+            "MapType",  # should be imported from pyspark.sql.types
             "NumericType",  # should be imported from pyspark.sql.types
             "PySparkTypeError",  # should be imported from pyspark.errors
             "PySparkValueError",  # should be imported from pyspark.errors
@@ -214,7 +216,7 @@ class FunctionsTestsMixin:
         self.assertTrue(df.is_cached)
         self.assertEqual(2, df.count())
 
-        with self.tempView("temp"):
+        with self.temp_view("temp"):
             df.createOrReplaceTempView("temp")
             df = self.spark.sql("select foo from temp")
             df.count()
@@ -235,8 +237,12 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_STR",
-            messageParameters={"arg_name": "col", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column or str",
+                "arg_name": "col",
+                "arg_type": "int",
+            },
         )
 
         with self.assertRaises(PySparkTypeError) as pe:
@@ -244,8 +250,12 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_DICT",
-            messageParameters={"arg_name": "fractions", "arg_type": "list"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "dict",
+                "arg_name": "fractions",
+                "arg_type": "list",
+            },
         )
 
         with self.assertRaises(PySparkTypeError) as pe:
@@ -272,8 +282,8 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_STR",
-            messageParameters={"arg_name": "col1", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={"expected_type": "str", "arg_name": "col1", "arg_type": "int"},
         )
 
         with self.assertRaises(PySparkTypeError) as pe:
@@ -281,8 +291,8 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_STR",
-            messageParameters={"arg_name": "col2", "arg_type": "bool"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={"expected_type": "str", "arg_name": "col2", "arg_type": "bool"},
         )
 
     def test_crosstab(self):
@@ -291,8 +301,8 @@ class FunctionsTestsMixin:
         ct = sorted(ct, key=lambda x: x[0])
         for i, row in enumerate(ct):
             self.assertEqual(row[0], str(i))
-            self.assertTrue(row[1], 1)
-            self.assertTrue(row[2], 1)
+            self.assertEqual(row[1], 1)
+            self.assertEqual(row[2], 1)
 
     def test_math_functions(self):
         df = self.spark.createDataFrame([Row(a=i, b=2 * i) for i in range(10)])
@@ -915,8 +925,9 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_INT",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "Column or int",
                 "arg_name": "startPos",
                 "arg_type": "str",
             },
@@ -927,6 +938,18 @@ class FunctionsTestsMixin:
                 df.select(getattr(F, name)("name")),
                 df.select(getattr(F, name)(F.col("name"))),
             )
+
+    def test_bitmap_scalar_functions(self):
+        df = self.spark.createDataFrame([("F00F", "70")], ["left", "right"])
+        left = F.to_binary("left", F.lit("hex"))
+        right = F.to_binary("right", F.lit("hex"))
+        actual = df.select(
+            F.substring(F.hex(F.bitmap_and(left, right)), 0, 4),
+            F.substring(F.hex(F.bitmap_or(left, right)), 0, 4),
+            F.substring(F.hex(F.bitmap_andnot(left, right)), 0, 4),
+            F.substring(F.hex(F.bitmap_xor(left, right)), 0, 4),
+        )
+        assertDataFrameEqual([Row("7000", "F00F", "800F", "800F")], actual)
 
     def test_collation(self):
         df = self.spark.createDataFrame([("a",), ("b",)], ["name"])
@@ -940,13 +963,13 @@ class FunctionsTestsMixin:
 
     def test_octet_length_function(self):
         # SPARK-36751: add octet length api for python
-        df = self.spark.createDataFrame([("cat",), ("\U0001F408",)], ["cat"])
+        df = self.spark.createDataFrame([("cat",), ("\U0001f408",)], ["cat"])
         actual = df.select(F.octet_length("cat"))
         assertDataFrameEqual([Row(3), Row(4)], actual)
 
     def test_bit_length_function(self):
         # SPARK-36751: add bit length api for python
-        df = self.spark.createDataFrame([("cat",), ("\U0001F408",)], ["cat"])
+        df = self.spark.createDataFrame([("cat",), ("\U0001f408",)], ["cat"])
         actual = df.select(F.bit_length("cat"))
         assertDataFrameEqual([Row(24), Row(32)], actual)
 
@@ -961,6 +984,73 @@ class FunctionsTestsMixin:
         assertDataFrameEqual([Row(b=3)], actual_without_threshold)
         actual_with_threshold = df.select(F.levenshtein(df.l, df.r, 2).alias("b"))
         assertDataFrameEqual([Row(b=-1)], actual_with_threshold)
+
+    def test_vector_functions(self):
+        from pyspark.sql.types import ArrayType, FloatType, StructField, StructType
+
+        schema = StructType(
+            [
+                StructField("a", ArrayType(FloatType())),
+                StructField("b", ArrayType(FloatType())),
+            ]
+        )
+        df = self.spark.createDataFrame([([1.0, 2.0, 3.0], [4.0, 5.0, 6.0])], schema)
+
+        # Similarity/distance functions
+        self.assertAlmostEqual(
+            df.select(F.vector_cosine_similarity("a", "b")).first()[0], 0.9746318, places=4
+        )
+        self.assertAlmostEqual(
+            df.select(F.vector_inner_product("a", "b")).first()[0], 32.0, places=1
+        )
+        self.assertAlmostEqual(
+            df.select(F.vector_l2_distance("a", "b")).first()[0], 5.196152, places=4
+        )
+
+        # Norm/normalize functions
+        schema2 = StructType([StructField("v", ArrayType(FloatType()))])
+        df2 = self.spark.createDataFrame([([3.0, 4.0],)], schema2)
+        self.assertAlmostEqual(
+            df2.select(F.vector_norm("v", F.lit(2.0).cast("float"))).first()[0], 5.0, places=1
+        )
+        result = df2.select(F.vector_normalize("v", F.lit(2.0).cast("float"))).first()[0]
+        self.assertAlmostEqual(result[0], 0.6, places=4)
+        self.assertAlmostEqual(result[1], 0.8, places=4)
+
+        # Aggregate functions
+        df3 = self.spark.createDataFrame([([1.0, 2.0],), ([3.0, 4.0],)], schema2)
+        avg_result = df3.select(F.vector_avg("v")).first()[0]
+        self.assertAlmostEqual(avg_result[0], 2.0, places=4)
+        self.assertAlmostEqual(avg_result[1], 3.0, places=4)
+        sum_result = df3.select(F.vector_sum("v")).first()[0]
+        self.assertAlmostEqual(sum_result[0], 4.0, places=4)
+        self.assertAlmostEqual(sum_result[1], 6.0, places=4)
+
+    def test_vector_sum_double(self):
+        from pyspark.sql.types import ArrayType, DoubleType
+
+        schema = StructType([StructField("v", ArrayType(DoubleType()))])
+        data = [([16777216.0, 1.0],), ([1.0, 1e-8],)]
+        df = self.spark.createDataFrame(data, schema).repartition(2)
+        result = df.select(F.vector_sum("v"))
+        self.assertEqual(result.schema[0].dataType, ArrayType(DoubleType(), containsNull=False))
+        self.assertEqual(result.first()[0], [16777217.0, 1.00000001])
+
+    def test_jaro_winkler_similarity_function(self):
+        df = self.spark.createDataFrame([("MARTHA", "MARHTA")], ["l", "r"])
+        result = df.select(F.jaro_winkler_similarity(df.l, df.r)).first()[0]
+        self.assertAlmostEqual(result, 0.9611111111111111, places=10)
+        # Null handling
+        null_result = df.select(F.jaro_winkler_similarity(df.l, F.lit(None))).first()[0]
+        self.assertIsNone(null_result)
+
+    def test_normalize_function(self):
+        df = self.spark.createDataFrame([("\ufb01",)], ["s"])
+        result = df.select(F.normalize(df.s, F.lit("NFKC"))).first()[0]
+        self.assertEqual(result, "fi")
+        # Null handling
+        null_result = df.select(F.normalize(F.lit(None), F.lit("NFC"))).first()[0]
+        self.assertIsNone(null_result)
 
     def test_between_function(self):
         df = self.spark.createDataFrame(
@@ -1540,9 +1630,150 @@ class FunctionsTestsMixin:
         self.assertTrue(isinstance(aqt[1], list))
         self.assertEqual(len(aqt[1]), 3)
         self.assertTrue(all(isinstance(q, float) for q in aqt[1]))
+        self.assertEqual(df.stat.approxQuantile("a", [0, 0.5, 1], 0.0), [0.0, 4.0, 9.0])
         self.assertRaises(TypeError, lambda: df.stat.approxQuantile(123, [0.1, 0.9], 0.1))
         self.assertRaises(TypeError, lambda: df.stat.approxQuantile(("a", 123), [0.1, 0.9], 0.1))
         self.assertRaises(TypeError, lambda: df.stat.approxQuantile(["a", 123], [0.1, 0.9], 0.1))
+
+        with self.assertRaises(PySparkTypeError) as pe:
+            df.stat.approxQuantile("a", [0.1, "0.9"], 0.1)
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "arg_name": "probabilities",
+                "expected_type": "list[float, int]",
+                "arg_type": "str",
+            },
+        )
+
+        with self.assertRaises(PySparkValueError) as pe:
+            df.stat.approxQuantile("a", [0.1, 1.5], 0.1)
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="VALUE_OUT_OF_BOUNDS",
+            messageParameters={
+                "arg_name": "probabilities",
+                "lower_bound": "0",
+                "upper_bound": "1",
+                "actual": "1.5",
+            },
+        )
+
+        with self.assertRaises(PySparkValueError) as pe:
+            df.stat.approxQuantile("a", [0.1, -0.1], 0.1)
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="VALUE_OUT_OF_BOUNDS",
+            messageParameters={
+                "arg_name": "probabilities",
+                "lower_bound": "0",
+                "upper_bound": "1",
+                "actual": "-0.1",
+            },
+        )
+
+        with self.assertRaises(PySparkValueError) as pe:
+            df.stat.approxQuantile("a", [0.1, float("nan")], 0.1)
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="VALUE_OUT_OF_BOUNDS",
+            messageParameters={
+                "arg_name": "probabilities",
+                "lower_bound": "0",
+                "upper_bound": "1",
+                "actual": "nan",
+            },
+        )
+
+        with self.assertRaises(PySparkTypeError) as pe:
+            df.stat.approxQuantile("a", [0.1, True], 0.1)
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "arg_name": "probabilities",
+                "expected_type": "list[float, int]",
+                "arg_type": "bool",
+            },
+        )
+
+        # A value error earlier in the list must not hide a type error later in the list:
+        # types are validated for every element before any value is checked, regardless
+        # of which order the bad elements appear in.
+        with self.assertRaises(PySparkTypeError) as pe:
+            df.stat.approxQuantile("a", [1.5, "0.9"], 0.1)
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "arg_name": "probabilities",
+                "expected_type": "list[float, int]",
+                "arg_type": "str",
+            },
+        )
+
+        with self.assertRaises(PySparkTypeError) as pe:
+            df.stat.approxQuantile("a", ["0.9", 1.5], 0.1)
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "arg_name": "probabilities",
+                "expected_type": "list[float, int]",
+                "arg_type": "str",
+            },
+        )
+
+        with self.assertRaises(PySparkValueError) as pe:
+            df.stat.approxQuantile("a", (0.1, 1.5), 0.1)
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="VALUE_OUT_OF_BOUNDS",
+            messageParameters={
+                "arg_name": "probabilities",
+                "lower_bound": "0",
+                "upper_bound": "1",
+                "actual": "1.5",
+            },
+        )
+
+        with self.assertRaises(PySparkValueError) as pe:
+            df.stat.approxQuantile("a", [0.1, 0.5, 0.9], float("nan"))
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="NEGATIVE_VALUE",
+            messageParameters={"arg_name": "relativeError", "arg_value": "nan"},
+        )
+
+        for relative_error in (True, False):
+            with self.subTest(relative_error=relative_error):
+                with self.assertRaises(PySparkTypeError) as pe:
+                    df.stat.approxQuantile("a", [0.5], relative_error)
+                self.check_error(
+                    exception=pe.exception,
+                    errorClass="NOT_EXPECTED_TYPE",
+                    messageParameters={
+                        "expected_type": "float or int",
+                        "arg_name": "relativeError",
+                        "arg_type": "bool",
+                    },
+                )
+
+        self.assertEqual(df.stat.approxQuantile("a", [0.5], 0), [4.0])
+
+        quantiles = df.stat.approxQuantile("a", [0.5], 1)
+        self.assertEqual(len(quantiles), 1)
+        self.assertEqual(quantiles, df.stat.approxQuantile("a", [0.5], 1.0))
 
     def test_sorting_functions_with_column(self):
         self.check_sorting_functions_with_column(Column)
@@ -1596,7 +1827,7 @@ class FunctionsTestsMixin:
         non_file_df = self.spark.range(100).select(F.input_file_name())
 
         results = non_file_df.collect()
-        self.assertTrue(len(results) == 100)
+        self.assertEqual(len(results), 100)
 
         # [SPARK-24605]: if everything was properly reset after the last job, this should return
         # empty string rather than the file read in the last job.
@@ -1708,8 +1939,12 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_INT_OR_STR",
-            messageParameters={"arg_name": "pos", "arg_type": "float"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column, int or str",
+                "arg_name": "pos",
+                "arg_type": "float",
+            },
         )
 
         with self.assertRaises(PySparkTypeError) as pe:
@@ -1717,8 +1952,12 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_INT_OR_STR",
-            messageParameters={"arg_name": "len", "arg_type": "float"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column, int or str",
+                "arg_name": "len",
+                "arg_type": "float",
+            },
         )
 
     def test_percentile(self):
@@ -1936,6 +2175,36 @@ class FunctionsTestsMixin:
         for r, ex in zip(rs, expected):
             self.assertEqual(tuple(r), ex[: len(r)])
 
+    def test_counter_diff_window_function(self):
+        df = self.spark.createDataFrame(
+            [
+                (1, datetime.datetime(2026, 1, 1, 0, 0, 0), 100),
+                (2, datetime.datetime(2026, 1, 1, 0, 0, 0), 200),
+                (3, datetime.datetime(2026, 1, 1, 0, 0, 0), 50),
+                (4, datetime.datetime(2026, 1, 1, 0, 0, 0), 100),
+                (5, datetime.datetime(2026, 1, 1, 0, 1, 0), 200),
+                (6, datetime.datetime(2026, 1, 1, 0, 1, 0), 300),
+            ],
+            ["t", "st", "c"],
+        )
+        w = Window.orderBy("t")
+
+        rows = df.select("t", F.counter_diff("c").over(w).alias("d")).orderBy("t").collect()
+        self.assertEqual(
+            [(r.t, r.d) for r in rows],
+            [(1, None), (2, 100), (3, None), (4, 50), (5, 100), (6, 100)],
+        )
+
+        rows = (
+            df.select("t", F.counter_diff("c", startTime="st").over(w).alias("d"))
+            .orderBy("t")
+            .collect()
+        )
+        self.assertEqual(
+            [(r.t, r.d) for r in rows],
+            [(1, None), (2, 100), (3, None), (4, 50), (5, None), (6, 100)],
+        )
+
     def test_window_functions_without_partitionBy(self):
         df = self.spark.createDataFrame([(1, "1"), (2, "2"), (1, "2"), (1, "2")], ["key", "value"])
         w = Window.orderBy("key", df.value)
@@ -2050,6 +2319,56 @@ class FunctionsTestsMixin:
             ["1", "2", "2", "2"],
         )
 
+    def test_collect_union(self):
+        # array<int>: distinct union across rows; NULL arrays ignored.
+        df = self.spark.createDataFrame([([1, 2],), ([2, 3],), ([1],), (None,)], ["value"])
+        self.assertEqual(
+            sorted(df.select(F.collect_union(df.value).alias("r")).collect()[0].r),
+            [1, 2, 3],
+        )
+
+        # array<string>
+        sdf = self.spark.createDataFrame([(["a", "b"],), (["b", "c"],), (["a"],)], ["value"])
+        self.assertEqual(
+            sorted(sdf.select(F.collect_union("value").alias("r")).collect()[0].r),
+            ["a", "b", "c"],
+        )
+
+        # array<double> (buffer keyed by bit pattern; values round-trip)
+        ddf = self.spark.createDataFrame([([1.5, 2.5],), ([2.5, 3.5],)], ["value"])
+        self.assertEqual(
+            sorted(ddf.select(F.collect_union("value").alias("r")).collect()[0].r),
+            [1.5, 2.5, 3.5],
+        )
+
+        # NULL elements inside a non-null array are dropped by default (IGNORE NULLS) ...
+        ndf = self.spark.createDataFrame([([1, None],), ([2],)], "value: array<int>")
+        self.assertEqual(
+            sorted(ndf.select(F.collect_union("value").alias("r")).collect()[0].r),
+            [1, 2],
+        )
+        # ... and kept (a single null) with RESPECT NULLS (SQL clause via expr).
+        respect = ndf.select(F.expr("collect_union(value) RESPECT NULLS").alias("r")).collect()[0].r
+        self.assertEqual(sorted(respect, key=lambda x: (x is not None, x)), [None, 1, 2])
+
+        # array<struct>: the motivating case (dedups whole structs, stays element-wise).
+        struct_data = [
+            ([{"id": 1, "flag": True}, {"id": 2, "flag": False}],),
+            ([{"id": 2, "flag": False}, {"id": 3, "flag": True}],),
+        ]
+        stdf = self.spark.createDataFrame(struct_data, "value: array<struct<id:int,flag:boolean>>")
+        struct_rows = stdf.select(F.collect_union("value").alias("r")).collect()[0].r
+        self.assertEqual(
+            sorted((row.id, row.flag) for row in struct_rows),
+            [(1, True), (2, False), (3, True)],
+        )
+
+        # Per-group union.
+        gdf = self.spark.createDataFrame([("a", [1, 2]), ("a", [2, 3]), ("b", [4])], ["k", "value"])
+        rows = gdf.groupBy("k").agg(F.collect_union("value").alias("r")).orderBy("k").collect()
+        self.assertEqual(sorted(rows[0].r), [1, 2, 3])
+        self.assertEqual(sorted(rows[1].r), [4])
+
     def test_listagg_functions(self):
         df = self.spark.createDataFrame(
             [(1, "1"), (2, "2"), (None, None), (1, "2")], ["key", "value"]
@@ -2151,7 +2470,7 @@ class FunctionsTestsMixin:
         result = sketch_df.select(F.kll_sketch_to_string_bigint("sketch")).first()[0]
         self.assertIsNotNone(result)
         self.assertIsInstance(result, str)
-        self.assertIn("Kll", result)
+        self.assertIn("kll", result.lower())
 
     def test_kll_sketch_get_n_bigint(self):
         """Test kll_sketch_get_n_bigint function"""
@@ -2212,7 +2531,7 @@ class FunctionsTestsMixin:
 
         # Test to_string
         string_result = sketch_df.select(F.kll_sketch_to_string_float("sketch")).first()[0]
-        self.assertIn("Kll", string_result)
+        self.assertIn("kll", string_result.lower())
 
         # Test get_n
         n = sketch_df.select(F.kll_sketch_get_n_float("sketch")).first()[0]
@@ -2240,7 +2559,7 @@ class FunctionsTestsMixin:
 
         # Test to_string
         string_result = sketch_df.select(F.kll_sketch_to_string_double("sketch")).first()[0]
-        self.assertIn("Kll", string_result)
+        self.assertIn("kll", string_result.lower())
 
         # Test get_n
         n = sketch_df.select(F.kll_sketch_get_n_double("sketch")).first()[0]
@@ -2269,6 +2588,830 @@ class FunctionsTestsMixin:
         n = sketch_df.select(F.kll_sketch_get_n_bigint("sketch")).first()[0]
         # Should only count non-null values
         self.assertEqual(n, 3)
+
+    def test_kll_merge_agg_bigint(self):
+        """Test kll_merge_agg_bigint function"""
+        df1 = self.spark.createDataFrame([1, 2, 3], "INT")
+        df2 = self.spark.createDataFrame([4, 5, 6], "INT")
+
+        sketch1 = df1.agg(F.kll_sketch_agg_bigint("value").alias("sketch"))
+        sketch2 = df2.agg(F.kll_sketch_agg_bigint("value").alias("sketch"))
+
+        # Union and merge sketches
+        merged = sketch1.union(sketch2).agg(F.kll_merge_agg_bigint("sketch").alias("merged"))
+
+        # Verify the merged sketch contains all values
+        n = merged.select(F.kll_sketch_get_n_bigint("merged")).first()[0]
+        self.assertEqual(n, 6)
+
+        # Test with explicit k parameter
+        merged_with_k = sketch1.union(sketch2).agg(
+            F.kll_merge_agg_bigint("sketch", 400).alias("merged")
+        )
+        self.assertIsNotNone(merged_with_k.first()[0])
+
+    def test_kll_merge_agg_float(self):
+        """Test kll_merge_agg_float function"""
+        df1 = self.spark.createDataFrame([1.0, 2.0, 3.0], "FLOAT")
+        df2 = self.spark.createDataFrame([4.0, 5.0, 6.0], "FLOAT")
+
+        sketch1 = df1.agg(F.kll_sketch_agg_float("value").alias("sketch"))
+        sketch2 = df2.agg(F.kll_sketch_agg_float("value").alias("sketch"))
+
+        # Union and merge sketches
+        merged = sketch1.union(sketch2).agg(F.kll_merge_agg_float("sketch").alias("merged"))
+
+        # Verify the merged sketch contains all values
+        n = merged.select(F.kll_sketch_get_n_float("merged")).first()[0]
+        self.assertEqual(n, 6)
+
+        # Test with explicit k parameter
+        merged_with_k = sketch1.union(sketch2).agg(
+            F.kll_merge_agg_float("sketch", 300).alias("merged")
+        )
+        self.assertIsNotNone(merged_with_k.first()[0])
+
+    def test_kll_merge_agg_double(self):
+        """Test kll_merge_agg_double function"""
+        df1 = self.spark.createDataFrame([1.0, 2.0, 3.0], "DOUBLE")
+        df2 = self.spark.createDataFrame([4.0, 5.0, 6.0], "DOUBLE")
+
+        sketch1 = df1.agg(F.kll_sketch_agg_double("value").alias("sketch"))
+        sketch2 = df2.agg(F.kll_sketch_agg_double("value").alias("sketch"))
+
+        # Union and merge sketches
+        merged = sketch1.union(sketch2).agg(F.kll_merge_agg_double("sketch").alias("merged"))
+
+        # Verify the merged sketch contains all values
+        n = merged.select(F.kll_sketch_get_n_double("merged")).first()[0]
+        self.assertEqual(n, 6)
+
+        # Test quantile on merged sketch
+        quantile = merged.select(F.kll_sketch_get_quantile_double("merged", F.lit(0.5))).first()[0]
+        self.assertIsNotNone(quantile)
+
+    def test_kll_merge_agg_with_different_k(self):
+        """Test kll_merge_agg with different k values"""
+        df1 = self.spark.createDataFrame([1, 2, 3], "INT")
+        df2 = self.spark.createDataFrame([4, 5, 6], "INT")
+
+        # Create sketches with different k values
+        sketch1 = df1.agg(F.kll_sketch_agg_bigint("value", 200).alias("sketch"))
+        sketch2 = df2.agg(F.kll_sketch_agg_bigint("value", 400).alias("sketch"))
+
+        # Merge sketches with different k values (should adopt from first sketch)
+        merged = sketch1.union(sketch2).agg(F.kll_merge_agg_bigint("sketch").alias("merged"))
+
+        n = merged.select(F.kll_sketch_get_n_bigint("merged")).first()[0]
+        self.assertEqual(n, 6)
+
+    def test_kll_merge_agg_with_nulls(self):
+        """Test kll_merge_agg with null values"""
+        df1 = self.spark.createDataFrame([1, 2, 3], "INT")
+        df2 = self.spark.createDataFrame([4, None, 6], "INT")
+
+        sketch1 = df1.agg(F.kll_sketch_agg_bigint("value").alias("sketch"))
+        sketch2 = df2.agg(F.kll_sketch_agg_bigint("value").alias("sketch"))
+
+        # Merge sketches - null values should be ignored
+        merged = sketch1.union(sketch2).agg(F.kll_merge_agg_bigint("sketch").alias("merged"))
+
+        n = merged.select(F.kll_sketch_get_n_bigint("merged")).first()[0]
+        # Should have 5 values (1,2,3,4,6 - null is ignored)
+        self.assertEqual(n, 5)
+
+    def test_tuple_sketch_agg_double_basic(self):
+        """Test tuple_sketch_agg_double basic functionality"""
+        df = self.spark.createDataFrame(
+            [(1, 1.5), (2, 2.5), (3, 3.5), (1, 0.5), (2, 1.0)], ["key", "summary"]
+        )
+
+        # Test with default parameters
+        sketch1 = df.agg(F.tuple_sketch_agg_double("key", "summary")).first()[0]
+        self.assertIsNotNone(sketch1)
+        self.assertIsInstance(sketch1, (bytes, bytearray))
+
+        # Test with explicit lgNomEntries
+        sketch2 = df.agg(F.tuple_sketch_agg_double("key", "summary", 10)).first()[0]
+        self.assertIsNotNone(sketch2)
+
+        # Test with lgNomEntries and mode
+        sketch3 = df.agg(F.tuple_sketch_agg_double("key", "summary", 10, "sum")).first()[0]
+        self.assertIsNotNone(sketch3)
+
+        # Test with Column objects
+        sketch4 = df.agg(F.tuple_sketch_agg_double(F.col("key"), F.col("summary"))).first()[0]
+        self.assertIsNotNone(sketch4)
+
+    def test_tuple_sketch_agg_integer_basic(self):
+        """Test tuple_sketch_agg_integer basic functionality"""
+        df = self.spark.createDataFrame(
+            [(1, 10), (2, 20), (3, 30), (1, 5), (2, 15)], ["key", "summary"]
+        )
+
+        # Test with default parameters
+        sketch1 = df.agg(F.tuple_sketch_agg_integer("key", "summary")).first()[0]
+        self.assertIsNotNone(sketch1)
+        self.assertIsInstance(sketch1, (bytes, bytearray))
+
+        # Test with explicit lgNomEntries
+        sketch2 = df.agg(F.tuple_sketch_agg_integer("key", "summary", 10)).first()[0]
+        self.assertIsNotNone(sketch2)
+
+        # Test with lgNomEntries and mode
+        sketch3 = df.agg(F.tuple_sketch_agg_integer("key", "summary", 10, "max")).first()[0]
+        self.assertIsNotNone(sketch3)
+
+        # Test with different mode
+        sketch4 = df.agg(F.tuple_sketch_agg_integer("key", "summary", 10, "min")).first()[0]
+        self.assertIsNotNone(sketch4)
+
+    def test_tuple_sketch_estimate_and_summary_double(self):
+        """Test tuple_sketch_estimate and summary functions - double"""
+        df = self.spark.createDataFrame(
+            [(1, 1.5), (2, 2.5), (3, 3.5), (1, 0.5), (2, 1.0)], ["key", "summary"]
+        )
+        sketch_df = df.agg(F.tuple_sketch_agg_double("key", "summary").alias("sketch"))
+
+        # Test estimate
+        estimate = sketch_df.select(F.tuple_sketch_estimate_double("sketch")).first()[0]
+        self.assertEqual(estimate, 3.0)
+
+        # Test summary with default mode (sum)
+        summary1 = sketch_df.select(F.tuple_sketch_summary_double("sketch")).first()[0]
+        self.assertEqual(summary1, 9.0)
+
+        # Test summary with explicit mode
+        summary2 = sketch_df.select(F.tuple_sketch_summary_double("sketch", "min")).first()[0]
+        self.assertEqual(summary2, 2.0)
+
+        # Test theta
+        theta = sketch_df.select(F.tuple_sketch_theta_double("sketch")).first()[0]
+        self.assertIsNotNone(theta)
+        self.assertGreater(theta, 0.0)
+        self.assertLessEqual(theta, 1.0)
+
+        # Test with Column objects
+        estimate2 = sketch_df.select(F.tuple_sketch_estimate_double(F.col("sketch"))).first()[0]
+        self.assertIsNotNone(estimate2)
+
+    def test_tuple_sketch_estimate_and_summary_integer(self):
+        """Test tuple_sketch_estimate and summary functions - integer"""
+        df = self.spark.createDataFrame(
+            [(1, 10), (2, 20), (3, 30), (1, 5), (2, 15)], ["key", "summary"]
+        )
+        sketch_df = df.agg(F.tuple_sketch_agg_integer("key", "summary").alias("sketch"))
+
+        # Test estimate
+        estimate = sketch_df.select(F.tuple_sketch_estimate_integer("sketch")).first()[0]
+        self.assertEqual(estimate, 3.0)
+
+        # Test summary with default mode (sum)
+        summary1 = sketch_df.select(F.tuple_sketch_summary_integer("sketch")).first()[0]
+        self.assertEqual(summary1, 80)
+
+        # Test summary with explicit mode
+        summary2 = sketch_df.select(F.tuple_sketch_summary_integer("sketch", "max")).first()[0]
+        self.assertEqual(summary2, 35)
+
+        # Test theta
+        theta = sketch_df.select(F.tuple_sketch_theta_integer("sketch")).first()[0]
+        self.assertIsNotNone(theta)
+        self.assertGreater(theta, 0.0)
+        self.assertLessEqual(theta, 1.0)
+
+        # Test with min mode
+        summary3 = sketch_df.select(F.tuple_sketch_summary_integer("sketch", "min")).first()[0]
+        self.assertEqual(summary3, 15)
+
+    def test_tuple_union_double_basic(self):
+        """Test tuple_union_double basic functionality"""
+        df1 = self.spark.createDataFrame([(1, 1.5), (2, 2.5)], ["key", "summary"])
+        df2 = self.spark.createDataFrame([(3, 3.5), (4, 4.5)], ["key", "summary"])
+
+        sketch1_df = df1.agg(F.tuple_sketch_agg_double("key", "summary").alias("sketch"))
+        sketch2_df = df2.agg(F.tuple_sketch_agg_double("key", "summary").alias("sketch"))
+
+        joined = sketch1_df.crossJoin(sketch2_df.withColumnRenamed("sketch", "sketch2"))
+
+        # Test union with default parameters
+        union1 = joined.select(F.tuple_union_double("sketch", "sketch2")).first()[0]
+        self.assertIsNotNone(union1)
+        self.assertIsInstance(union1, (bytes, bytearray))
+
+        # Test union with lgNomEntries
+        union2 = joined.select(F.tuple_union_double("sketch", "sketch2", 10)).first()[0]
+        self.assertIsNotNone(union2)
+
+        # Test union with lgNomEntries and mode
+        union3 = joined.select(F.tuple_union_double("sketch", "sketch2", 10, "sum")).first()[0]
+        self.assertIsNotNone(union3)
+
+        # Verify estimate from union
+        estimate = joined.select(
+            F.tuple_sketch_estimate_double(F.tuple_union_double("sketch", "sketch2"))
+        ).first()[0]
+        self.assertEqual(estimate, 4.0)
+
+    def test_tuple_union_integer_basic(self):
+        """Test tuple_union_integer basic functionality"""
+        df1 = self.spark.createDataFrame([(1, 10), (2, 20)], ["key", "summary"])
+        df2 = self.spark.createDataFrame([(3, 30), (4, 40)], ["key", "summary"])
+
+        sketch1_df = df1.agg(F.tuple_sketch_agg_integer("key", "summary").alias("sketch"))
+        sketch2_df = df2.agg(F.tuple_sketch_agg_integer("key", "summary").alias("sketch"))
+
+        joined = sketch1_df.crossJoin(sketch2_df.withColumnRenamed("sketch", "sketch2"))
+
+        # Test union with default parameters
+        union1 = joined.select(F.tuple_union_integer("sketch", "sketch2")).first()[0]
+        self.assertIsNotNone(union1)
+
+        # Test union with lgNomEntries and mode
+        union2 = joined.select(F.tuple_union_integer("sketch", "sketch2", 10, "max")).first()[0]
+        self.assertIsNotNone(union2)
+
+        # Test with column names
+        union3 = joined.select(F.tuple_union_integer("sketch", "sketch2", 10)).first()[0]
+        self.assertIsNotNone(union3)
+
+        # Verify estimate from union
+        estimate = joined.select(
+            F.tuple_sketch_estimate_integer(F.tuple_union_integer("sketch", "sketch2"))
+        ).first()[0]
+        self.assertEqual(estimate, 4.0)
+
+    def test_tuple_intersection_double_basic(self):
+        """Test tuple_intersection_double basic functionality"""
+        df1 = self.spark.createDataFrame([(1, 1.5), (2, 2.5), (3, 3.5)], ["key", "summary"])
+        df2 = self.spark.createDataFrame([(2, 1.0), (3, 2.0), (4, 3.0)], ["key", "summary"])
+
+        sketch1_df = df1.agg(F.tuple_sketch_agg_double("key", "summary").alias("sketch"))
+        sketch2_df = df2.agg(F.tuple_sketch_agg_double("key", "summary").alias("sketch"))
+
+        joined = sketch1_df.crossJoin(sketch2_df.withColumnRenamed("sketch", "sketch2"))
+
+        # Test intersection with default mode
+        intersection1 = joined.select(F.tuple_intersection_double("sketch", "sketch2")).first()[0]
+        self.assertIsNotNone(intersection1)
+        self.assertIsInstance(intersection1, (bytes, bytearray))
+
+        # Test intersection with mode
+        intersection2 = joined.select(
+            F.tuple_intersection_double("sketch", "sketch2", "sum")
+        ).first()[0]
+        self.assertIsNotNone(intersection2)
+
+        # Test with min mode
+        intersection3 = joined.select(
+            F.tuple_intersection_double("sketch", "sketch2", "min")
+        ).first()[0]
+        self.assertIsNotNone(intersection3)
+
+        # Verify estimate from intersection (keys 2 and 3 are common)
+        estimate = joined.select(
+            F.tuple_sketch_estimate_double(F.tuple_intersection_double("sketch", "sketch2"))
+        ).first()[0]
+        self.assertEqual(estimate, 2.0)
+
+    def test_tuple_intersection_integer_basic(self):
+        """Test tuple_intersection_integer basic functionality"""
+        df1 = self.spark.createDataFrame([(1, 10), (2, 20), (3, 30)], ["key", "summary"])
+        df2 = self.spark.createDataFrame([(2, 15), (3, 25), (4, 35)], ["key", "summary"])
+
+        sketch1_df = df1.agg(F.tuple_sketch_agg_integer("key", "summary").alias("sketch"))
+        sketch2_df = df2.agg(F.tuple_sketch_agg_integer("key", "summary").alias("sketch"))
+
+        joined = sketch1_df.crossJoin(sketch2_df.withColumnRenamed("sketch", "sketch2"))
+
+        # Test intersection with default mode
+        intersection1 = joined.select(F.tuple_intersection_integer("sketch", "sketch2")).first()[0]
+        self.assertIsNotNone(intersection1)
+
+        # Test intersection with mode
+        intersection2 = joined.select(
+            F.tuple_intersection_integer("sketch", "sketch2", "max")
+        ).first()[0]
+        self.assertIsNotNone(intersection2)
+
+        # Verify estimate from intersection (keys 2 and 3 are common)
+        estimate = joined.select(
+            F.tuple_sketch_estimate_integer(F.tuple_intersection_integer("sketch", "sketch2"))
+        ).first()[0]
+        self.assertEqual(estimate, 2.0)
+
+    def test_tuple_difference_double_basic(self):
+        """Test tuple_difference_double basic functionality"""
+        df1 = self.spark.createDataFrame([(1, 1.5), (2, 2.5), (3, 3.5)], ["key", "summary"])
+        df2 = self.spark.createDataFrame([(2, 1.0), (3, 2.0)], ["key", "summary"])
+
+        sketch1_df = df1.agg(F.tuple_sketch_agg_double("key", "summary").alias("sketch"))
+        sketch2_df = df2.agg(F.tuple_sketch_agg_double("key", "summary").alias("sketch"))
+
+        joined = sketch1_df.crossJoin(sketch2_df.withColumnRenamed("sketch", "sketch2"))
+
+        # Test difference
+        difference = joined.select(F.tuple_difference_double("sketch", "sketch2")).first()[0]
+        self.assertIsNotNone(difference)
+        self.assertIsInstance(difference, (bytes, bytearray))
+
+        # Verify estimate from difference (only key 1 is unique to df1)
+        estimate = joined.select(
+            F.tuple_sketch_estimate_double(F.tuple_difference_double("sketch", "sketch2"))
+        ).first()[0]
+        self.assertEqual(estimate, 1.0)
+
+    def test_tuple_difference_integer_basic(self):
+        """Test tuple_difference_integer basic functionality"""
+        df1 = self.spark.createDataFrame([(1, 10), (2, 20), (3, 30)], ["key", "summary"])
+        df2 = self.spark.createDataFrame([(2, 15), (3, 25)], ["key", "summary"])
+
+        sketch1_df = df1.agg(F.tuple_sketch_agg_integer("key", "summary").alias("sketch"))
+        sketch2_df = df2.agg(F.tuple_sketch_agg_integer("key", "summary").alias("sketch"))
+
+        joined = sketch1_df.crossJoin(sketch2_df.withColumnRenamed("sketch", "sketch2"))
+
+        # Test difference
+        difference = joined.select(F.tuple_difference_integer("sketch", "sketch2")).first()[0]
+        self.assertIsNotNone(difference)
+
+        # Verify estimate from difference (only key 1 is unique to df1)
+        estimate = joined.select(
+            F.tuple_sketch_estimate_integer(F.tuple_difference_integer("sketch", "sketch2"))
+        ).first()[0]
+        self.assertEqual(estimate, 1.0)
+
+    def test_tuple_difference_theta_double_basic(self):
+        """Test tuple_difference_theta_double basic functionality"""
+        df1 = self.spark.createDataFrame(
+            [(1, 1.5), (2, 2.5), (3, 3.5), (5, 5.5)], ["key", "summary"]
+        )
+        df2 = self.spark.createDataFrame([1, 2, 4], "int")
+
+        tuple_sketch_df = df1.agg(F.tuple_sketch_agg_double("key", "summary").alias("tuple_sketch"))
+        theta_sketch_df = df2.agg(F.theta_sketch_agg(F.col("value")).alias("theta_sketch"))
+
+        joined = tuple_sketch_df.crossJoin(theta_sketch_df)
+
+        # Test difference (keys in tuple_sketch but not in theta_sketch: 3 and 5)
+        difference = joined.select(
+            F.tuple_difference_theta_double("tuple_sketch", "theta_sketch")
+        ).first()[0]
+        self.assertIsNotNone(difference)
+        self.assertIsInstance(difference, (bytes, bytearray))
+
+        # Verify estimate from difference
+        estimate = joined.select(
+            F.tuple_sketch_estimate_double(
+                F.tuple_difference_theta_double("tuple_sketch", "theta_sketch")
+            )
+        ).first()[0]
+        self.assertEqual(estimate, 2.0)
+
+    def test_tuple_difference_theta_integer_basic(self):
+        """Test tuple_difference_theta_integer basic functionality"""
+        df1 = self.spark.createDataFrame([(1, 10), (2, 20), (3, 30), (5, 50)], ["key", "summary"])
+        df2 = self.spark.createDataFrame([1, 2, 4], "int")
+
+        tuple_sketch_df = df1.agg(
+            F.tuple_sketch_agg_integer("key", "summary").alias("tuple_sketch")
+        )
+        theta_sketch_df = df2.agg(F.theta_sketch_agg(F.col("value")).alias("theta_sketch"))
+
+        joined = tuple_sketch_df.crossJoin(theta_sketch_df)
+
+        # Test difference (keys in tuple_sketch but not in theta_sketch: 3 and 5)
+        difference = joined.select(
+            F.tuple_difference_theta_integer("tuple_sketch", "theta_sketch")
+        ).first()[0]
+        self.assertIsNotNone(difference)
+
+        # Verify estimate from difference
+        estimate = joined.select(
+            F.tuple_sketch_estimate_integer(
+                F.tuple_difference_theta_integer("tuple_sketch", "theta_sketch")
+            )
+        ).first()[0]
+        self.assertEqual(estimate, 2.0)
+
+    def test_tuple_intersection_theta_double_basic(self):
+        """Test tuple_intersection_theta_double basic functionality"""
+        df1 = self.spark.createDataFrame([(1, 1.5), (2, 2.5), (3, 3.5)], ["key", "summary"])
+        df2 = self.spark.createDataFrame([2, 3, 4], "int")
+
+        tuple_sketch_df = df1.agg(F.tuple_sketch_agg_double("key", "summary").alias("tuple_sketch"))
+        theta_sketch_df = df2.agg(F.theta_sketch_agg(F.col("value")).alias("theta_sketch"))
+
+        joined = tuple_sketch_df.crossJoin(theta_sketch_df)
+
+        # Test intersection with default mode
+        intersection1 = joined.select(
+            F.tuple_intersection_theta_double("tuple_sketch", "theta_sketch")
+        ).first()[0]
+        self.assertIsNotNone(intersection1)
+        self.assertIsInstance(intersection1, (bytes, bytearray))
+
+        # Test intersection with mode
+        intersection2 = joined.select(
+            F.tuple_intersection_theta_double("tuple_sketch", "theta_sketch", "sum")
+        ).first()[0]
+        self.assertIsNotNone(intersection2)
+
+        # Test with min mode
+        intersection3 = joined.select(
+            F.tuple_intersection_theta_double("tuple_sketch", "theta_sketch", "min")
+        ).first()[0]
+        self.assertIsNotNone(intersection3)
+
+        # Verify estimate from intersection (keys 2 and 3 are common)
+        estimate = joined.select(
+            F.tuple_sketch_estimate_double(
+                F.tuple_intersection_theta_double("tuple_sketch", "theta_sketch")
+            )
+        ).first()[0]
+        self.assertEqual(estimate, 2.0)
+
+    def test_tuple_intersection_theta_integer_basic(self):
+        """Test tuple_intersection_theta_integer basic functionality"""
+        df1 = self.spark.createDataFrame([(1, 10), (2, 20), (3, 30)], ["key", "summary"])
+        df2 = self.spark.createDataFrame([2, 3, 4], "int")
+
+        tuple_sketch_df = df1.agg(
+            F.tuple_sketch_agg_integer("key", "summary").alias("tuple_sketch")
+        )
+        theta_sketch_df = df2.agg(F.theta_sketch_agg(F.col("value")).alias("theta_sketch"))
+
+        joined = tuple_sketch_df.crossJoin(theta_sketch_df)
+
+        # Test intersection with default mode
+        intersection1 = joined.select(
+            F.tuple_intersection_theta_integer("tuple_sketch", "theta_sketch")
+        ).first()[0]
+        self.assertIsNotNone(intersection1)
+
+        # Test intersection with mode
+        intersection2 = joined.select(
+            F.tuple_intersection_theta_integer("tuple_sketch", "theta_sketch", "max")
+        ).first()[0]
+        self.assertIsNotNone(intersection2)
+
+        # Verify estimate from intersection (keys 2 and 3 are common)
+        estimate = joined.select(
+            F.tuple_sketch_estimate_integer(
+                F.tuple_intersection_theta_integer("tuple_sketch", "theta_sketch")
+            )
+        ).first()[0]
+        self.assertEqual(estimate, 2.0)
+
+    def test_tuple_union_theta_double_basic(self):
+        """Test tuple_union_theta_double basic functionality"""
+        df1 = self.spark.createDataFrame([(1, 1.5), (2, 2.5)], ["key", "summary"])
+        df2 = self.spark.createDataFrame([3, 4], "int")
+
+        tuple_sketch_df = df1.agg(F.tuple_sketch_agg_double("key", "summary").alias("tuple_sketch"))
+        theta_sketch_df = df2.agg(F.theta_sketch_agg(F.col("value")).alias("theta_sketch"))
+
+        joined = tuple_sketch_df.crossJoin(theta_sketch_df)
+
+        # Test union with default parameters
+        union1 = joined.select(F.tuple_union_theta_double("tuple_sketch", "theta_sketch")).first()[
+            0
+        ]
+        self.assertIsNotNone(union1)
+        self.assertIsInstance(union1, (bytes, bytearray))
+
+        # Test union with lgNomEntries
+        union2 = joined.select(
+            F.tuple_union_theta_double("tuple_sketch", "theta_sketch", 10)
+        ).first()[0]
+        self.assertIsNotNone(union2)
+
+        # Test union with lgNomEntries and mode
+        union3 = joined.select(
+            F.tuple_union_theta_double("tuple_sketch", "theta_sketch", 10, "sum")
+        ).first()[0]
+        self.assertIsNotNone(union3)
+
+        # Verify estimate from union (all 4 keys)
+        estimate = joined.select(
+            F.tuple_sketch_estimate_double(
+                F.tuple_union_theta_double("tuple_sketch", "theta_sketch")
+            )
+        ).first()[0]
+        self.assertEqual(estimate, 4.0)
+
+    def test_tuple_union_theta_integer_basic(self):
+        """Test tuple_union_theta_integer basic functionality"""
+        df1 = self.spark.createDataFrame([(1, 10), (2, 20)], ["key", "summary"])
+        df2 = self.spark.createDataFrame([3, 4], "int")
+
+        tuple_sketch_df = df1.agg(
+            F.tuple_sketch_agg_integer("key", "summary").alias("tuple_sketch")
+        )
+        theta_sketch_df = df2.agg(F.theta_sketch_agg(F.col("value")).alias("theta_sketch"))
+
+        joined = tuple_sketch_df.crossJoin(theta_sketch_df)
+
+        # Test union with default parameters
+        union1 = joined.select(F.tuple_union_theta_integer("tuple_sketch", "theta_sketch")).first()[
+            0
+        ]
+        self.assertIsNotNone(union1)
+
+        # Test union with lgNomEntries and mode
+        union2 = joined.select(
+            F.tuple_union_theta_integer("tuple_sketch", "theta_sketch", 10, "max")
+        ).first()[0]
+        self.assertIsNotNone(union2)
+
+        # Test with lgNomEntries only
+        union3 = joined.select(
+            F.tuple_union_theta_integer("tuple_sketch", "theta_sketch", 10)
+        ).first()[0]
+        self.assertIsNotNone(union3)
+
+        # Verify estimate from union (all 4 keys)
+        estimate = joined.select(
+            F.tuple_sketch_estimate_integer(
+                F.tuple_union_theta_integer("tuple_sketch", "theta_sketch")
+            )
+        ).first()[0]
+        self.assertEqual(estimate, 4.0)
+
+    def test_tuple_union_agg_double_basic(self):
+        """Test tuple_union_agg_double basic functionality"""
+        df1 = self.spark.createDataFrame([(1, 1, 1.5), (1, 2, 2.5)], ["id", "key", "summary"])
+        df2 = self.spark.createDataFrame([(1, 3, 3.5), (1, 4, 4.5)], ["id", "key", "summary"])
+
+        sketch1_df = df1.groupBy("id").agg(
+            F.tuple_sketch_agg_double("key", "summary").alias("sketch")
+        )
+        sketch2_df = df2.groupBy("id").agg(
+            F.tuple_sketch_agg_double("key", "summary").alias("sketch")
+        )
+
+        combined = sketch1_df.union(sketch2_df)
+
+        # Test union_agg with default parameters
+        union1 = combined.groupBy("id").agg(F.tuple_union_agg_double("sketch")).first()[1]
+        self.assertIsNotNone(union1)
+        self.assertIsInstance(union1, (bytes, bytearray))
+
+        # Test union_agg with lgNomEntries
+        union2 = combined.groupBy("id").agg(F.tuple_union_agg_double("sketch", 10)).first()[1]
+        self.assertIsNotNone(union2)
+
+        # Test union_agg with lgNomEntries and mode
+        union3 = (
+            combined.groupBy("id").agg(F.tuple_union_agg_double("sketch", 10, "sum")).first()[1]
+        )
+        self.assertIsNotNone(union3)
+
+        # Verify estimate from union_agg (keys 1, 2, 3, 4 should all be present)
+        estimate_result = (
+            combined.groupBy("id")
+            .agg(F.tuple_union_agg_double("sketch").alias("union_sketch"))
+            .select(F.tuple_sketch_estimate_double("union_sketch"))
+            .first()[0]
+        )
+        self.assertEqual(estimate_result, 4.0)
+
+    def test_tuple_union_agg_integer_basic(self):
+        """Test tuple_union_agg_integer basic functionality"""
+        df1 = self.spark.createDataFrame([(1, 1, 10), (1, 2, 20)], ["id", "key", "summary"])
+        df2 = self.spark.createDataFrame([(1, 3, 30), (1, 4, 40)], ["id", "key", "summary"])
+
+        sketch1_df = df1.groupBy("id").agg(
+            F.tuple_sketch_agg_integer("key", "summary").alias("sketch")
+        )
+        sketch2_df = df2.groupBy("id").agg(
+            F.tuple_sketch_agg_integer("key", "summary").alias("sketch")
+        )
+
+        combined = sketch1_df.union(sketch2_df)
+
+        # Test union_agg with default parameters
+        union1 = combined.groupBy("id").agg(F.tuple_union_agg_integer("sketch")).first()[1]
+        self.assertIsNotNone(union1)
+
+        # Test union_agg with lgNomEntries and mode
+        union2 = (
+            combined.groupBy("id").agg(F.tuple_union_agg_integer("sketch", 10, "max")).first()[1]
+        )
+        self.assertIsNotNone(union2)
+
+        # Test with lgNomEntries
+        union3 = combined.groupBy("id").agg(F.tuple_union_agg_integer("sketch", 10)).first()[1]
+        self.assertIsNotNone(union3)
+
+        # Verify estimate from union_agg (keys 1, 2, 3, 4 should all be present)
+        estimate_result = (
+            combined.groupBy("id")
+            .agg(F.tuple_union_agg_integer("sketch").alias("union_sketch"))
+            .select(F.tuple_sketch_estimate_integer("union_sketch"))
+            .first()[0]
+        )
+        self.assertEqual(estimate_result, 4.0)
+
+    def test_tuple_intersection_agg_double_basic(self):
+        """Test tuple_intersection_agg_double basic functionality"""
+        df1 = self.spark.createDataFrame(
+            [(1, 1, 1.5), (1, 2, 2.5), (1, 3, 3.5)], ["id", "key", "summary"]
+        )
+        df2 = self.spark.createDataFrame(
+            [(1, 2, 1.0), (1, 3, 2.0), (1, 4, 3.0)], ["id", "key", "summary"]
+        )
+
+        sketch1_df = df1.groupBy("id").agg(
+            F.tuple_sketch_agg_double("key", "summary").alias("sketch")
+        )
+        sketch2_df = df2.groupBy("id").agg(
+            F.tuple_sketch_agg_double("key", "summary").alias("sketch")
+        )
+
+        combined = sketch1_df.union(sketch2_df)
+
+        # Test intersection_agg with default mode
+        intersection1 = (
+            combined.groupBy("id").agg(F.tuple_intersection_agg_double("sketch")).first()[1]
+        )
+        self.assertIsNotNone(intersection1)
+        self.assertIsInstance(intersection1, (bytes, bytearray))
+
+        # Test intersection_agg with mode
+        intersection2 = (
+            combined.groupBy("id").agg(F.tuple_intersection_agg_double("sketch", "sum")).first()[1]
+        )
+        self.assertIsNotNone(intersection2)
+
+        # Test with min mode
+        intersection3 = (
+            combined.groupBy("id").agg(F.tuple_intersection_agg_double("sketch", "min")).first()[1]
+        )
+        self.assertIsNotNone(intersection3)
+
+        # Verify estimate from intersection_agg (keys 2 and 3 are common)
+        estimate_result = (
+            combined.groupBy("id")
+            .agg(F.tuple_intersection_agg_double("sketch").alias("intersection_sketch"))
+            .select(F.tuple_sketch_estimate_double("intersection_sketch"))
+            .first()[0]
+        )
+        self.assertEqual(estimate_result, 2.0)
+
+    def test_tuple_intersection_agg_integer_basic(self):
+        """Test tuple_intersection_agg_integer basic functionality"""
+        df1 = self.spark.createDataFrame(
+            [(1, 1, 10), (1, 2, 20), (1, 3, 30)], ["id", "key", "summary"]
+        )
+        df2 = self.spark.createDataFrame(
+            [(1, 2, 15), (1, 3, 25), (1, 4, 35)], ["id", "key", "summary"]
+        )
+
+        sketch1_df = df1.groupBy("id").agg(
+            F.tuple_sketch_agg_integer("key", "summary").alias("sketch")
+        )
+        sketch2_df = df2.groupBy("id").agg(
+            F.tuple_sketch_agg_integer("key", "summary").alias("sketch")
+        )
+
+        combined = sketch1_df.union(sketch2_df)
+
+        # Test intersection_agg with default mode
+        intersection1 = (
+            combined.groupBy("id").agg(F.tuple_intersection_agg_integer("sketch")).first()[1]
+        )
+        self.assertIsNotNone(intersection1)
+
+        # Test intersection_agg with mode
+        intersection2 = (
+            combined.groupBy("id").agg(F.tuple_intersection_agg_integer("sketch", "max")).first()[1]
+        )
+        self.assertIsNotNone(intersection2)
+
+        # Verify estimate from intersection_agg (keys 2 and 3 are common)
+        estimate_result = (
+            combined.groupBy("id")
+            .agg(F.tuple_intersection_agg_integer("sketch").alias("intersection_sketch"))
+            .select(F.tuple_sketch_estimate_integer("intersection_sketch"))
+            .first()[0]
+        )
+        self.assertEqual(estimate_result, 2.0)
+
+    def test_tuple_sketch_with_nulls(self):
+        """Test tuple sketch with null values"""
+        df = self.spark.createDataFrame([(1, 10), (2, 20), (3, None)], ["key", "summary"])
+
+        # Null summaries should be handled
+        sketch = df.agg(F.tuple_sketch_agg_integer("key", "summary").alias("sketch"))
+        estimate = sketch.select(F.tuple_sketch_estimate_integer("sketch")).first()[0]
+        self.assertIsNotNone(estimate)
+        self.assertEqual(estimate, 2.0)
+
+    def test_tuple_sketch_comprehensive_double(self):
+        """Test tuple_sketch_agg + operations + estimate comprehensive test - double"""
+        df1 = self.spark.createDataFrame(
+            [(1, "a", 1.0), (1, "a", 2.0), (1, "b", 3.0), (1, "c", 4.0)],
+            ["id", "key", "summary"],
+        )
+
+        df2 = self.spark.createDataFrame(
+            [(1, "a", 0.5), (1, "c", 1.5), (1, "d", 2.5), (1, "e", 3.5)],
+            ["id", "key", "summary"],
+        )
+
+        # Test tuple_sketch_agg and estimate
+        res1 = (
+            df1.groupBy("id")
+            .agg(F.tuple_sketch_agg_double("key", "summary").alias("sketch"))
+            .withColumn("estimate", F.tuple_sketch_estimate_double("sketch"))
+            .withColumn("summary_total", F.tuple_sketch_summary_double("sketch"))
+        )
+
+        row1 = res1.first()
+        self.assertGreaterEqual(row1["estimate"], 3.0)
+        self.assertGreater(row1["summary_total"], 0.0)
+
+        # Test union operations
+        sketch1 = df1.groupBy("id").agg(F.tuple_sketch_agg_double("key", "summary").alias("sketch"))
+        sketch2 = df2.groupBy("id").agg(F.tuple_sketch_agg_double("key", "summary").alias("sketch"))
+
+        union_result = (
+            sketch1.union(sketch2)
+            .groupBy("id")
+            .agg(F.tuple_union_agg_double("sketch").alias("union_sketch"))
+            .withColumn("union_estimate", F.tuple_sketch_estimate_double("union_sketch"))
+        )
+
+        union_row = union_result.first()
+        self.assertGreaterEqual(union_row["union_estimate"], 5.0)
+
+        # Test intersection
+        joined = sketch1.crossJoin(sketch2.withColumnRenamed("sketch", "sketch2"))
+        intersection_result = joined.withColumn(
+            "intersection_sketch", F.tuple_intersection_double("sketch", "sketch2")
+        ).withColumn("intersection_estimate", F.tuple_sketch_estimate_double("intersection_sketch"))
+
+        intersection_row = intersection_result.first()
+        self.assertGreaterEqual(intersection_row["intersection_estimate"], 2.0)
+
+        # Test difference
+        difference_result = joined.withColumn(
+            "difference_sketch", F.tuple_difference_double("sketch", "sketch2")
+        ).withColumn("difference_estimate", F.tuple_sketch_estimate_double("difference_sketch"))
+
+        difference_row = difference_result.first()
+        self.assertGreaterEqual(difference_row["difference_estimate"], 1.0)
+
+    def test_tuple_sketch_comprehensive_integer(self):
+        """Test tuple_sketch_agg + operations + estimate comprehensive test - integer"""
+        df1 = self.spark.createDataFrame(
+            [(1, "a", 10), (1, "a", 20), (1, "b", 30), (1, "c", 40)], ["id", "key", "summary"]
+        )
+
+        df2 = self.spark.createDataFrame(
+            [(1, "a", 5), (1, "c", 15), (1, "d", 25), (1, "e", 35)], ["id", "key", "summary"]
+        )
+
+        # Test tuple_sketch_agg and estimate
+        res1 = (
+            df1.groupBy("id")
+            .agg(F.tuple_sketch_agg_integer("key", "summary").alias("sketch"))
+            .withColumn("estimate", F.tuple_sketch_estimate_integer("sketch"))
+            .withColumn("summary_total", F.tuple_sketch_summary_integer("sketch"))
+        )
+
+        row1 = res1.first()
+        self.assertGreaterEqual(row1["estimate"], 3.0)
+        self.assertGreater(row1["summary_total"], 0)
+
+        # Test with different modes
+        res_max = (
+            df1.groupBy("id")
+            .agg(F.tuple_sketch_agg_integer("key", "summary", 12, "max").alias("sketch"))
+            .withColumn("summary_max", F.tuple_sketch_summary_integer("sketch", "max"))
+        )
+
+        row_max = res_max.first()
+        self.assertGreater(row_max["summary_max"], 0)
+
+        # Test union with mode
+        sketch1 = df1.groupBy("id").agg(
+            F.tuple_sketch_agg_integer("key", "summary").alias("sketch")
+        )
+        sketch2 = df2.groupBy("id").agg(
+            F.tuple_sketch_agg_integer("key", "summary").alias("sketch")
+        )
+
+        union_result = (
+            sketch1.union(sketch2)
+            .groupBy("id")
+            .agg(F.tuple_union_agg_integer("sketch", 12, "sum").alias("union_sketch"))
+            .withColumn("union_estimate", F.tuple_sketch_estimate_integer("union_sketch"))
+        )
+
+        union_row = union_result.first()
+        self.assertGreaterEqual(union_row["union_estimate"], 5.0)
 
     def test_datetime_functions(self):
         df = self.spark.range(1).selectExpr("'2017-01-22' as dateCol")
@@ -2302,8 +3445,12 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_STR",
-            messageParameters={"arg_name": "errMsg", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column or str",
+                "arg_name": "errMsg",
+                "arg_type": "int",
+            },
         )
 
     def test_raise_error(self):
@@ -2323,8 +3470,12 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_STR",
-            messageParameters={"arg_name": "errMsg", "arg_type": "NoneType"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column or str",
+                "arg_name": "errMsg",
+                "arg_type": "NoneType",
+            },
         )
 
     def test_sum_distinct(self):
@@ -2397,11 +3548,15 @@ class FunctionsTestsMixin:
         df = self.spark.createDataFrame(
             [("100-200", r"(\d+)", "--")], ["str", "pattern", "replacement"]
         )
+
         self.assertTrue(
             all(
                 df.select(
                     F.regexp_replace("str", r"(\d+)", "--") == "-----",
                     F.regexp_replace("str", F.col("pattern"), F.col("replacement")) == "-----",
+                    F.regexp_replace("str", r"(\d+)", "--", 5) == "100---",
+                    F.regexp_replace("str", F.col("pattern"), F.col("replacement"), F.lit(5))
+                    == "100---",
                 ).first()
             )
         )
@@ -2573,7 +3728,16 @@ class FunctionsTestsMixin:
 
     def test_variant_expressions(self):
         df = self.spark.createDataFrame(
-            [Row(json="""{ "a" : 1 }""", path="$.a"), Row(json="""{ "b" : 2 }""", path="$.b")]
+            [
+                Row(json="""{ "a" : 1 }""", path="$.a", newpath="$.z", arr="[1, 2]", arrpath="$"),
+                Row(
+                    json="""{ "b" : 2 }""",
+                    path="$.b",
+                    newpath="$.z",
+                    arr="[[3], 4]",
+                    arrpath="$[0]",
+                ),
+            ]
         )
         v = F.parse_json(df.json)
 
@@ -2581,6 +3745,86 @@ class FunctionsTestsMixin:
             self.assertEqual([r[0] for r in resultDf.collect()], expected)
 
         check(df.select(F.is_variant_null(v)), [False, False])
+        check(df.select(F.is_valid_variant(v)), [True, True])
+        check(df.select(F.to_json(F.variant_delete(v, "$.a"))), ["{}", '{"b":2}'])
+        check(df.select(F.to_json(F.variant_delete(v, df.path))), ["{}", "{}"])
+        check(
+            df.select(F.to_json(F.variant_delete(v, F.lit(None)))),
+            ['{"a":1}', '{"b":2}'],
+        )
+        check(
+            df.select(F.to_json(F.variant_insert(v, "$.z", F.lit(9)))),
+            ['{"a":1,"z":9}', '{"b":2,"z":9}'],
+        )
+        check(df.select(F.to_json(F.variant_insert(v, "$.z", F.lit(None)))), [None, None])
+        check(
+            df.select(F.to_json(F.variant_insert(v, df.newpath, F.lit(9)))),
+            ['{"a":1,"z":9}', '{"b":2,"z":9}'],
+        )
+        check(
+            df.select(F.to_json(F.try_variant_insert(v, "$.z", F.lit(9)))),
+            ['{"a":1,"z":9}', '{"b":2,"z":9}'],
+        )
+        check(df.select(F.to_json(F.try_variant_insert(v, df.path, F.lit(9)))), [None, None])
+        check(df.select(F.to_json(F.try_variant_insert(v, "$.z", F.lit(None)))), [None, None])
+        check(
+            df.select(F.to_json(F.variant_set(v, "$.z", F.lit(9)))),
+            ['{"a":1,"z":9}', '{"b":2,"z":9}'],
+        )
+        check(
+            df.select(F.to_json(F.variant_set(v, "$.z", F.lit(9), False))),
+            ['{"a":1}', '{"b":2}'],
+        )
+        check(df.select(F.to_json(F.variant_set(v, "$.z", F.lit(None)))), [None, None])
+        check(
+            df.select(F.to_json(F.variant_set(v, df.newpath, F.lit(9)))),
+            ['{"a":1,"z":9}', '{"b":2,"z":9}'],
+        )
+        check(
+            df.select(F.to_json(F.try_variant_set(v, "$.z", F.lit(9)))),
+            ['{"a":1,"z":9}', '{"b":2,"z":9}'],
+        )
+        check(
+            df.select(F.to_json(F.try_variant_set(v, "$.z", F.lit(9), False))),
+            ['{"a":1}', '{"b":2}'],
+        )
+        check(df.select(F.to_json(F.try_variant_set(v, "$[0]", F.lit(9)))), [None, None])
+        check(
+            df.select(F.to_json(F.try_variant_set(v, df.newpath, F.lit(9)))),
+            ['{"a":1,"z":9}', '{"b":2,"z":9}'],
+        )
+        arr = F.parse_json(df.arr)
+        check(
+            df.select(F.to_json(F.variant_array_append(arr, "$", F.lit(9)))),
+            ["[1,2,9]", "[[3],4,9]"],
+        )
+        check(df.select(F.to_json(F.variant_array_append(arr, "$", F.lit(None)))), [None, None])
+        check(
+            df.select(F.to_json(F.variant_array_append(arr, df.arrpath, F.lit(9)))),
+            ["[1,2,9]", "[[3,9],4]"],
+        )
+        check(
+            df.select(F.to_json(F.try_variant_array_append(arr, "$", F.lit(9)))),
+            ["[1,2,9]", "[[3],4,9]"],
+        )
+        check(df.select(F.to_json(F.try_variant_array_append(arr, "$.a", F.lit(9)))), [None, None])
+        check(
+            df.select(F.to_json(F.try_variant_array_append(arr, df.arrpath, F.lit(9)))),
+            ["[1,2,9]", "[[3,9],4]"],
+        )
+        strip_v = F.parse_json(F.lit('{"a": 1, "b": null, "c": [1, null]}'))
+        check(
+            df.select(F.to_json(F.variant_strip_nulls(strip_v))),
+            ['{"a":1,"c":[1]}', '{"a":1,"c":[1]}'],
+        )
+        check(
+            df.select(F.to_json(F.variant_strip_nulls(strip_v, False))),
+            ['{"a":1,"c":[1,null]}', '{"a":1,"c":[1,null]}'],
+        )
+        check(df.select(F.to_json(F.variant_pick(v, "$.a"))), ['{"a":1}', "{}"])
+        check(df.select(F.to_json(F.variant_pick(v, df.path))), ['{"a":1}', '{"b":2}'])
+        check(df.select(F.to_json(F.variant_pick(v, F.lit(None)))), ["{}", "{}"])
+        check(df.select(F.to_json(F.variant_pick(v, "$.a", df.path))), ['{"a":1}', '{"b":2}'])
         check(df.select(F.schema_of_variant(v)), ["OBJECT<a: BIGINT>", "OBJECT<b: BIGINT>"])
         check(df.select(F.schema_of_variant_agg(v)), ["OBJECT<a: BIGINT, b: BIGINT>"])
 
@@ -2612,8 +3856,12 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_STR",
-            messageParameters={"arg_name": "json", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column or str",
+                "arg_name": "json",
+                "arg_type": "int",
+            },
         )
 
     def test_try_parse_json(self):
@@ -2660,14 +3908,35 @@ class FunctionsTestsMixin:
         ).collect()
         self.assertEqual("""{"a":1}""", actual[0]["var"])
 
+    def test_variant_from_arrays_and_entries(self):
+        df = self.spark.createDataFrame(
+            [(["a", "b"], [1, 2])], "keys array<string>, values array<int>"
+        )
+        actual = df.select(
+            F.to_json(F.variant_from_arrays("keys", "values")).alias("var"),
+        ).collect()
+        self.assertEqual("""{"a":1,"b":2}""", actual[0]["var"])
+
+        df2 = self.spark.createDataFrame(
+            [([("a", 1), ("b", 2)],)], "entries array<struct<k string, v int>>"
+        )
+        actual2 = df2.select(
+            F.to_json(F.variant_from_entries("entries")).alias("var"),
+        ).collect()
+        self.assertEqual("""{"a":1,"b":2}""", actual2[0]["var"])
+
     def test_schema_of_csv(self):
         with self.assertRaises(PySparkTypeError) as pe:
             F.schema_of_csv(1)
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_STR",
-            messageParameters={"arg_name": "csv", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column or str",
+                "arg_name": "csv",
+                "arg_type": "int",
+            },
         )
 
     def test_from_csv(self):
@@ -2677,8 +3946,12 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_STR",
-            messageParameters={"arg_name": "schema", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column or str",
+                "arg_name": "schema",
+                "arg_type": "int",
+            },
         )
 
     def test_schema_of_xml(self):
@@ -2687,8 +3960,12 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_STR",
-            messageParameters={"arg_name": "xml", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column or str",
+                "arg_name": "xml",
+                "arg_type": "int",
+            },
         )
 
     def test_from_xml(self):
@@ -2698,8 +3975,12 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_STR_OR_STRUCT",
-            messageParameters={"arg_name": "schema", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "StructType, Column or str",
+                "arg_name": "schema",
+                "arg_type": "int",
+            },
         )
 
     def test_greatest(self):
@@ -2719,8 +4000,12 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN",
-            messageParameters={"arg_name": "condition", "arg_type": "str"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column",
+                "arg_name": "condition",
+                "arg_type": "str",
+            },
         )
 
     def test_window(self):
@@ -2729,8 +4014,12 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_STR",
-            messageParameters={"arg_name": "windowDuration", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "str",
+                "arg_name": "windowDuration",
+                "arg_type": "int",
+            },
         )
 
     def test_session_window(self):
@@ -2739,8 +4028,12 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_STR",
-            messageParameters={"arg_name": "gapDuration", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column or str",
+                "arg_name": "gapDuration",
+                "arg_type": "int",
+            },
         )
 
     def test_current_user(self):
@@ -2758,8 +4051,12 @@ class FunctionsTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_INT",
-            messageParameters={"arg_name": "numBuckets", "arg_type": "str"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column or int",
+                "arg_name": "numBuckets",
+                "arg_type": "str",
+            },
         )
 
     def test_to_time(self):
@@ -2961,18 +4258,72 @@ class FunctionsTestsMixin:
 
     def test_st_asbinary(self):
         df = self.spark.createDataFrame(
+            [(bytes.fromhex("0101000000000000000000F03F0000000000000040"), "XDR")],
+            ["wkb", "end"],
+        )
+        results = df.select(
+            F.hex(F.st_asbinary(F.st_geogfromwkb("wkb"))),
+            F.hex(F.st_asbinary(F.st_geogfromwkb("wkb"), "NDR")),
+            F.hex(F.st_asbinary(F.st_geogfromwkb("wkb"), "XDR")),
+            F.hex(F.st_asbinary(F.st_geogfromwkb("wkb"), F.col("end"))),
+            F.hex(F.st_asbinary(F.st_geomfromwkb("wkb"))),
+            F.hex(F.st_asbinary(F.st_geomfromwkb("wkb"), "NDR")),
+            F.hex(F.st_asbinary(F.st_geomfromwkb("wkb"), "XDR")),
+            F.hex(F.st_asbinary(F.st_geomfromwkb("wkb"), F.col("end"))),
+        ).collect()
+        expected = Row(
+            "0101000000000000000000F03F0000000000000040",
+            "0101000000000000000000F03F0000000000000040",
+            "00000000013FF00000000000004000000000000000",
+            "00000000013FF00000000000004000000000000000",
+            "0101000000000000000000F03F0000000000000040",
+            "0101000000000000000000F03F0000000000000040",
+            "00000000013FF00000000000004000000000000000",
+            "00000000013FF00000000000004000000000000000",
+        )
+        self.assertEqual(results, [expected])
+
+    def test_st_geogfromwkb(self):
+        df = self.spark.createDataFrame(
             [(bytes.fromhex("0101000000000000000000F03F0000000000000040"),)],
             ["wkb"],
         )
         results = df.select(
             F.hex(F.st_asbinary(F.st_geogfromwkb("wkb"))),
+        ).collect()
+        expected = Row(
+            "0101000000000000000000F03F0000000000000040",
+        )
+        self.assertEqual(results, [expected])
+        # ST_GeogFromWKB with invalid WKB.
+        df = self.spark.createDataFrame([(bytearray(b"\x6f"),)], ["wkb"])
+        with self.assertRaises(IllegalArgumentException) as error_context:
+            df.select(F.st_geogfromwkb("wkb")).collect()
+        self.assertIn("[WKB_PARSE_ERROR]", str(error_context.exception))
+        self.assertIn("Unexpected end of WKB buffer", str(error_context.exception))
+
+    def test_st_geomfromwkb(self):
+        df = self.spark.createDataFrame(
+            [(bytes.fromhex("0101000000000000000000F03F0000000000000040"), 4326)],
+            ["wkb", "srid"],
+        )
+        results = df.select(
             F.hex(F.st_asbinary(F.st_geomfromwkb("wkb"))),
+            F.hex(F.st_asbinary(F.st_geomfromwkb("wkb", "srid"))),
+            F.hex(F.st_asbinary(F.st_geomfromwkb("wkb", 4326))),
         ).collect()
         expected = Row(
             "0101000000000000000000F03F0000000000000040",
             "0101000000000000000000F03F0000000000000040",
+            "0101000000000000000000F03F0000000000000040",
         )
         self.assertEqual(results, [expected])
+        # ST_GeomFromWKB with invalid WKB.
+        df = self.spark.createDataFrame([(bytearray(b"\x6f"),)], ["wkb"])
+        with self.assertRaises(IllegalArgumentException) as error_context:
+            df.select(F.st_geomfromwkb("wkb")).collect()
+        self.assertIn("[WKB_PARSE_ERROR]", str(error_context.exception))
+        self.assertIn("Unexpected end of WKB buffer", str(error_context.exception))
 
     def test_st_setsrid(self):
         df = self.spark.createDataFrame(
@@ -3001,26 +4352,129 @@ class FunctionsTestsMixin:
         results = df.select(
             F.st_srid(F.st_geogfromwkb("wkb")),
             F.st_srid(F.st_geomfromwkb("wkb")),
+            F.st_srid(F.st_geomfromwkb("wkb", 4326)),
         ).collect()
         expected = Row(
             4326,
             0,
+            4326,
         )
         self.assertEqual(results, [expected])
 
+    def test_max_by_min_by_with_k(self):
+        """Test max_by and min_by aggregate functions with k parameter"""
+        df = self.spark.createDataFrame(
+            [("a", 10), ("b", 50), ("c", 20), ("d", 40), ("e", 30)],
+            schema=("x", "y"),
+        )
 
-class FunctionsTests(ReusedSQLTestCase, FunctionsTestsMixin):
+        # Test max_by with k
+        result = df.select(F.max_by("x", "y", 3)).collect()[0][0]
+        self.assertEqual(result, ["b", "d", "e"])
+
+        # Test min_by with k
+        result = df.select(F.min_by("x", "y", 3)).collect()[0][0]
+        self.assertEqual(result, ["a", "c", "e"])
+
+        # Test k = 1
+        result = df.select(F.max_by("x", "y", 1)).collect()[0][0]
+        self.assertEqual(result, ["b"])
+
+        result = df.select(F.min_by("x", "y", 1)).collect()[0][0]
+        self.assertEqual(result, ["a"])
+
+        # Test k larger than row count
+        result = df.select(F.max_by("x", "y", 10)).collect()[0][0]
+        self.assertEqual(sorted(result), ["a", "b", "c", "d", "e"])
+
+        # Test with groupBy
+        df2 = self.spark.createDataFrame(
+            [
+                ("Eng", "Alice", 120000),
+                ("Eng", "Bob", 95000),
+                ("Eng", "Carol", 110000),
+                ("Sales", "Dave", 80000),
+                ("Sales", "Eve", 75000),
+                ("Sales", "Frank", 85000),
+            ],
+            schema=("dept", "emp", "salary"),
+        )
+        result = df2.groupBy("dept").agg(F.max_by("emp", "salary", 2)).orderBy("dept").collect()
+        self.assertEqual(result[0][1], ["Alice", "Carol"])  # Eng
+        self.assertEqual(result[1][1], ["Frank", "Dave"])  # Sales
+
+    def test_xxh3_64(self):
+        """Test xxh3_64 hash function"""
+        # Test with string input
+        df = self.spark.createDataFrame([("Spark",), ("",), (None,)], ["data"])
+        result = df.select(F.xxh3_64("data")).collect()
+
+        # Verify against known values from Scala tests
+        self.assertEqual(result[0][0], 80997306238743657)  # "Spark"
+        self.assertEqual(result[1][0], 0x2D06800538D394C2)  # empty string
+        self.assertIsNone(result[2][0])  # null
+
+        # Test with binary input
+        df_binary = self.spark.createDataFrame([(bytearray([1, 2, 3, 4, 5, 6]),)], ["data"])
+        result_binary = df_binary.select(F.xxh3_64("data")).collect()
+        # Value from DataFrameFunctionsSuite.scala
+        self.assertEqual(result_binary[0][0], -4044731995552965649)
+
+    def test_xxh3_128(self):
+        """Test xxh3_128 hash function"""
+        # Test with string input
+        df = self.spark.createDataFrame([("Spark",), ("",), (None,)], ["data"])
+        result = df.select(F.xxh3_128("data")).collect()
+
+        # Verify against known values from Scala tests
+        self.assertEqual(result[0][0], "7d57dd84c60c86ca1f4e82ab91a12b5e")  # "Spark"
+        self.assertEqual(result[1][0], "99aa06d3014798d86001c324468d497f")  # empty string
+        self.assertIsNone(result[2][0])  # null
+
+        # Test with binary input
+        df_binary = self.spark.createDataFrame([(bytearray([1, 2, 3, 4, 5, 6]),)], ["data"])
+        result_binary = df_binary.select(F.xxh3_128("data")).collect()
+        # Value from DataFrameFunctionsSuite.scala
+        self.assertEqual(result_binary[0][0], "866737830f560dbf3e1f439d2d785f44")
+
+    def test_xxh3_with_cast(self):
+        """Test xxh3 functions with explicit cast to binary"""
+        df = self.spark.createDataFrame([("ABC",)], ["a"])
+
+        # Test xxh3_64 with cast
+        result_64 = df.select(F.xxh3_64(F.col("a").cast("binary"))).collect()
+        # Value from DataFrameFunctionsSuite.scala
+        self.assertEqual(result_64[0][0], 2615927343983396622)
+
+        # Test xxh3_128 with cast
+        result_128 = df.select(F.xxh3_128(F.col("a").cast("binary"))).collect()
+        # Value from DataFrameFunctionsSuite.scala
+        self.assertEqual(result_128[0][0], "9e947f00ecd6acb2244da40f405c870e")
+
+    def test_farm_fingerprint(self):
+        """Test farm_fingerprint function"""
+        df = self.spark.createDataFrame([("Spark",), ("",), (None,)], ["data"])
+        result = df.select(F.farm_fingerprint("data")).collect()
+
+        # Values from HashExpressionsSuite.scala
+        self.assertEqual(result[0][0], -2743780590904673122)  # "Spark"
+        self.assertEqual(result[1][0], -7286425919675154353)  # empty string
+        self.assertIsNone(result[2][0])  # null
+
+        df_binary = self.spark.createDataFrame([(bytearray([1, 2, 3, 4, 5, 6]),)], ["data"])
+        result_binary = df_binary.select(F.farm_fingerprint("data")).collect()
+        self.assertEqual(result_binary[0][0], 8673355959317488908)
+
+        # Matches BigQuery FARM_FINGERPRINT('1footrue').
+        df_bq = self.spark.createDataFrame([("1footrue",)], ["data"])
+        self.assertEqual(df_bq.select(F.farm_fingerprint("data")).first()[0], -1541654101129638711)
+
+
+class FunctionsTests(FunctionsTestsMixin, ReusedSQLTestCase):
     pass
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.sql.tests.test_functions import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

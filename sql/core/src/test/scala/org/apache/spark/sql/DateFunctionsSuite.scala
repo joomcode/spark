@@ -32,7 +32,7 @@ import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.DoubleType
 import org.apache.spark.unsafe.types.CalendarInterval
 
-class DateFunctionsSuite extends QueryTest with SharedSparkSession {
+class DateFunctionsSuite extends SharedSparkSession {
   import testImplicits._
 
   // The test cases which throw exceptions under ANSI mode are covered by date.sql and
@@ -443,6 +443,37 @@ class DateFunctionsSuite extends QueryTest with SharedSparkSession {
     checkAnswer(
       df.selectExpr("""DATE_SUB(d, 1)"""),
       Seq(Row(Date.valueOf("2015-05-31")), Row(Date.valueOf("2015-06-01"))))
+  }
+
+  gridTest("date arithmetic preserves NULL string day counts")(Seq(false, true)) { ansiEnabled =>
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> ansiEnabled.toString) {
+      for (days <- Seq(
+          "CAST(NULL AS STRING)",
+          "IF(true, CAST(NULL AS STRING), '2')",
+          "CAST(CAST(NULL AS INT) AS STRING)")) {
+        checkAnswer(
+          sql(s"SELECT date_add(DATE '2020-01-01', $days), " +
+            s"date_sub(DATE '2020-01-01', $days)"),
+          Row(null, null))
+      }
+      checkAnswer(
+        sql("SELECT date_add(DATE '2020-01-01', '2'), date_sub(DATE '2020-01-01', '2')"),
+        Row(Date.valueOf("2020-01-03"), Date.valueOf("2019-12-30")))
+    }
+  }
+
+  test("date arithmetic rejects invalid string day counts in non-ANSI mode") {
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
+      for (function <- Seq("date_add", "date_sub"); days <- Seq("x", "1.5")) {
+        checkError(
+          exception = intercept[AnalysisException] {
+            sql(s"SELECT $function(DATE '2020-01-01', '$days')").collect()
+          },
+          condition = "SECOND_FUNCTION_ARGUMENT_NOT_INTEGER",
+          parameters = Map("functionName" -> function),
+          sqlState = "22023")
+      }
+    }
   }
 
   test("time_add") {
@@ -1470,5 +1501,40 @@ class DateFunctionsSuite extends QueryTest with SharedSparkSession {
 
     checkAnswer(df.selectExpr("try_to_timestamp(a)"), Seq(Row(ts)))
     checkAnswer(df.select(try_to_timestamp(col("a"))), Seq(Row(ts)))
+  }
+
+  test("try_to_date") {
+    // without format
+    val df1 = Seq("2015-07-22", "2014-12-31").toDF("s")
+    checkAnswer(
+      df1.select(try_to_date(col("s"))),
+      Seq(Row(Date.valueOf("2015-07-22")), Row(Date.valueOf("2014-12-31"))))
+    checkAnswer(
+      df1.selectExpr("try_to_date(s)"),
+      Seq(Row(Date.valueOf("2015-07-22")), Row(Date.valueOf("2014-12-31"))))
+
+    // with format
+    val df2 = Seq("2015-07-22", "2014-31-12").toDF("s")
+    checkAnswer(
+      df2.select(try_to_date(col("s"), "yyyy-MM-dd")),
+      Seq(Row(Date.valueOf("2015-07-22")), Row(null)))
+    checkAnswer(
+      df2.selectExpr("try_to_date(s, 'yyyy-MM-dd')"),
+      Seq(Row(Date.valueOf("2015-07-22")), Row(null)))
+    checkAnswer(
+      df2.select(try_to_date(col("s"), "yyyy-dd-MM")),
+      Seq(Row(null), Row(Date.valueOf("2014-12-31"))))
+    checkAnswer(
+      df2.selectExpr("try_to_date(s, 'yyyy-dd-MM')"),
+      Seq(Row(null), Row(Date.valueOf("2014-12-31"))))
+
+    // invalid format - returns NULL
+    val df3 = Seq("2016-02-29", "2017-02-29", "2020-13-01", "invalid-date").toDF("x")
+    checkAnswer(
+      df3.select(try_to_date(col("x"))),
+      Seq(Row(Date.valueOf("2016-02-29")), Row(null), Row(null), Row(null)))
+    checkAnswer(
+      df3.selectExpr("try_to_date(x)"),
+      Seq(Row(Date.valueOf("2016-02-29")), Row(null), Row(null), Row(null)))
   }
 }

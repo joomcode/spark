@@ -14,13 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import unittest
 
 import pandas as pd
 
 from pyspark import pandas as ps
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
-from pyspark.testing.sqlutils import SQLTestUtils
 
 
 class GroupbyAggregateMixin:
@@ -234,6 +232,19 @@ class GroupbyAggregateMixin:
         )
         self.assert_eq(agg_psdf, agg_pdf)
 
+    def test_aggregate_relabel_size(self):
+        pdf = pd.DataFrame({"group": ["a", "a", "b"], "B": [10.0, None, 30.0]})
+        psdf = ps.from_pandas(pdf)
+
+        expected = (
+            pdf.groupby("group").agg(b_size=("B", "size"), b_count=("B", "count")).sort_index()
+        )
+        actual = (
+            psdf.groupby("group").agg(b_size=("B", "size"), b_count=("B", "count")).sort_index()
+        )
+
+        self.assert_eq(actual, expected)
+
     def test_aggregate_relabel_multiindex(self):
         pdf = pd.DataFrame({"A": [0, 1, 2, 3], "B": [5, 6, 7, 8], "group": ["a", "a", "b", "b"]})
         pdf.columns = pd.MultiIndex.from_tuples([("y", "A"), ("y", "B"), ("x", "group")])
@@ -273,18 +284,11 @@ class GroupbyAggregateMixin:
 class GroupbyAggregateTests(
     GroupbyAggregateMixin,
     PandasOnSparkTestCase,
-    SQLTestUtils,
 ):
     pass
 
 
 if __name__ == "__main__":
-    from pyspark.pandas.tests.groupby.test_aggregate import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

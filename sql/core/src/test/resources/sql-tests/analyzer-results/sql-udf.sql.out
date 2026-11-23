@@ -1297,7 +1297,7 @@ Project [spark_catalog.default.foo9n(a#x) AS spark_catalog.default.foo9n(array(1
 SELECT foo9n(from_json('[1, 2, 3]', 'array<int>'))
 -- !query analysis
 Project [spark_catalog.default.foo9n(a#x) AS spark_catalog.default.foo9n(from_json([1, 2, 3]))#x]
-+- Project [cast(from_json(ArrayType(IntegerType,true), [1, 2, 3], Some(America/Los_Angeles), false) as array<int>) AS a#x]
++- Project [cast(from_json(ArrayType(IntegerType,true), [1, 2, 3], Some(America/Los_Angeles), false, false) as array<int>) AS a#x]
    +- OneRowRelation
 
 
@@ -1319,7 +1319,7 @@ Project [spark_catalog.default.foo9o(a#x) AS spark_catalog.default.foo9o(map(hel
 SELECT foo9o(from_json('{"hello":1, "world":2}', 'map<string,int>'))
 -- !query analysis
 Project [spark_catalog.default.foo9o(a#x) AS spark_catalog.default.foo9o(entries)#x]
-+- Project [cast(from_json(MapType(StringType,IntegerType,true), {"hello":1, "world":2}, Some(America/Los_Angeles), false) as map<string,int>) AS a#x]
++- Project [cast(from_json(MapType(StringType,IntegerType,true), {"hello":1, "world":2}, Some(America/Los_Angeles), false, false) as map<string,int>) AS a#x]
    +- OneRowRelation
 
 
@@ -1341,7 +1341,7 @@ Project [spark_catalog.default.foo9p(a#x) AS spark_catalog.default.foo9p(struct(
 SELECT foo9p(from_json('{1:"hello"}', 'struct<a1:int, a2:string>'))
 -- !query analysis
 Project [spark_catalog.default.foo9p(a#x) AS spark_catalog.default.foo9p(from_json({1:"hello"}))#x]
-+- Project [cast(from_json(StructField(a1,IntegerType,true), StructField(a2,StringType,true), {1:"hello"}, Some(America/Los_Angeles), false) as struct<a1:int,a2:string>) AS a#x]
++- Project [cast(from_json(StructField(a1,IntegerType,true), StructField(a2,StringType,true), {1:"hello"}, Some(America/Los_Angeles), false, false) as struct<a1:int,a2:string>) AS a#x]
    +- OneRowRelation
 
 
@@ -1371,7 +1371,7 @@ Project [spark_catalog.default.foo9q(a#x) AS spark_catalog.default.foo9q(array(n
 SELECT foo9q(from_json('[{1:"hello"}, {2:"world"}]', 'array<struct<a1:int,a2:string>>'))
 -- !query analysis
 Project [spark_catalog.default.foo9q(a#x) AS spark_catalog.default.foo9q(from_json([{1:"hello"}, {2:"world"}]))#x]
-+- Project [cast(from_json(ArrayType(StructType(StructField(a1,IntegerType,true),StructField(a2,StringType,true)),true), [{1:"hello"}, {2:"world"}], Some(America/Los_Angeles), false) as array<struct<a1:int,a2:string>>) AS a#x]
++- Project [cast(from_json(ArrayType(StructType(StructField(a1,IntegerType,true),StructField(a2,StringType,true)),true), [{1:"hello"}, {2:"world"}], Some(America/Los_Angeles), false, false) as array<struct<a1:int,a2:string>>) AS a#x]
    +- OneRowRelation
 
 
@@ -1393,7 +1393,7 @@ Project [spark_catalog.default.foo9r(a#x) AS spark_catalog.default.foo9r(array(m
 SELECT foo9r(from_json('[{"hello":1}, {"world":2}]', 'array<map<string,int>>'))
 -- !query analysis
 Project [spark_catalog.default.foo9r(a#x) AS spark_catalog.default.foo9r(from_json([{"hello":1}, {"world":2}]))#x]
-+- Project [cast(from_json(ArrayType(MapType(StringType,IntegerType,true),true), [{"hello":1}, {"world":2}], Some(America/Los_Angeles), false) as array<map<string,int>>) AS a#x]
++- Project [cast(from_json(ArrayType(MapType(StringType,IntegerType,true),true), [{"hello":1}, {"world":2}], Some(America/Los_Angeles), false, false) as array<map<string,int>>) AS a#x]
    +- OneRowRelation
 
 
@@ -1718,7 +1718,7 @@ CreateSQLFunctionCommand spark_catalog.default.foo2_2b, a INT, INT, 1 + (SELECT 
 SELECT foo2_2b(5)
 -- !query analysis
 Project [spark_catalog.default.foo2_2b(a#x) AS spark_catalog.default.foo2_2b(5)#x]
-:  +- Project [outer(a#x)]
+:  +- Project [outer(a#x) AS a#x]
 :     +- OneRowRelation
 +- Project [cast(5 as int) AS a#x]
    +- OneRowRelation
@@ -1814,52 +1814,22 @@ DropTable true, false
 -- !query
 DROP TABLE IF EXISTS ts
 -- !query analysis
-org.apache.spark.sql.AnalysisException
-{
-  "errorClass" : "WRONG_COMMAND_FOR_OBJECT_TYPE",
-  "sqlState" : "42809",
-  "messageParameters" : {
-    "alternative" : "DROP VIEW",
-    "foundType" : "VIEW",
-    "objectName" : "spark_catalog.default.ts",
-    "operation" : "DROP TABLE",
-    "requiredType" : "EXTERNAL or MANAGED"
-  }
-}
+DropTable true, false
++- ResolvedIdentifier V2SessionCatalog(spark_catalog), default.ts
 
 
 -- !query
 DROP TABLE IF EXISTS tm
 -- !query analysis
-org.apache.spark.sql.AnalysisException
-{
-  "errorClass" : "WRONG_COMMAND_FOR_OBJECT_TYPE",
-  "sqlState" : "42809",
-  "messageParameters" : {
-    "alternative" : "DROP VIEW",
-    "foundType" : "VIEW",
-    "objectName" : "spark_catalog.default.tm",
-    "operation" : "DROP TABLE",
-    "requiredType" : "EXTERNAL or MANAGED"
-  }
-}
+DropTable true, false
++- ResolvedIdentifier V2SessionCatalog(spark_catalog), default.tm
 
 
 -- !query
 DROP TABLE IF EXISTS ta
 -- !query analysis
-org.apache.spark.sql.AnalysisException
-{
-  "errorClass" : "WRONG_COMMAND_FOR_OBJECT_TYPE",
-  "sqlState" : "42809",
-  "messageParameters" : {
-    "alternative" : "DROP VIEW",
-    "foundType" : "VIEW",
-    "objectName" : "spark_catalog.default.ta",
-    "operation" : "DROP TABLE",
-    "requiredType" : "EXTERNAL or MANAGED"
-  }
-}
+DropTable true, false
++- ResolvedIdentifier V2SessionCatalog(spark_catalog), default.ta
 
 
 -- !query
@@ -2573,12 +2543,12 @@ Project [c1#x, c2#x, spark_catalog.default.foo3_1a(c1, c2)#x]
 SELECT c1, (SELECT c1), (SELECT foo3_1b(c1)), SUM(c2) FROM t1 GROUP BY 1, 2, 3
 -- !query analysis
 Aggregate [c1#x, scalar-subquery#x [c1#x], scalar-subquery#x [c1#x]], [c1#x, scalar-subquery#x [c1#x] AS scalarsubquery(c1)#x, scalar-subquery#x [c1#x] AS scalarsubquery(c1)#x, sum(c2#x) AS sum(c2)#xL]
-:  :- Project [outer(c1#x)]
+:  :- Project [outer(c1#x) AS c1#x]
 :  :  +- OneRowRelation
 :  :- Project [spark_catalog.default.foo3_1b(x#x) AS spark_catalog.default.foo3_1b(outer(spark_catalog.default.t1.c1))#x]
 :  :  +- Project [cast(outer(c1#x) as int) AS x#x]
 :  :     +- OneRowRelation
-:  :- Project [outer(c1#x)]
+:  :- Project [outer(c1#x) AS c1#x]
 :  :  +- OneRowRelation
 :  +- Project [spark_catalog.default.foo3_1b(x#x) AS spark_catalog.default.foo3_1b(outer(spark_catalog.default.t1.c1))#x]
 :     +- Project [cast(outer(c1#x) as int) AS x#x]
@@ -2991,7 +2961,7 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
   "errorClass" : "UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY",
   "sqlState" : "0A000",
   "messageParameters" : {
-    "treeNode" : "Join Inner, (spark_catalog.default.foo3_1g(x#x) = 2)\n:  +- Project [outer(x#x)]\n:     +- OneRowRelation\n:- SubqueryAlias spark_catalog.default.t1\n:  +- View (`spark_catalog`.`default`.`t1`, [c1#x, c2#x])\n:     +- Project [cast(col1#x as int) AS c1#x, cast(col2#x as int) AS c2#x]\n:        +- LocalRelation [col1#x, col2#x]\n+- SubqueryAlias spark_catalog.default.t2\n   +- View (`spark_catalog`.`default`.`t2`, [c1#x, c2#x])\n      +- Project [cast(col1#x as int) AS c1#x, cast(col2#x as int) AS c2#x]\n         +- LocalRelation [col1#x, col2#x]\n"
+    "treeNode" : "Join Inner, (spark_catalog.default.foo3_1g(x#x) = 2)\n:  +- Project [outer(x#x) AS x#x]\n:     +- OneRowRelation\n:- SubqueryAlias spark_catalog.default.t1\n:  +- View (`spark_catalog`.`default`.`t1`, [c1#x, c2#x])\n:     +- Project [cast(col1#x as int) AS c1#x, cast(col2#x as int) AS c2#x]\n:        +- LocalRelation [col1#x, col2#x]\n+- SubqueryAlias spark_catalog.default.t2\n   +- View (`spark_catalog`.`default`.`t2`, [c1#x, c2#x])\n      +- Project [cast(col1#x as int) AS c1#x, cast(col2#x as int) AS c2#x]\n         +- LocalRelation [col1#x, col2#x]\n"
   }
 }
 
@@ -3534,6 +3504,50 @@ Project [spark_catalog.default.foo3_2e1(occurrences#x, instance_start_time#x) AS
 
 
 -- !query
+CREATE FUNCTION foo3_2e2(x INT) RETURNS INT RETURN
+WITH t AS (SELECT c1, SUM(c2) AS s FROM t2 WHERE c1 = x GROUP BY c1)
+SELECT s FROM t
+-- !query analysis
+CreateSQLFunctionCommand spark_catalog.default.foo3_2e2, x INT, INT, WITH t AS (SELECT c1, SUM(c2) AS s FROM t2 WHERE c1 = x GROUP BY c1)
+SELECT s FROM t, false, false, false, false
+
+
+-- !query
+SET spark.sql.optimizer.scalarSubqueryUseSingleJoin=false
+-- !query analysis
+SetCommand (spark.sql.optimizer.scalarSubqueryUseSingleJoin,Some(false))
+
+
+-- !query
+SELECT c1, foo3_2e2(c1) FROM t1
+-- !query analysis
+Project [c1#x, spark_catalog.default.foo3_2e2(x#x) AS spark_catalog.default.foo3_2e2(c1)#x]
+:  +- WithCTE
+:     :- CTERelationDef xxxx, false
+:     :  +- SubqueryAlias t
+:     :     +- Aggregate [c1#x], [c1#x, sum(c2#x) AS s#xL]
+:     :        +- Filter (c1#x = outer(x#x))
+:     :           +- SubqueryAlias spark_catalog.default.t2
+:     :              +- View (`spark_catalog`.`default`.`t2`, [c1#x, c2#x])
+:     :                 +- Project [cast(col1#x as int) AS c1#x, cast(col2#x as int) AS c2#x]
+:     :                    +- LocalRelation [col1#x, col2#x]
+:     +- Project [s#xL]
+:        +- SubqueryAlias t
+:           +- CTERelationRef xxxx, true, [c1#x, s#xL], false, false
++- Project [c1#x, c2#x, cast(c1#x as int) AS x#x]
+   +- SubqueryAlias spark_catalog.default.t1
+      +- View (`spark_catalog`.`default`.`t1`, [c1#x, c2#x])
+         +- Project [cast(col1#x as int) AS c1#x, cast(col2#x as int) AS c2#x]
+            +- LocalRelation [col1#x, col2#x]
+
+
+-- !query
+RESET spark.sql.optimizer.scalarSubqueryUseSingleJoin
+-- !query analysis
+ResetCommand spark.sql.optimizer.scalarSubqueryUseSingleJoin
+
+
+-- !query
 SET spark.sql.ansi.enabled=true
 -- !query analysis
 SetCommand (spark.sql.ansi.enabled,Some(true))
@@ -3987,6 +4001,219 @@ org.apache.spark.sql.AnalysisException
     "tempObjName" : "`t`"
   }
 }
+
+
+-- !query
+DECLARE OR REPLACE VARIABLE foo3_5_col STRING DEFAULT 'a'
+-- !query analysis
+CreateVariable default(cast(a as string), sql=''a''), true
++- ResolvedIdentifier org.apache.spark.sql.catalyst.analysis.FakeSystemCatalog$@xxxxxxxx, session.foo3_5_col
+
+
+-- !query
+CREATE FUNCTION foo3_5d(x INT) RETURNS INT RETURN x + length(foo3_5_col)
+-- !query analysis
+org.apache.spark.sql.AnalysisException
+{
+  "errorClass" : "INVALID_TEMP_OBJ_REFERENCE",
+  "sqlState" : "42K0F",
+  "messageParameters" : {
+    "obj" : "FUNCTION",
+    "objName" : "`default`.`foo3_5d`",
+    "tempObj" : "VARIABLE",
+    "tempObjName" : "`foo3_5_col`"
+  }
+}
+
+
+-- !query
+CREATE FUNCTION foo3_5d(x INT) RETURNS INT
+RETURN (SELECT IDENTIFIER(foo3_5_col) FROM VALUES (1) AS T(a))
+-- !query analysis
+org.apache.spark.sql.AnalysisException
+{
+  "errorClass" : "INVALID_TEMP_OBJ_REFERENCE",
+  "sqlState" : "42K0F",
+  "messageParameters" : {
+    "obj" : "FUNCTION",
+    "objName" : "`default`.`foo3_5d`",
+    "tempObj" : "VARIABLE",
+    "tempObjName" : "`foo3_5_col`"
+  }
+}
+
+
+-- !query
+CREATE FUNCTION foo3_5d(x INT) RETURNS TABLE (a INT)
+RETURN SELECT IDENTIFIER(foo3_5_col) AS a FROM VALUES (1) AS T(a)
+-- !query analysis
+org.apache.spark.sql.AnalysisException
+{
+  "errorClass" : "INVALID_TEMP_OBJ_REFERENCE",
+  "sqlState" : "42K0F",
+  "messageParameters" : {
+    "obj" : "FUNCTION",
+    "objName" : "`default`.`foo3_5d`",
+    "tempObj" : "VARIABLE",
+    "tempObjName" : "`foo3_5_col`"
+  }
+}
+
+
+-- !query
+CREATE TEMPORARY FUNCTION foo3_5e(x INT) RETURNS INT
+RETURN (SELECT IDENTIFIER(foo3_5_col) FROM VALUES (1) AS T(a))
+-- !query analysis
+CreateSQLFunctionCommand foo3_5e, x INT, INT, (SELECT IDENTIFIER(foo3_5_col) FROM VALUES (1) AS T(a)), false, true, false, false
+
+
+-- !query
+SELECT foo3_5e(0)
+-- !query analysis
+Project [foo3_5e(x#x) AS foo3_5e(0)#x]
+:  +- Project [a#x]
+:     +- SubqueryAlias T
+:        +- LocalRelation [a#x]
++- Project [cast(0 as int) AS x#x]
+   +- OneRowRelation
+
+
+-- !query
+DROP TEMPORARY FUNCTION foo3_5e
+-- !query analysis
+DropFunctionCommand foo3_5e, false, true
+
+
+-- !query
+DECLARE OR REPLACE VARIABLE foo3_5_tbl STRING DEFAULT 't1'
+-- !query analysis
+CreateVariable default(cast(t1 as string), sql=''t1''), true
++- ResolvedIdentifier org.apache.spark.sql.catalyst.analysis.FakeSystemCatalog$@xxxxxxxx, session.foo3_5_tbl
+
+
+-- !query
+CREATE FUNCTION foo3_5d(x INT) RETURNS TABLE (c1 INT)
+RETURN SELECT c1 FROM IDENTIFIER(foo3_5_tbl)
+-- !query analysis
+org.apache.spark.sql.AnalysisException
+{
+  "errorClass" : "INVALID_TEMP_OBJ_REFERENCE",
+  "sqlState" : "42K0F",
+  "messageParameters" : {
+    "obj" : "FUNCTION",
+    "objName" : "`default`.`foo3_5d`",
+    "tempObj" : "VARIABLE",
+    "tempObjName" : "`foo3_5_tbl`"
+  }
+}
+
+
+-- !query
+CREATE FUNCTION foo3_5d(x INT) RETURNS INT
+RETURN (SELECT IDENTIFIER(session.foo3_5_col) FROM VALUES (1) AS T(a))
+-- !query analysis
+org.apache.spark.sql.AnalysisException
+{
+  "errorClass" : "INVALID_TEMP_OBJ_REFERENCE",
+  "sqlState" : "42K0F",
+  "messageParameters" : {
+    "obj" : "FUNCTION",
+    "objName" : "`default`.`foo3_5d`",
+    "tempObj" : "VARIABLE",
+    "tempObjName" : "`session`.`foo3_5_col`"
+  }
+}
+
+
+-- !query
+CREATE FUNCTION foo3_5d(x INT) RETURNS TABLE (c INT)
+RETURN SELECT IDENTIFIER(foo3_5_col) AS c FROM IDENTIFIER(foo3_5_tbl) AS T(a, b)
+-- !query analysis
+org.apache.spark.sql.AnalysisException
+{
+  "errorClass" : "INVALID_TEMP_OBJ_REFERENCE",
+  "sqlState" : "42K0F",
+  "messageParameters" : {
+    "obj" : "FUNCTION",
+    "objName" : "`default`.`foo3_5d`",
+    "tempObj" : "VARIABLE",
+    "tempObjName" : "`foo3_5_tbl`"
+  }
+}
+
+
+-- !query
+SET spark.sql.legacy.allowSessionVariableInPersistedView=true
+-- !query analysis
+SetCommand (spark.sql.legacy.allowSessionVariableInPersistedView,Some(true))
+
+
+-- !query
+CREATE FUNCTION foo3_5f(x INT) RETURNS INT
+RETURN (SELECT IDENTIFIER(foo3_5_col) FROM VALUES (1) AS T(a))
+-- !query analysis
+CreateSQLFunctionCommand spark_catalog.default.foo3_5f, x INT, INT, (SELECT IDENTIFIER(foo3_5_col) FROM VALUES (1) AS T(a)), false, false, false, false
+
+
+-- !query
+SELECT foo3_5f(0)
+-- !query analysis
+Project [spark_catalog.default.foo3_5f(x#x) AS spark_catalog.default.foo3_5f(0)#x]
+:  +- Project [a#x]
+:     +- SubqueryAlias T
+:        +- LocalRelation [a#x]
++- Project [cast(0 as int) AS x#x]
+   +- OneRowRelation
+
+
+-- !query
+SET spark.sql.legacy.allowSessionVariableInPersistedView=false
+-- !query analysis
+SetCommand (spark.sql.legacy.allowSessionVariableInPersistedView,Some(false))
+
+
+-- !query
+CREATE FUNCTION foo3_5g(x INT) RETURNS INT RETURN foo3_5f(x) + 1
+-- !query analysis
+CreateSQLFunctionCommand spark_catalog.default.foo3_5g, x INT, INT, foo3_5f(x) + 1, false, false, false, false
+
+
+-- !query
+SELECT foo3_5g(0)
+-- !query analysis
+Project [spark_catalog.default.foo3_5g(x#x) AS spark_catalog.default.foo3_5g(0)#x]
+:  +- Project [a#x]
+:     +- SubqueryAlias T
+:        +- LocalRelation [a#x]
++- Project [x#x, cast(x#x as int) AS x#x]
+   +- Project [cast(0 as int) AS x#x]
+      +- OneRowRelation
+
+
+-- !query
+DROP FUNCTION foo3_5g
+-- !query analysis
+DropFunctionCommand spark_catalog.default.foo3_5g, false, false
+
+
+-- !query
+DROP FUNCTION foo3_5f
+-- !query analysis
+DropFunctionCommand spark_catalog.default.foo3_5f, false, false
+
+
+-- !query
+DROP TEMPORARY VARIABLE foo3_5_tbl
+-- !query analysis
+DropVariable false
++- ResolvedIdentifier org.apache.spark.sql.catalyst.analysis.FakeSystemCatalog$@xxxxxxxx, session.foo3_5_tbl
+
+
+-- !query
+DROP TEMPORARY VARIABLE foo3_5_col
+-- !query analysis
+DropVariable false
++- ResolvedIdentifier org.apache.spark.sql.catalyst.analysis.FakeSystemCatalog$@xxxxxxxx, session.foo3_5_col
 
 
 -- !query
@@ -4577,13 +4804,13 @@ DropFunctionCommand spark_catalog.default.foo1b2, true, false
 -- !query
 DROP FUNCTION IF EXISTS foo1c1
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo1c1]
+DropFunctionCommand spark_catalog.default.foo1c1, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo1c2
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo1c2]
+DropFunctionCommand spark_catalog.default.foo1c2, true, false
 
 
 -- !query
@@ -4619,49 +4846,49 @@ DropFunctionCommand spark_catalog.default.foo1d6, true, false
 -- !query
 DROP FUNCTION IF EXISTS foo1e1
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo1e1]
+DropFunctionCommand spark_catalog.default.foo1e1, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo1e2
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo1e2]
+DropFunctionCommand spark_catalog.default.foo1e2, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo1e3
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo1e3]
+DropFunctionCommand spark_catalog.default.foo1e3, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo1f1
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo1f1]
+DropFunctionCommand spark_catalog.default.foo1f1, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo1f2
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo1f2]
+DropFunctionCommand spark_catalog.default.foo1f2, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo1g1
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo1g1]
+DropFunctionCommand spark_catalog.default.foo1g1, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo1g2
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo1g2]
+DropFunctionCommand spark_catalog.default.foo1g2, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo2a0
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo2a0]
+DropFunctionCommand spark_catalog.default.foo2a0, true, false
 
 
 -- !query
@@ -4679,37 +4906,37 @@ DropFunctionCommand spark_catalog.default.foo2a4, true, false
 -- !query
 DROP FUNCTION IF EXISTS foo2b1
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo2b1]
+DropFunctionCommand spark_catalog.default.foo2b1, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo2b2
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo2b2]
+DropFunctionCommand spark_catalog.default.foo2b2, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo2c1
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo2c1]
+DropFunctionCommand spark_catalog.default.foo2c1, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo31
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo31]
+DropFunctionCommand spark_catalog.default.foo31, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo32
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo32]
+DropFunctionCommand spark_catalog.default.foo32, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo33
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo33]
+DropFunctionCommand spark_catalog.default.foo33, true, false
 
 
 -- !query
@@ -4721,7 +4948,7 @@ DropFunctionCommand spark_catalog.default.foo41, true, false
 -- !query
 DROP FUNCTION IF EXISTS foo42
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo42]
+DropFunctionCommand spark_catalog.default.foo42, true, false
 
 
 -- !query
@@ -4811,7 +5038,7 @@ DropFunctionCommand spark_catalog.default.foo9h, true, false
 -- !query
 DROP FUNCTION IF EXISTS foo9i
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo9i]
+DropFunctionCommand spark_catalog.default.foo9i, true, false
 
 
 -- !query
@@ -5003,13 +5230,13 @@ DropFunctionCommand spark_catalog.default.foo2_2b, true, false
 -- !query
 DROP FUNCTION IF EXISTS foo2_2c
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo2_2c]
+DropFunctionCommand spark_catalog.default.foo2_2c, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo2_2d
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo2_2d]
+DropFunctionCommand spark_catalog.default.foo2_2d, true, false
 
 
 -- !query
@@ -5159,13 +5386,19 @@ DropFunctionCommand spark_catalog.default.foo3_2d1, true, false
 -- !query
 DROP FUNCTION IF EXISTS foo3_2d2
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo3_2d2]
+DropFunctionCommand spark_catalog.default.foo3_2d2, true, false
 
 
 -- !query
 DROP FUNCTION IF EXISTS foo3_2e1
 -- !query analysis
 DropFunctionCommand spark_catalog.default.foo3_2e1, true, false
+
+
+-- !query
+DROP FUNCTION IF EXISTS foo3_2e2
+-- !query analysis
+DropFunctionCommand spark_catalog.default.foo3_2e2, true, false
 
 
 -- !query
@@ -5285,7 +5518,7 @@ DropFunctionCommand spark_catalog.default.foo3_12e, true, false
 -- !query
 DROP FUNCTION IF EXISTS foo3_12f
 -- !query analysis
-NoopCommand DROP FUNCTION, [foo3_12f]
+DropFunctionCommand spark_catalog.default.foo3_12f, true, false
 
 
 -- !query

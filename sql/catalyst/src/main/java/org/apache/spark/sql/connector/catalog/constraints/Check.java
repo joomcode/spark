@@ -27,12 +27,13 @@ import org.apache.spark.sql.connector.expressions.filter.Predicate;
 /**
  * A CHECK constraint.
  * <p>
- * A CHECK constraint defines a condition each row in a table must satisfy. Connectors can define
- * such constraints either in SQL (Spark SQL dialect) or using a {@link Predicate predicate} if the
- * condition can be expressed using a supported expression. A CHECK constraint can reference one or
- * more columns. Such constraint is considered violated if its condition evaluates to {@code FALSE},
- * but not {@code NULL}. The search condition must be deterministic and cannot contain subqueries
- * and certain functions like aggregates or UDFs.
+ * A CHECK constraint defines a condition each row in a table must satisfy. The condition is always
+ * represented as a SQL string (Spark SQL dialect), accessible via {@link #predicateSql()}, and is
+ * additionally exposed as a {@link Predicate predicate} via {@link #predicate()}, which is
+ * {@code null} in the cases that method lists. A CHECK constraint can reference one or more
+ * columns. Such constraint is considered violated if its condition evaluates to {@code FALSE}, but
+ * not {@code NULL}. The search condition must be deterministic and cannot contain subqueries and
+ * certain functions like aggregates or UDFs.
  * <p>
  * Spark supports enforced and not enforced CHECK constraints, allowing connectors to control
  * whether data modifications that violate the constraint must fail. Each constraint is either
@@ -63,13 +64,33 @@ public class Check extends BaseConstraint {
 
   /**
    * Returns the SQL representation of the search condition (Spark SQL dialect).
+   * <p>
+   * This is the canonical representation of the condition and is always present (never
+   * {@code null}). The optional {@link #predicate()} provides a structured form, except in the
+   * cases that method lists.
+   * <p>
+   * When a write cannot use {@link #predicate()}, Spark reads the condition from this text. It
+   * parses and analyzes the text with ANSI mode on and the default values of the SQL configs that
+   * change how a text reads, such as {@code spark.sql.parser.escapedStringLiterals}, regardless of
+   * the session of the write. Only the session time zone, case sensitivity, timestamp type,
+   * decimal precision loss and TIME type support, the configs that a view also takes from the
+   * session that reads it, the functions found through {@code SET PATH}, and the configs that an
+   * expression reads during evaluation, such as {@code spark.sql.legacy.timeParserPolicy}, follow
+   * that session. A connector that builds a constraint itself should write the condition
+   * accordingly.
    */
   public String predicateSql() {
     return predicateSql;
   }
 
   /**
-   * Returns the search condition.
+   * Returns the search condition as a {@link Predicate}, or {@code null} if the condition cannot be
+   * expressed using supported predicate expressions. Spark may also leave it {@code null} for a
+   * condition that reads the current time, date, catalog, user and the like, so that each write
+   * evaluates it from {@link #predicateSql()} with its own values instead of comparing with the
+   * values at the time the constraint was added. A connector that validates or enforces such a
+   * constraint itself has to evaluate {@link #predicateSql()}. Use {@link #predicateSql()} for the
+   * canonical SQL representation, which is always present.
    */
   public Predicate predicate() {
     return predicate;
@@ -77,7 +98,7 @@ public class Check extends BaseConstraint {
 
   @Override
   protected String definition() {
-    return String.format("CHECK (%s)", predicateSql != null ? predicateSql : predicate);
+    return String.format("CHECK (%s)", predicateSql);
   }
 
   @Override
@@ -123,10 +144,10 @@ public class Check extends BaseConstraint {
     }
 
     public Check build() {
-      if (predicateSql == null && predicate == null) {
+      if (predicateSql == null) {
         throw new SparkIllegalArgumentException(
             "INTERNAL_ERROR",
-            Map.of("message", "Predicate SQL and expression can't be both null in CHECK"));
+            Map.of("message", "Predicate SQL can't be null in CHECK"));
       }
       return new Check(name(), predicateSql, predicate, enforced(), validationStatus(), rely());
     }

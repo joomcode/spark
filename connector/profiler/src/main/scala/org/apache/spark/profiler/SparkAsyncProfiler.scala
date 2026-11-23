@@ -23,8 +23,7 @@ import one.profiler.{AsyncProfiler, AsyncProfilerLoader}
 import org.apache.hadoop.fs.{FileSystem, FSDataOutputStream, Path}
 import org.apache.hadoop.fs.permission.FsPermission
 
-import org.apache.spark.SparkConf
-import org.apache.spark.SparkContext.DRIVER_IDENTIFIER
+import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.PATH
@@ -45,7 +44,7 @@ private[spark] class SparkAsyncProfiler(conf: SparkConf, executorId: String) ext
   private def getAppId: Option[String] = conf.getOption("spark.app.id")
   private def getAttemptId: Option[String] = conf.getOption("spark.app.attempt.id")
 
-  private val profileFile = if (executorId == DRIVER_IDENTIFIER) {
+  private val profileFile = if (SparkContext.isDriver(executorId)) {
     s"profile-$executorId.jfr"
   } else {
     s"profile-exec-$executorId.jfr"
@@ -53,7 +52,6 @@ private[spark] class SparkAsyncProfiler(conf: SparkConf, executorId: String) ext
 
   private val startcmd = s"start,$profilerOptions,file=$profilerLocalDir/$profileFile"
   private val stopcmd = s"stop,$profilerOptions,file=$profilerLocalDir/$profileFile"
-  private val dumpcmd = s"dump,$profilerOptions,file=$profilerLocalDir/$profileFile"
   private val resumecmd = s"resume,$profilerOptions,file=$profilerLocalDir/$profileFile"
 
   private val PROFILER_FOLDER_PERMISSIONS = new FsPermission(Integer.parseInt("770", 8).toShort)
@@ -173,11 +171,10 @@ private[spark] class SparkAsyncProfiler(conf: SparkConf, executorId: String) ext
     }
 
     try {
-      // stop (pause) the profiler, dump the results and then resume. This is not ideal as we miss
-      // the events while the file is being dumped, but that is the only way to make sure that
+      // stop (pause) the profiler and then resume. This is not ideal as we miss
+      // the events while the profiler is stopped, but that is the only way to make sure that
       // the chunk of data we are copying to dfs is in a consistent state.
       profiler.get.execute(stopcmd)
-      profiler.get.execute(dumpcmd)
       var remaining = inputStream.available()
       if (!lastChunk) {
         profiler.get.execute(resumecmd)

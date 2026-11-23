@@ -14,21 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import logging
 import os
 import time
 import unittest
-import logging
 
+from pyspark.sql import Row
 from pyspark.sql.utils import PythonException
-from pyspark.testing.sqlutils import (
-    ReusedSQLTestCase,
+from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import (
+    assertDataFrameEqual,
     have_pandas,
     have_pyarrow,
     pandas_requirement_message,
     pyarrow_requirement_message,
 )
-from pyspark.sql import Row
-from pyspark.testing.utils import assertDataFrameEqual
 from pyspark.util import is_remote_only
 
 if have_pyarrow:
@@ -42,7 +42,7 @@ if have_pandas:
     not have_pandas or not have_pyarrow,
     pandas_requirement_message or pyarrow_requirement_message,
 )
-class MapInArrowTestsMixin(object):
+class MapInArrowTestsMixin:
     def test_map_in_arrow(self):
         def func(iterator):
             for batch in iterator:
@@ -54,6 +54,66 @@ class MapInArrowTestsMixin(object):
         actual = df.mapInArrow(func, "id long").collect()
         expected = df.collect()
         self.assertEqual(actual, expected)
+
+    def test_map_in_arrow_legacy_accept_any_iterable(self):
+        # With the legacy flag enabled, returning a non-Iterator iterable (e.g. list) is accepted.
+        def list_not_iter(iterator):
+            return [batch for batch in iterator]
+
+        with self.sql_conf(
+            {"spark.sql.execution.pythonUDF.mapInBatch.legacy.acceptAnyIterable.enabled": True}
+        ):
+            df = self.spark.range(10)
+            actual = df.mapInArrow(list_not_iter, "id long").collect()
+            expected = df.collect()
+            self.assertEqual(actual, expected)
+
+    def test_map_in_arrow_legacy_accept_sequence_protocol(self):
+        # A sequence-protocol object (implements __getitem__ but not __iter__) is iterable via
+        # iter(...) even though it is not a collections.abc.Iterable, so the legacy flag must
+        # accept it too.
+        class SequenceOnly:
+            def __init__(self, items):
+                self._items = items
+
+            def __getitem__(self, index):
+                return self._items[index]
+
+        self.assertFalse(hasattr(SequenceOnly([]), "__iter__"))
+
+        def returns_sequence(iterator):
+            return SequenceOnly([batch for batch in iterator])
+
+        with self.sql_conf(
+            {"spark.sql.execution.pythonUDF.mapInBatch.legacy.acceptAnyIterable.enabled": True}
+        ):
+            df = self.spark.range(10)
+            actual = df.mapInArrow(returns_sequence, "id long").collect()
+            expected = df.collect()
+            self.assertEqual(actual, expected)
+
+    def test_map_in_arrow_accept_any_iterable_by_default(self):
+        # The legacy flag defaults to true, so returning a non-Iterator iterable (e.g. list) is
+        # accepted without setting any config. This guards the default against regression: the
+        # *_legacy_accept_any_iterable tests above force the flag on and would still pass if the
+        # default were flipped back to false.
+        def list_not_iter(iterator):
+            return [batch for batch in iterator]
+
+        df = self.spark.range(10)
+        actual = df.mapInArrow(list_not_iter, "id long").collect()
+        expected = df.collect()
+        self.assertEqual(actual, expected)
+
+    def test_map_in_arrow_with_limit(self):
+        def get_size(iterator):
+            for batch in iterator:
+                assert isinstance(batch, pa.RecordBatch)
+                if batch.num_rows > 0:
+                    yield pa.RecordBatch.from_arrays([pa.array([batch.num_rows])], names=["size"])
+
+        df = self.spark.range(100)
+        df.mapInArrow(get_size, "size long").limit(1).collect()
 
     def test_multiple_columns(self):
         data = [(1, "foo"), (2, None), (3, "bar"), (4, "bar")]
@@ -91,7 +151,8 @@ class MapInArrowTestsMixin(object):
 
         df = self.spark.range(10)
         actual = df.repartition(1).mapInArrow(func, "a long").collect()
-        self.assertEqual(set((r.a for r in actual)), set(range(100)))
+        # Each input batch produces 0..99 once, in order, since there is one partition.
+        self.assertEqual([r.a for r in actual], list(range(100)) * max(1, len(actual) // 100))
 
     def test_other_than_recordbatch_iter(self):
         with self.quiet():
@@ -104,19 +165,32 @@ class MapInArrowTestsMixin(object):
         def bad_iter_elem(_):
             return iter([1])
 
+        def list_not_iter(_):
+            # Iterable but not an Iterator: violates the Iterator[pa.RecordBatch] contract.
+            return [pa.RecordBatch.from_pandas(pd.DataFrame({"a": [0]}))]
+
         with self.assertRaisesRegex(
             PythonException,
-            "Return type of the user-defined function should be iterator "
-            "of pyarrow.RecordBatch, but is int",
+            r"iterator of pyarrow\.RecordBatch.*\bint\b",
         ):
             (self.spark.range(10, numPartitions=3).mapInArrow(not_iter, "a int").count())
 
         with self.assertRaisesRegex(
             PythonException,
-            "Return type of the user-defined function should be iterator "
-            "of pyarrow.RecordBatch, but is iterator of int",
+            r"iterator of pyarrow\.RecordBatch.*iterator of int",
         ):
             (self.spark.range(10, numPartitions=3).mapInArrow(bad_iter_elem, "a int").count())
+
+        with (
+            self.sql_conf(
+                {"spark.sql.execution.pythonUDF.mapInBatch.legacy.acceptAnyIterable.enabled": False}
+            ),
+            self.assertRaisesRegex(
+                PythonException,
+                r"iterator of pyarrow\.RecordBatch.*\blist\b",
+            ),
+        ):
+            (self.spark.range(10, numPartitions=3).mapInArrow(list_not_iter, "a int").count())
 
     def test_empty_iterator(self):
         def empty_iter(_):
@@ -129,6 +203,21 @@ class MapInArrowTestsMixin(object):
             return iter([pa.RecordBatch.from_pandas(pd.DataFrame({"a": []}))])
 
         self.assertEqual(self.spark.range(10).mapInArrow(empty_rows, "a double").count(), 0)
+
+    def test_passing_metadata(self):
+        def extract_metadata(iterator):
+            for batch in iterator:
+                assert isinstance(batch, pa.RecordBatch)
+                if batch.num_rows > 0:
+                    m = batch.schema.field("id").metadata[b"SPARK::metadata::json"]
+                    yield pa.RecordBatch.from_arrays(
+                        [pa.array([str(m)] * batch.num_rows)], names=["metadata"]
+                    )
+
+        df = self.spark.range(1).withMetadata("id", {"x": 1})
+
+        row = df.mapInArrow(extract_metadata, "metadata string").first()
+        self.assertEqual(row.metadata, """b'{"x":1}'""")
 
     def test_chain_map_in_arrow(self):
         def func(iterator):
@@ -152,8 +241,18 @@ class MapInArrowTestsMixin(object):
     def test_map_in_arrow_with_barrier_mode(self):
         df = self.spark.range(10)
 
+        def func0(iterator):
+            from pyspark import BarrierTaskContext
+
+            BarrierTaskContext.get()
+            for batch in iterator:
+                yield batch
+
+        with self.assertRaisesRegex(PythonException, "\\[NOT_IN_BARRIER_STAGE\\]"):
+            df.mapInArrow(func0, "id long", False).collect()
+
         def func1(iterator):
-            from pyspark import TaskContext, BarrierTaskContext
+            from pyspark import BarrierTaskContext, TaskContext
 
             tc = TaskContext.get()
             assert tc is not None
@@ -164,7 +263,7 @@ class MapInArrowTestsMixin(object):
         df.mapInArrow(func1, "id long", False).collect()
 
         def func2(iterator):
-            from pyspark import TaskContext, BarrierTaskContext
+            from pyspark import BarrierTaskContext, TaskContext
 
             tc = TaskContext.get()
             assert tc is not None
@@ -326,12 +425,6 @@ class MapInArrowWithOutputArrowBatchSlicingBytesTests(MapInArrowTests):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.arrow.test_arrow_map import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

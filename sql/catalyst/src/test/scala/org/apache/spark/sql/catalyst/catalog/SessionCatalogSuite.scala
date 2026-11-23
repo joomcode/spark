@@ -197,16 +197,6 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
           "expectedType" -> "\"BOOLEAN\"",
           "defaultValue" -> "41 + 1",
           "actualType" -> "\"INT\""))
-
-      // Make sure that constant-folding default values does not take place when the feature is
-      // disabled.
-      withSQLConf(SQLConf.ENABLE_DEFAULT_COLUMNS.key -> "false") {
-        val result: StructType = ResolveDefaultColumns.constantFoldCurrentDefaultsToExistDefaults(
-          db1tbl3.schema, "CREATE TABLE")
-        val columnEWithFeatureDisabled: StructField = findField("e", result)
-        // No constant-folding has taken place to the EXISTS_DEFAULT metadata.
-        assert(!columnEWithFeatureDisabled.metadata.contains("EXISTS_DEFAULT"))
-      }
     }
     withSQLConf(SQLConf.DEFAULT_COLUMN_ALLOWED_PROVIDERS.key -> "csv,hive,json,orc,parquet") {
       test
@@ -307,6 +297,102 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
     }
   }
 
+  test("drop database clears function registry cache (cache coherence)") {
+    val extCatalog = newEmptyCatalog()
+    extCatalog.createDatabase(newDb("default"), ignoreIfExists = true)
+    extCatalog.createDatabase(newDb("cache_coherence_db"), ignoreIfExists = false)
+    extCatalog.createFunction(
+      "cache_coherence_db", newFunc("cached_func", Some("cache_coherence_db")))
+    val registry = new SimpleFunctionRegistry()
+    val catalog = new SessionCatalog(extCatalog, registry)
+    try {
+      val ident = FunctionIdentifier(
+        "cached_func", Some("cache_coherence_db"), Some(CatalogManager.SESSION_CATALOG_NAME))
+      val info = new ExpressionInfo(
+        "test.Example",
+        "cache_coherence_db",
+        "cached_func",
+        "usage",
+        "arguments",
+        "\n    Examples:\n",
+        "\n    \n  ",
+        "misc_funcs",
+        "1.0.0",
+        "",
+        "sql_udf")
+      val builder = (e: Seq[Expression]) => e.head
+      registry.registerFunction(ident, info, builder)
+      assert(registry.functionExists(ident))
+      catalog.dropDatabase("cache_coherence_db", ignoreIfNotExists = false, cascade = true)
+      assert(!registry.functionExists(ident))
+    } finally {
+      catalog.reset()
+    }
+  }
+
+  test("drop database clears table function registry cache (cache coherence)") {
+    val extCatalog = newEmptyCatalog()
+    extCatalog.createDatabase(newDb("default"), ignoreIfExists = true)
+    extCatalog.createDatabase(newDb("cache_coherence_db2"), ignoreIfExists = false)
+    val scalarRegistry = new SimpleFunctionRegistry()
+    val tableRegistry = new SimpleTableFunctionRegistry()
+    val catalog = new SessionCatalog(extCatalog, scalarRegistry, tableRegistry)
+    try {
+      val ident = FunctionIdentifier(
+        "cached_table_func", Some("cache_coherence_db2"),
+        Some(CatalogManager.SESSION_CATALOG_NAME))
+      val info = new ExpressionInfo(
+        "test.Example",
+        "cache_coherence_db2",
+        "cached_table_func",
+        "usage",
+        "arguments",
+        "\n    Examples:\n",
+        "\n    \n  ",
+        "table_funcs",
+        "1.0.0",
+        "",
+        "sql_udf")
+      val builder = (_: Seq[Expression]) => Range(1, 1, 1, 1)
+      tableRegistry.registerFunction(ident, info, builder)
+      assert(tableRegistry.functionExists(ident))
+      catalog.dropDatabase("cache_coherence_db2", ignoreIfNotExists = false, cascade = true)
+      assert(!tableRegistry.functionExists(ident))
+    } finally {
+      catalog.reset()
+    }
+  }
+
+  test("drop database preserves functions in other databases (cache coherence)") {
+    val extCatalog = newEmptyCatalog()
+    extCatalog.createDatabase(newDb("default"), ignoreIfExists = true)
+    extCatalog.createDatabase(newDb("drop_me"), ignoreIfExists = false)
+    extCatalog.createDatabase(newDb("keep_me"), ignoreIfExists = false)
+    extCatalog.createFunction("drop_me", newFunc("func_drop", Some("drop_me")))
+    extCatalog.createFunction("keep_me", newFunc("func_keep", Some("keep_me")))
+    val registry = new SimpleFunctionRegistry()
+    val catalog = new SessionCatalog(extCatalog, registry)
+    try {
+      val dropIdent = FunctionIdentifier(
+        "func_drop", Some("drop_me"), Some(CatalogManager.SESSION_CATALOG_NAME))
+      val keepIdent = FunctionIdentifier(
+        "func_keep", Some("keep_me"), Some(CatalogManager.SESSION_CATALOG_NAME))
+      val builder = (e: Seq[Expression]) => e.head
+      val makeInfo = (db: String, name: String) => new ExpressionInfo(
+        "test.Example", db, name, "usage", "arguments",
+        "\n    Examples:\n", "\n    \n  ", "misc_funcs", "1.0.0", "", "sql_udf")
+      registry.registerFunction(dropIdent, makeInfo("drop_me", "func_drop"), builder)
+      registry.registerFunction(keepIdent, makeInfo("keep_me", "func_keep"), builder)
+      assert(registry.functionExists(dropIdent))
+      assert(registry.functionExists(keepIdent))
+      catalog.dropDatabase("drop_me", ignoreIfNotExists = false, cascade = true)
+      assert(!registry.functionExists(dropIdent))
+      assert(registry.functionExists(keepIdent))
+    } finally {
+      catalog.reset()
+    }
+  }
+
   test("alter database") {
     withBasicCatalog { catalog =>
       val db1 = catalog.getDatabaseMetadata("db1")
@@ -368,6 +454,22 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
     }
   }
 
+  test("create external table without location") {
+    withBasicCatalog { catalog =>
+      val externalTableWithoutLocation = CatalogTable(
+        identifier = TableIdentifier("tbl_ext", Some("db1")),
+        tableType = CatalogTableType.EXTERNAL,
+        storage = CatalogStorageFormat.empty,
+        schema = new StructType().add("col1", "int"))
+      checkError(
+        exception = intercept[AnalysisException] {
+          catalog.createTable(externalTableWithoutLocation, ignoreIfExists = false)
+        },
+        condition = "CREATE_EXTERNAL_TABLE_WITHOUT_LOCATION",
+        parameters = Map.empty)
+    }
+  }
+
   test("create table when database does not exist") {
     withBasicCatalog { catalog =>
       // Creating table in non-existent database should always fail
@@ -419,15 +521,14 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
 
   test("drop table when database/table does not exist") {
     withBasicCatalog { catalog =>
-      // Should always throw exception when the database does not exist
-      intercept[NoSuchNamespaceException] {
+      // Should throw exception when the database does not exist and ignoreIfNotExists is false
+      intercept[NoSuchTableException] {
         catalog.dropTable(TableIdentifier("tbl1", Some("unknown_db")), ignoreIfNotExists = false,
           purge = false)
       }
-      intercept[NoSuchNamespaceException] {
-        catalog.dropTable(TableIdentifier("tbl1", Some("unknown_db")), ignoreIfNotExists = true,
-          purge = false)
-      }
+      // Should succeed (no-op) when the database does not exist and ignoreIfNotExists is true
+      catalog.dropTable(TableIdentifier("tbl1", Some("unknown_db")), ignoreIfNotExists = true,
+        purge = false)
       intercept[NoSuchTableException] {
         catalog.dropTable(TableIdentifier("unknown_table", Some("db2")), ignoreIfNotExists = false,
           purge = false)
@@ -719,20 +820,30 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
 
   test("get tables by name when tables belong to different databases") {
     withBasicCatalog { catalog =>
-      intercept[AnalysisException](catalog.getTablesByName(
-        Seq(
-          TableIdentifier("tbl1", Some("db1")),
-          TableIdentifier("tbl2", Some("db2"))
-        )
-      ))
+      checkError(
+        exception = intercept[AnalysisException](catalog.getTablesByName(
+          Seq(
+            TableIdentifier("tbl1", Some("db1")),
+            TableIdentifier("tbl2", Some("db2"))
+          )
+        )),
+        condition = "TABLES_OR_VIEWS_NOT_IN_SAME_DATABASE",
+        parameters = Map(
+          "qualifiedTableNames" ->
+            "List(spark_catalog.db1.tbl1, spark_catalog.db2.tbl2)"))
       // Get table without explicitly specifying database
       catalog.setCurrentDatabase("db2")
-      intercept[AnalysisException](catalog.getTablesByName(
-        Seq(
-          TableIdentifier("tbl1", Some("db1")),
-          TableIdentifier("tbl2")
-        )
-      ))
+      checkError(
+        exception = intercept[AnalysisException](catalog.getTablesByName(
+          Seq(
+            TableIdentifier("tbl1", Some("db1")),
+            TableIdentifier("tbl2")
+          )
+        )),
+        condition = "TABLES_OR_VIEWS_NOT_IN_SAME_DATABASE",
+        parameters = Map(
+          "qualifiedTableNames" ->
+            "List(spark_catalog.db1.tbl1, spark_catalog.db2.tbl2)"))
     }
   }
 
@@ -1069,7 +1180,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
             TableIdentifier("tbl2", Some("db2")),
             Seq(partWithEmptyValue, part1), ignoreIfExists = true)
         },
-        condition = "_LEGACY_ERROR_TEMP_1076",
+        condition = "INVALID_PARTITION_SPEC",
         parameters = Map(
           "details" -> "The spec ([a=3, b=]) contains an empty partition column value"))
     }
@@ -1162,7 +1273,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
             purge = false,
             retainData = false)
         },
-        condition = "_LEGACY_ERROR_TEMP_1076",
+        condition = "INVALID_PARTITION_SPEC",
         parameters = Map(
           "details" -> ("The spec (a, b, c) must be contained within the partition " +
             s"spec (a, b) defined in table '`$SESSION_CATALOG_NAME`.`db2`.`tbl2`'")))
@@ -1175,7 +1286,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
             purge = false,
             retainData = false)
         },
-        condition = "_LEGACY_ERROR_TEMP_1076",
+        condition = "INVALID_PARTITION_SPEC",
         parameters = Map(
           "details" -> ("The spec (a, unknown) must be contained within the partition " +
             s"spec (a, b) defined in table '`$SESSION_CATALOG_NAME`.`db2`.`tbl2`'")))
@@ -1188,7 +1299,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
             purge = false,
             retainData = false)
         },
-        condition = "_LEGACY_ERROR_TEMP_1076",
+        condition = "INVALID_PARTITION_SPEC",
         parameters = Map(
           "details" -> "The spec ([a=3, b=]) contains an empty partition column value"))
     }
@@ -1255,7 +1366,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
         exception = intercept[AnalysisException] {
           catalog.getPartition(TableIdentifier("tbl1", Some("db2")), partWithEmptyValue.spec)
         },
-        condition = "_LEGACY_ERROR_TEMP_1076",
+        condition = "INVALID_PARTITION_SPEC",
         parameters = Map(
           "details" -> "The spec ([a=3, b=]) contains an empty partition column value"))
     }
@@ -1346,7 +1457,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
             TableIdentifier("tbl1", Some("db2")),
             Seq(part1.spec), Seq(partWithEmptyValue.spec))
         },
-        condition = "_LEGACY_ERROR_TEMP_1076",
+        condition = "INVALID_PARTITION_SPEC",
         parameters = Map(
           "details" -> "The spec ([a=3, b=]) contains an empty partition column value"))
     }
@@ -1427,7 +1538,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
         exception = intercept[AnalysisException] {
           catalog.alterPartitions(TableIdentifier("tbl1", Some("db2")), Seq(partWithEmptyValue))
         },
-        condition = "_LEGACY_ERROR_TEMP_1076",
+        condition = "INVALID_PARTITION_SPEC",
         parameters = Map(
           "details" -> "The spec ([a=3, b=]) contains an empty partition column value"))
     }
@@ -1459,7 +1570,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
           catalog.listPartitionNames(TableIdentifier("tbl2", Some("db2")),
             Some(partWithMoreColumns.spec))
         },
-        condition = "_LEGACY_ERROR_TEMP_1076",
+        condition = "INVALID_PARTITION_SPEC",
         parameters = Map(
           "details" -> ("The spec (a, b, c) must be contained within the partition spec (a, b) " +
             s"defined in table '`$SESSION_CATALOG_NAME`.`db2`.`tbl2`'")))
@@ -1468,7 +1579,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
           catalog.listPartitionNames(TableIdentifier("tbl2", Some("db2")),
             Some(partWithUnknownColumns.spec))
         },
-        condition = "_LEGACY_ERROR_TEMP_1076",
+        condition = "INVALID_PARTITION_SPEC",
         parameters = Map(
           "details" -> ("The spec (a, unknown) must be contained within the partition " +
             s"spec (a, b) defined in table '`$SESSION_CATALOG_NAME`.`db2`.`tbl2`'")))
@@ -1477,7 +1588,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
           catalog.listPartitionNames(TableIdentifier("tbl2", Some("db2")),
             Some(partWithEmptyValue.spec))
         },
-        condition = "_LEGACY_ERROR_TEMP_1076",
+        condition = "INVALID_PARTITION_SPEC",
         parameters = Map(
           "details" -> "The spec ([a=3, b=]) contains an empty partition column value"))
     }
@@ -1507,7 +1618,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
           catalog.listPartitions(TableIdentifier("tbl2", Some("db2")),
             Some(partWithMoreColumns.spec))
         },
-        condition = "_LEGACY_ERROR_TEMP_1076",
+        condition = "INVALID_PARTITION_SPEC",
         parameters = Map(
           "details" -> ("The spec (a, b, c) must be contained within the partition spec (a, b) " +
             s"defined in table '`$SESSION_CATALOG_NAME`.`db2`.`tbl2`'")))
@@ -1516,7 +1627,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
           catalog.listPartitions(TableIdentifier("tbl2", Some("db2")),
             Some(partWithUnknownColumns.spec))
         },
-        condition = "_LEGACY_ERROR_TEMP_1076",
+        condition = "INVALID_PARTITION_SPEC",
         parameters = Map(
           "details" -> ("The spec (a, unknown) must be contained within the partition " +
             s"spec (a, b) defined in table '`$SESSION_CATALOG_NAME`.`db2`.`tbl2`'")))
@@ -1525,7 +1636,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
           catalog.listPartitions(TableIdentifier("tbl2", Some("db2")),
             Some(partWithEmptyValue.spec))
         },
-        condition = "_LEGACY_ERROR_TEMP_1076",
+        condition = "INVALID_PARTITION_SPEC",
         parameters = Map(
           "details" -> "The spec ([a=3, b=]) contains an empty partition column value"))
     }
@@ -1666,9 +1777,81 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
       assert(!catalog.isTemporaryFunction(FunctionIdentifier("func1")))
 
       // Returns false when the function is built-in or hive
-      assert(FunctionRegistry.builtin.functionExists(FunctionIdentifier("sum")))
+      assert(FunctionRegistry.builtin.functionExists(
+        FunctionRegistry.builtinFunctionIdentifier("sum")))
       assert(!catalog.isTemporaryFunction(FunctionIdentifier("sum")))
       assert(!catalog.isTemporaryFunction(FunctionIdentifier("histogram_numeric")))
+    }
+  }
+
+  test("isTemporaryScalarFunctionVisible honors stored-view captured temp functions") {
+    withBasicCatalog { catalog =>
+      val tempFunc = (e: Seq[Expression]) => e.head
+      catalog.registerFunction(
+        newFunc("temp_json", None), overrideIfExists = false, functionBuilder = Some(tempFunc))
+
+      // A view descriptor whose frozen catalog/namespace is non-empty (so we are resolving a view)
+      // and that captured the given temp function names.
+      def viewDesc(captured: Seq[String]): CatalogTable = {
+        val tempFnProp = if (captured.isEmpty) {
+          Map.empty[String, String]
+        } else {
+          Map(CatalogTable.VIEW_REFERRED_TEMP_FUNCTION_NAMES ->
+            captured.map(n => s""""$n"""").mkString("[", ",", "]"))
+        }
+        CatalogTable(
+          TableIdentifier("v", Some("default")),
+          CatalogTableType.VIEW,
+          CatalogStorageFormat.empty,
+          StructType(Seq(StructField("a", IntegerType))),
+          viewText = Some("SELECT 1"),
+          properties =
+            CatalogTable.catalogAndNamespaceToProps(SESSION_CATALOG_NAME, Seq("default")) ++
+              tempFnProp)
+      }
+
+      // Outside any view context, a registered temp scalar function is visible.
+      assert(catalog.isTemporaryScalarFunctionVisible(FunctionIdentifier("temp_json")))
+      assert(!catalog.isTemporaryTableFunctionVisible(FunctionIdentifier("temp_json")))
+
+      // Inside a view that did NOT capture it (e.g. an unrelated temp created after the view), it
+      // is hidden, matching handleViewContext used by actual resolution -- so the builtin-ownership
+      // probe won't be fooled into skipping builtin-only syntax handling.
+      AnalysisContext.withAnalysisContext(viewDesc(captured = Nil)) {
+        assert(!catalog.isTemporaryScalarFunctionVisible(FunctionIdentifier("temp_json")))
+      }
+      // Inside a view that captured it, it stays visible.
+      AnalysisContext.withAnalysisContext(viewDesc(captured = Seq("temp_json"))) {
+        assert(catalog.isTemporaryScalarFunctionVisible(FunctionIdentifier("temp_json")))
+      }
+    }
+  }
+
+  test("temp table function is visible to the table probe, not the scalar probe") {
+    // Scalar and table temp functions are probed separately. The scalar probe mirrors the
+    // scalar-only resolveScalarFunctionByIdentifier, so a same-named temp *table* function is not
+    // visible to it; its effect (making scalar resolution terminal) is reported by the table probe.
+    val extCatalog = newEmptyCatalog()
+    extCatalog.createDatabase(newDb("default"), ignoreIfExists = true)
+    val scalarRegistry = new SimpleFunctionRegistry()
+    val tableRegistry = new SimpleTableFunctionRegistry()
+    val catalog = new SessionCatalog(extCatalog, scalarRegistry, tableRegistry)
+    try {
+      val ident = FunctionIdentifier(
+        "count", Some(CatalogManager.SESSION_NAMESPACE), Some(CatalogManager.SYSTEM_CATALOG_NAME))
+      val info = new ExpressionInfo(
+        "test.Example", CatalogManager.SESSION_NAMESPACE, "count", "usage", "arguments",
+        "\n    Examples:\n", "\n    \n  ", "table_funcs", "1.0.0", "", "sql_udf")
+      tableRegistry.registerFunction(ident, info, (_: Seq[Expression]) => Range(1, 1, 1, 1))
+
+      assert(catalog.isTemporaryFunction(FunctionIdentifier("count")),
+        "a temp table function should count as a temporary function")
+      assert(!catalog.isTemporaryScalarFunctionVisible(FunctionIdentifier("count")),
+        "a temp table function must not be visible to the scalar ownership probe")
+      assert(catalog.isTemporaryTableFunctionVisible(FunctionIdentifier("count")),
+        "a temp table function must be visible to the table ownership probe")
+    } finally {
+      catalog.reset()
     }
   }
 
@@ -2169,6 +2352,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
         exprText = None,
         queryText = None,
         comment = None,
+        collation = None,
         deterministic = Some(true),
         containsSQL = Some(false),
         isTableFunc = false,
@@ -2192,6 +2376,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
         exprText = Some("SELECT 1"),
         queryText = None,
         comment = None,
+        collation = None,
         deterministic = Some(true),
         containsSQL = Some(true),
         isTableFunc = true,  // But marked as table function

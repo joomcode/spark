@@ -21,11 +21,16 @@ import org.apache.spark.sql.catalyst.SQLConfHelper
 import org.apache.spark.sql.catalyst.analysis.CollationStrength.{Default, Explicit, Implicit, Indeterminate}
 import org.apache.spark.sql.catalyst.analysis.TypeCoercion.haveSameType
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Project}
+import org.apache.spark.sql.catalyst.expressions.variant.VariantGet
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.util.TypeUtils.toSQLExpr
 import org.apache.spark.sql.errors.QueryCompilationErrors
-import org.apache.spark.sql.types.{ArrayType, DataType, IndeterminateStringType, MapType, NullType, StringType, StructType}
+import org.apache.spark.sql.types.{
+  ArrayType, DataType, IndeterminateStringType, MapType, NullType, StringHelper,
+  StringType, StructType
+}
 import org.apache.spark.sql.util.SchemaUtils
 
 /**
@@ -36,7 +41,7 @@ object CollationTypeCoercion extends SQLConfHelper {
   private val COLLATION_CONTEXT_TAG = new TreeNodeTag[DataType]("collationContext")
 
   private def hasCollationContextTag(expr: Expression): Boolean = {
-    expr.getTagValue(COLLATION_CONTEXT_TAG).isDefined
+    expr.containsTag(COLLATION_CONTEXT_TAG)
   }
 
   def apply(expression: Expression): Expression = expression match {
@@ -90,7 +95,7 @@ object CollationTypeCoercion extends SQLConfHelper {
         _: LessThan | _: LessThanOrEqual | _: StartsWith | _: StringInstr | _: ToNumber |
         _: TryToNumber | _: StringToMap | _: Levenshtein  | _: StringSplitSQL | _: SplitPart |
         _: Lag | _: Lead | _: RegExpReplace | _: StringRPad | _: StringLPad | _: Overlay |
-        _: Elt | _: SubstringIndex | _: StringLocate | _: If) =>
+        _: Elt | _: SubstringIndex | _: StringLocate | _: If | _: StringInstrWithOccurrence) =>
       val newChildren = collateToSingleType(otherExpr, otherExpr.children)
       otherExpr.withNewChildren(newChildren)
 
@@ -107,6 +112,13 @@ object CollationTypeCoercion extends SQLConfHelper {
 
   /**
    * Changes the data type of the expression to the given `newType`.
+   *
+   * Literal and Cast: wrap in a new Cast when the CHAR/VARCHAR constraint
+   * changes so truncation, overflow, and padding stay on the original node.
+   * Collation-only changes retarget with `copy(dataType)` and copy
+   * `USER_SPECIFIED_CAST` (truncation). Do not copy all tags: a stale
+   * `COLLATION_CONTEXT_TAG` would reuse the pre-LCT collation. That keeps
+   * a non-string Cast child non-string and therefore Default strength.
    */
   private def changeType(expr: Expression, newType: DataType): Expression = {
     mergeTypes(expr.dataType, newType) match {
@@ -114,8 +126,17 @@ object CollationTypeCoercion extends SQLConfHelper {
         assert(!newDataType.existsRecursively(_.isInstanceOf[StringTypeWithContext]))
 
         expr match {
+          case lit: Literal if stringConstraintChanged(lit.dataType, newDataType) =>
+            Cast(lit, newDataType, timeZoneId = Some(conf.sessionLocalTimeZone))
           case lit: Literal => lit.copy(dataType = newDataType)
-          case cast: Cast => cast.copy(dataType = newDataType)
+          case cast: Cast if stringConstraintChanged(cast.dataType, newDataType) =>
+            Cast(cast, newDataType, timeZoneId = Some(conf.sessionLocalTimeZone))
+          case cast: Cast =>
+            val retargeted = cast.copy(dataType = newDataType)
+            if (cast.containsTag(Cast.USER_SPECIFIED_CAST)) {
+              retargeted.setTagValue(Cast.USER_SPECIFIED_CAST, ())
+            }
+            retargeted
           case subquery: SubqueryExpression =>
             changeTypeInSubquery(subquery, newType)
 
@@ -124,6 +145,24 @@ object CollationTypeCoercion extends SQLConfHelper {
 
       case _ =>
         expr
+    }
+  }
+
+  /**
+   * True when CHAR/VARCHAR length (or nested length) differs between `from` and `to`.
+   * Collation-only differences are not a constraint change.
+   */
+  private def stringConstraintChanged(from: DataType, to: DataType): Boolean = {
+    (from, to) match {
+      case (f: StringType, t: StringType) => f.constraint != t.constraint
+      case (ArrayType(fe, _), ArrayType(te, _)) => stringConstraintChanged(fe, te)
+      case (MapType(fk, fv, _), MapType(tk, tv, _)) =>
+        stringConstraintChanged(fk, tk) || stringConstraintChanged(fv, tv)
+      case (fs: StructType, ts: StructType) if fs.length == ts.length =>
+        fs.fields.indices.exists { i =>
+          stringConstraintChanged(fs.fields(i).dataType, ts.fields(i).dataType)
+        }
+      case _ => false
     }
   }
 
@@ -288,6 +327,16 @@ object CollationTypeCoercion extends SQLConfHelper {
             None
         }
 
+      case elementAt: ElementAt =>
+        findCollationContext(elementAt.left) match {
+          case Some(MapType(_, valueType, _)) =>
+            mergeWinner(elementAt.dataType, valueType)
+          case Some(ArrayType(elementType, _)) =>
+            mergeWinner(elementAt.dataType, elementType)
+          case _ =>
+            None
+        }
+
       case struct: CreateNamedStruct =>
         val childrenContexts = struct.valExprs.map(findCollationContext)
         if (childrenContexts.isEmpty) {
@@ -330,6 +379,11 @@ object CollationTypeCoercion extends SQLConfHelper {
     case expr if hasCollationContextTag(expr) =>
       Some(expr.getTagValue(COLLATION_CONTEXT_TAG).get)
 
+    // WindowSpecDefinition and WindowFrame store metadata information so we don't need
+    // to check them. `partitionSpec` will be iterated separately.
+    case _: WindowSpecDefinition | _: WindowFrame =>
+      None
+
     // if `expr` doesn't have a string in its dataType then it doesn't
     // have the collation context either
     case expr if !expr.dataType.existsRecursively(_.isInstanceOf[StringType]) =>
@@ -347,8 +401,17 @@ object CollationTypeCoercion extends SQLConfHelper {
 
       Some(addContextToStringType(cast.dataType, castStrength))
 
+    // An explicitly collated target or RETURNING type (even UTF8_BINARY), not the arguments,
+    // decides the collation, like a column of that type.
+    case e @ (_: VariantGet | _: JsonValue | _: JsonQuery | _: JsonArray | _: JsonObjectExpr)
+        if DataTypeUtils.hasNonDefaultStringCharOrVarcharType(e.dataType) =>
+      Some(addContextToStringType(e.dataType, Implicit))
+
     case expr @ (_: NamedExpression | _: SubqueryExpression | _: VariableReference) =>
       Some(addContextToStringType(expr.dataType, Implicit))
+
+    case f: SQLFunctionExpression =>
+      Some(addContextToStringType(f.dataType, Implicit))
 
     case lit: Literal =>
       Some(addContextToStringType(lit.dataType, Default))
@@ -396,7 +459,17 @@ object CollationTypeCoercion extends SQLConfHelper {
     }
   }
 
-  /** Determines the winning StringTypeWithContext based on the strength of the collation. */
+  /**
+   * Resolves collation strength independently of CHAR/VARCHAR length.
+   *
+   * Runs whenever first-class CHAR/VARCHAR are enabled (`standardSemantics` or
+   * `preserveCharVarcharTypeInfo`).
+   *
+   * Same collation: string-family LCT `max(n, m)` with the stronger strength.
+   * Different collations, equal strength: mismatch (error if Explicit, else
+   * indeterminate). Different collations, unequal strength: the stronger
+   * operand wins in full, including its length.
+   */
   private def getWinningStringType(
       left: StringTypeWithContext,
       right: StringTypeWithContext): StringTypeWithContext = {
@@ -409,14 +482,13 @@ object CollationTypeCoercion extends SQLConfHelper {
       }
     }
 
-    (left.strength.priority, right.strength.priority) match {
-      case (leftPriority, rightPriority) if leftPriority == rightPriority =>
-        if (left.sameType(right)) left
-        else handleMismatch()
+    val winner =
+      if (left.strength.priority <= right.strength.priority) left else right
 
-      case (leftPriority, rightPriority) =>
-        if (leftPriority < rightPriority) left
-        else right
+    StringHelper.tightestCommonString(left.stringType, right.stringType) match {
+      case Some(lct) => StringTypeWithContext(lct, winner.strength)
+      case None if left.strength.priority == right.strength.priority => handleMismatch()
+      case None => winner
     }
   }
 
@@ -443,8 +515,12 @@ object CollationTypeCoercion extends SQLConfHelper {
       case _: Throwable => NullType
     }
 
-    expression.children.exists(child =>
-      shouldFailWithIndeterminateCollation(expression, getDataTypeSafe(child)))
+    // Most expressions can contain indeterminate collation, so check the expression before
+    // typing its children. Some children have no data type and throw an internal error when
+    // asked for one, such as the WithField, DropField and UpdateNestedField operations of an
+    // UpdateFields.
+    !canContainIndeterminateCollation(expression) &&
+      expression.children.exists(child => hasIndeterminateCollation(getDataTypeSafe(child)))
   }
 
   /**
@@ -476,8 +552,32 @@ object CollationTypeCoercion extends SQLConfHelper {
     case _: BinaryComparison | _: StringPredicate | _: Upper | _: Lower | _: InitCap |
          _: FindInSet | _: StringInstr | _: StringReplace | _: StringLocate | _: SubstringIndex |
          _: StringTrim | _: StringTrimLeft | _: StringTrimRight | _: StringTranslate |
-         _: StringSplitSQL | _: In | _: InSubquery | _: FindInSet => false
+         _: StringSplitSQL | _: In | _: InSubquery | _: StringInstrWithOccurrence => false
     case _ => true
+  }
+
+  /**
+   * Pre-tags [[CommonExpressionRef]]s in [[With]] expressions with the collation context of their
+   * definitions. This must be called before the bottom-up expression transformation, because that
+   * transformation processes inner expressions (like [[EqualTo]]) before reaching the [[With]]
+   * node. Without the enclosing [[With]], we have no context for what the refs point to, so we
+   * cannot correctly determine their collation strength.
+   */
+  private[analysis] def preTagCommonExpressionRefs(plan: LogicalPlan): LogicalPlan = {
+    plan.resolveExpressionsDown {
+      case withExpression: With =>
+        withExpression.child.foreach {
+          case ref: CommonExpressionRef =>
+            withExpression.defs.find(d => d.id == ref.id && d.child.resolved)
+              .foreach { definition =>
+                findCollationContext(definition.child).foreach { context =>
+                  ref.setTagValue(COLLATION_CONTEXT_TAG, context)
+                }
+              }
+          case _ =>
+        }
+        withExpression
+    }
   }
 }
 

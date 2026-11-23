@@ -27,7 +27,7 @@ import scala.util.control.NonFatal
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder
 
-import org.apache.spark.SparkException
+import org.apache.spark.{SparkException, SparkThrowable}
 
 private[spark] object ThreadUtils {
 
@@ -358,10 +358,26 @@ private[spark] object ThreadUtils {
   def awaitResult[T](awaitable: Awaitable[T], atMost: Duration): T = {
     SparkThreadUtils.awaitResult(awaitable, atMost)
   }
+
+  @throws(classOf[SparkException])
+  def awaitResult[T](
+      awaitable: Awaitable[T],
+      atMost: Duration,
+      preserveSparkThrowable: Boolean): T = {
+    SparkThreadUtils.awaitResult(awaitable, atMost, preserveSparkThrowable)
+  }
   // scalastyle:on awaitresult
 
   @throws(classOf[SparkException])
   def awaitResult[T](future: JFuture[T], atMost: Duration): T = {
+    awaitResult(future, atMost, preserveSparkThrowable = false)
+  }
+
+  @throws(classOf[SparkException])
+  def awaitResult[T](
+      future: JFuture[T],
+      atMost: Duration,
+      preserveSparkThrowable: Boolean): T = {
     try {
       atMost match {
         case Duration.Inf => future.get()
@@ -370,6 +386,16 @@ private[spark] object ThreadUtils {
     } catch {
       case e: SparkFatalException =>
         throw e.throwable
+      // JFuture.get() wraps exceptions in ExecutionException. Unwrap and check if the
+      // cause carries a structured condition (SparkThrowable) to preserve the SQL state.
+      case e: ExecutionException
+          if preserveSparkThrowable
+            && e.getCause.isInstanceOf[SparkThrowable]
+            && e.getCause.asInstanceOf[SparkThrowable].getCondition != null =>
+        // Attach the caller's stack trace so it's not lost when re-throwing from a worker thread.
+        e.getCause.addSuppressed(
+          new SparkException("Exception thrown in awaitResult", cause = null))
+        throw e.getCause
       case NonFatal(t)
         if !t.isInstanceOf[TimeoutException] =>
         throw new SparkException("Exception thrown in awaitResult: ", t)
@@ -397,14 +423,32 @@ private[spark] object ThreadUtils {
   }
   // scalastyle:on awaitready
 
+  /**
+   * Shuts down the executor, waiting up to `gracePeriod` for running and queued tasks to finish.
+   * If they do not finish in time, or if the calling thread is interrupted while waiting, calls
+   * `shutdownNow()` to interrupt the running tasks and drop the queued ones. In the latter case,
+   * the `InterruptedException` is rethrown. This method does not wait again after
+   * `shutdownNow()`, so the executor may not be terminated yet when it returns, and tasks that
+   * ignore interrupts may keep running.
+   */
   def shutdown(
       executor: ExecutorService,
       gracePeriod: Duration = FiniteDuration(30, TimeUnit.SECONDS)): Unit = {
     executor.shutdown()
-    executor.awaitTermination(gracePeriod.toMillis, TimeUnit.MILLISECONDS)
-    if (!executor.isShutdown) {
-      executor.shutdownNow()
+    try {
+      if (!executor.awaitTermination(gracePeriod.toMillis, TimeUnit.MILLISECONDS)) {
+        executor.shutdownNow()
+      }
+    } catch {
+      case e: InterruptedException =>
+        executor.shutdownNow()
+        throw e
     }
+  }
+
+  /** See the overloaded [[parmap]] for full documentation. */
+  def parmap[I, O](in: Seq[I], prefix: String, maxThreads: Int)(f: I => O): Seq[O] = {
+    parmap(in, prefix, maxThreads, preserveSparkThrowable = false)(f)
   }
 
   /**
@@ -419,13 +463,19 @@ private[spark] object ThreadUtils {
    * @param in - the input collection which should be transformed in parallel.
    * @param prefix - the prefix assigned to the underlying thread pool.
    * @param maxThreads - maximum number of thread can be created during execution.
+   * @param preserveSparkThrowable if true, re-throw exceptions that already carry a structured
+   *   error class (SparkThrowable) instead of wrapping them in a generic SparkException.
    * @param f - the lambda function will be applied to each element of `in`.
    * @tparam I - the type of elements in the input collection.
    * @tparam O - the type of elements in resulted collection.
    * @return new collection in which each element was given from the input collection `in` by
    *         applying the lambda function `f`.
    */
-  def parmap[I, O](in: Seq[I], prefix: String, maxThreads: Int)(f: I => O): Seq[O] = {
+  def parmap[I, O](
+      in: Seq[I],
+      prefix: String,
+      maxThreads: Int,
+      preserveSparkThrowable: Boolean)(f: I => O): Seq[O] = {
     val pool = newForkJoinPool(prefix, maxThreads)
     try {
       implicit val ec: ExecutionContextExecutor = ExecutionContext.fromExecutor(pool)
@@ -433,7 +483,7 @@ private[spark] object ThreadUtils {
       val futures = in.map(x => Future(f(x)))
       val futureSeq = Future.sequence(futures)
 
-      awaitResult(futureSeq, Duration.Inf)
+      awaitResult(futureSeq, Duration.Inf, preserveSparkThrowable)
     } finally {
       pool.shutdownNow()
     }

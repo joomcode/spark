@@ -33,12 +33,17 @@ import org.apache.spark.unsafe.types.UTF8String
   usage = """
     _FUNC_(expr) - Returns human readable summary information about this sketch.
   """,
+  arguments = """
+    Arguments:
+      * expr - The sketch to return summary information about.
+        An expression that evaluates to a binary.
+  """,
   examples = """
     Examples:
       > SELECT LENGTH(_FUNC_(kll_sketch_agg_bigint(col))) > 0 FROM VALUES (1), (2), (3), (4), (5) tab(col);
        true
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchToStringBigint(child: Expression) extends KllSketchToStringBase {
   override protected def withNewChildInternal(newChild: Expression): KllSketchToStringBigint =
@@ -50,8 +55,8 @@ case class KllSketchToStringBigint(child: Expression) extends KllSketchToStringB
       val sketch = KllLongsSketch.heapify(Memory.wrap(buffer))
       UTF8String.fromString(sketch.toString())
     } catch {
-      case e: Exception =>
-        throw QueryExecutionErrors.kllSketchInvalidInputError(prettyName, e.getMessage)
+      case _: Exception =>
+        throw QueryExecutionErrors.kllInvalidInputSketchBuffer(prettyName)
     }
   }
 }
@@ -61,12 +66,17 @@ case class KllSketchToStringBigint(child: Expression) extends KllSketchToStringB
   usage = """
     _FUNC_(expr) - Returns human readable summary information about this sketch.
   """,
+  arguments = """
+    Arguments:
+      * expr - The sketch to return summary information about.
+        An expression that evaluates to a binary.
+  """,
   examples = """
     Examples:
       > SELECT LENGTH(_FUNC_(kll_sketch_agg_float(col))) > 0 FROM VALUES (CAST(1.0 AS FLOAT)), (CAST(2.0 AS FLOAT)), (CAST(3.0 AS FLOAT)), (CAST(4.0 AS FLOAT)), (CAST(5.0 AS FLOAT)) tab(col);
        true
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchToStringFloat(child: Expression) extends KllSketchToStringBase {
   override protected def withNewChildInternal(newChild: Expression): KllSketchToStringFloat =
@@ -78,8 +88,8 @@ case class KllSketchToStringFloat(child: Expression) extends KllSketchToStringBa
       val sketch = KllFloatsSketch.heapify(Memory.wrap(buffer))
       UTF8String.fromString(sketch.toString())
     } catch {
-      case e: Exception =>
-        throw QueryExecutionErrors.kllSketchInvalidInputError(prettyName, e.getMessage)
+      case _: Exception =>
+        throw QueryExecutionErrors.kllInvalidInputSketchBuffer(prettyName)
     }
   }
 }
@@ -89,12 +99,17 @@ case class KllSketchToStringFloat(child: Expression) extends KllSketchToStringBa
   usage = """
     _FUNC_(expr) - Returns human readable summary information about this sketch.
   """,
+  arguments = """
+    Arguments:
+      * expr - The sketch to return summary information about.
+        An expression that evaluates to a binary.
+  """,
   examples = """
     Examples:
       > SELECT LENGTH(_FUNC_(kll_sketch_agg_double(col))) > 0 FROM VALUES (CAST(1.0 AS DOUBLE)), (CAST(2.0 AS DOUBLE)), (CAST(3.0 AS DOUBLE)), (CAST(4.0 AS DOUBLE)), (CAST(5.0 AS DOUBLE)) tab(col);
        true
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchToStringDouble(child: Expression) extends KllSketchToStringBase {
   override protected def withNewChildInternal(newChild: Expression): KllSketchToStringDouble =
@@ -106,8 +121,8 @@ case class KllSketchToStringDouble(child: Expression) extends KllSketchToStringB
       val sketch = KllDoublesSketch.heapify(Memory.wrap(buffer))
       UTF8String.fromString(sketch.toString())
     } catch {
-      case e: Exception =>
-        throw QueryExecutionErrors.kllSketchInvalidInputError(prettyName, e.getMessage)
+      case _: Exception =>
+        throw QueryExecutionErrors.kllInvalidInputSketchBuffer(prettyName)
     }
   }
 }
@@ -127,12 +142,17 @@ abstract class KllSketchToStringBase
   usage = """
     _FUNC_(expr) - Returns the number of items collected in the sketch.
   """,
+  arguments = """
+    Arguments:
+      * expr - The sketch to return the number of collected items from.
+        An expression that evaluates to a binary.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(kll_sketch_agg_bigint(col)) FROM VALUES (1), (2), (3), (4), (5) tab(col);
        5
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchGetNBigint(child: Expression) extends KllSketchGetNBase {
   override protected def withNewChildInternal(newChild: Expression): KllSketchGetNBigint =
@@ -144,8 +164,8 @@ case class KllSketchGetNBigint(child: Expression) extends KllSketchGetNBase {
       val sketch = KllLongsSketch.heapify(Memory.wrap(buffer))
       sketch.getN()
     } catch {
-      case e: Exception =>
-        throw QueryExecutionErrors.kllSketchInvalidInputError(prettyName, e.getMessage)
+      case _: Exception =>
+        throw QueryExecutionErrors.kllInvalidInputSketchBuffer(prettyName)
     }
   }
 }
@@ -155,12 +175,17 @@ case class KllSketchGetNBigint(child: Expression) extends KllSketchGetNBase {
   usage = """
     _FUNC_(expr) - Returns the number of items collected in the sketch.
   """,
+  arguments = """
+    Arguments:
+      * expr - The sketch to return the number of collected items from.
+        An expression that evaluates to a binary.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(kll_sketch_agg_float(col)) FROM VALUES (CAST(1.0 AS FLOAT)), (CAST(2.0 AS FLOAT)), (CAST(3.0 AS FLOAT)), (CAST(4.0 AS FLOAT)), (CAST(5.0 AS FLOAT)) tab(col);
        5
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchGetNFloat(child: Expression) extends KllSketchGetNBase {
   override protected def withNewChildInternal(newChild: Expression): KllSketchGetNFloat =
@@ -172,8 +197,8 @@ case class KllSketchGetNFloat(child: Expression) extends KllSketchGetNBase {
       val sketch = KllFloatsSketch.heapify(Memory.wrap(buffer))
       sketch.getN()
     } catch {
-      case e: Exception =>
-        throw QueryExecutionErrors.kllSketchInvalidInputError(prettyName, e.getMessage)
+      case _: Exception =>
+        throw QueryExecutionErrors.kllInvalidInputSketchBuffer(prettyName)
     }
   }
 }
@@ -183,12 +208,17 @@ case class KllSketchGetNFloat(child: Expression) extends KllSketchGetNBase {
   usage = """
     _FUNC_(expr) - Returns the number of items collected in the sketch.
   """,
+  arguments = """
+    Arguments:
+      * expr - The sketch to return the number of collected items from.
+        An expression that evaluates to a binary.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(kll_sketch_agg_double(col)) FROM VALUES (CAST(1.0 AS DOUBLE)), (CAST(2.0 AS DOUBLE)), (CAST(3.0 AS DOUBLE)), (CAST(4.0 AS DOUBLE)), (CAST(5.0 AS DOUBLE)) tab(col);
        5
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchGetNDouble(child: Expression) extends KllSketchGetNBase {
   override protected def withNewChildInternal(newChild: Expression): KllSketchGetNDouble =
@@ -200,8 +230,8 @@ case class KllSketchGetNDouble(child: Expression) extends KllSketchGetNBase {
       val sketch = KllDoublesSketch.heapify(Memory.wrap(buffer))
       sketch.getN()
     } catch {
-      case e: Exception =>
-        throw QueryExecutionErrors.kllSketchInvalidInputError(prettyName, e.getMessage)
+      case _: Exception =>
+        throw QueryExecutionErrors.kllInvalidInputSketchBuffer(prettyName)
     }
   }
 }
@@ -221,12 +251,19 @@ abstract class KllSketchGetNBase
   usage = """
     _FUNC_(left, right) - Merges two sketch buffers together into one.
   """,
+  arguments = """
+    Arguments:
+      * left - The first sketch buffer to merge.
+        An expression that evaluates to a binary.
+      * right - The second sketch buffer to merge.
+        An expression that evaluates to a binary.
+  """,
   examples = """
     Examples:
       > SELECT LENGTH(kll_sketch_to_string_bigint(_FUNC_(kll_sketch_agg_bigint(col), kll_sketch_agg_bigint(col)))) > 0 FROM VALUES (1), (2), (3), (4), (5) tab(col);
        true
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchMergeBigint(left: Expression, right: Expression) extends KllSketchMergeBase {
   override def withNewChildrenInternal(newLeft: Expression, newRight: Expression): Expression =
@@ -241,8 +278,8 @@ case class KllSketchMergeBigint(left: Expression, right: Expression) extends Kll
       leftSketch.merge(rightSketch)
       leftSketch.toByteArray
     } catch {
-      case e: Exception =>
-        throw QueryExecutionErrors.kllSketchIncompatibleMergeError(prettyName, e.getMessage)
+      case _: Exception =>
+        throw QueryExecutionErrors.kllInvalidInputSketchBuffer(prettyName)
     }
   }
 }
@@ -252,12 +289,19 @@ case class KllSketchMergeBigint(left: Expression, right: Expression) extends Kll
   usage = """
     _FUNC_(left, right) - Merges two sketch buffers together into one.
   """,
+  arguments = """
+    Arguments:
+      * left - The first sketch buffer to merge.
+        An expression that evaluates to a binary.
+      * right - The second sketch buffer to merge.
+        An expression that evaluates to a binary.
+  """,
   examples = """
     Examples:
       > SELECT LENGTH(kll_sketch_to_string_float(_FUNC_(kll_sketch_agg_float(col), kll_sketch_agg_float(col)))) > 0 FROM VALUES (CAST(1.0 AS FLOAT)), (CAST(2.0 AS FLOAT)), (CAST(3.0 AS FLOAT)), (CAST(4.0 AS FLOAT)), (CAST(5.0 AS FLOAT)) tab(col);
        true
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchMergeFloat(left: Expression, right: Expression) extends KllSketchMergeBase {
   override def withNewChildrenInternal(newLeft: Expression, newRight: Expression): Expression =
@@ -272,8 +316,8 @@ case class KllSketchMergeFloat(left: Expression, right: Expression) extends KllS
       leftSketch.merge(rightSketch)
       leftSketch.toByteArray
     } catch {
-      case e: Exception =>
-        throw QueryExecutionErrors.kllSketchIncompatibleMergeError(prettyName, e.getMessage)
+      case _: Exception =>
+        throw QueryExecutionErrors.kllInvalidInputSketchBuffer(prettyName)
     }
   }
 }
@@ -283,12 +327,19 @@ case class KllSketchMergeFloat(left: Expression, right: Expression) extends KllS
   usage = """
     _FUNC_(left, right) - Merges two sketch buffers together into one.
   """,
+  arguments = """
+    Arguments:
+      * left - The first sketch buffer to merge.
+        An expression that evaluates to a binary.
+      * right - The second sketch buffer to merge.
+        An expression that evaluates to a binary.
+  """,
   examples = """
     Examples:
       > SELECT LENGTH(kll_sketch_to_string_double(_FUNC_(kll_sketch_agg_double(col), kll_sketch_agg_double(col)))) > 0 FROM VALUES (CAST(1.0 AS DOUBLE)), (CAST(2.0 AS DOUBLE)), (CAST(3.0 AS DOUBLE)), (CAST(4.0 AS DOUBLE)), (CAST(5.0 AS DOUBLE)) tab(col);
        true
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchMergeDouble(left: Expression, right: Expression) extends KllSketchMergeBase {
   override def withNewChildrenInternal(newLeft: Expression, newRight: Expression): Expression =
@@ -303,8 +354,8 @@ case class KllSketchMergeDouble(left: Expression, right: Expression) extends Kll
       leftSketch.merge(rightSketch)
       leftSketch.toByteArray
     } catch {
-      case e: Exception =>
-        throw QueryExecutionErrors.kllSketchIncompatibleMergeError(prettyName, e.getMessage)
+      case _: Exception =>
+        throw QueryExecutionErrors.kllInvalidInputSketchBuffer(prettyName)
     }
   }
 }
@@ -326,13 +377,24 @@ abstract class KllSketchMergeBase
     desired quantile given the input rank. The desired quantile can either be a single value
     or an array. In the latter case, the function will return an array of results of equal
     length to the input array.
+    A NULL sketch, scalar NULL rank, or NULL rank array returns NULL.
+    When a rank array already has element type DOUBLE, NULL elements are treated as 0.0, requesting
+    the minimum quantile. A NULL-containing array that needs an implicit element cast fails
+    analysis. For example, SQL array(0.5D, NULL) is accepted, but array(0.5, NULL) fails.
+  """,
+  arguments = """
+    Arguments:
+      * left - The sketch buffer to extract the quantile from.
+        An expression that evaluates to a binary.
+      * right - The input rank, or array of ranks, to compute the quantile for.
+        An expression that evaluates to a double or array. Must be a constant.
   """,
   examples = """
     Examples:
       > SELECT _FUNC_(kll_sketch_agg_bigint(col), 0.5) > 1 FROM VALUES (1), (2), (3), (4), (5) tab(col);
        true
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchGetQuantileBigint(left: Expression, right: Expression)
     extends KllSketchGetQuantileBase {
@@ -358,13 +420,24 @@ case class KllSketchGetQuantileBigint(left: Expression, right: Expression)
     desired quantile given the input rank. The desired quantile can either be a single value
     or an array. In the latter case, the function will return an array of results of equal
     length to the input array.
+    A NULL sketch, scalar NULL rank, or NULL rank array returns NULL.
+    When a rank array already has element type DOUBLE, NULL elements are treated as 0.0, requesting
+    the minimum quantile. A NULL-containing array that needs an implicit element cast fails
+    analysis. For example, SQL array(0.5D, NULL) is accepted, but array(0.5, NULL) fails.
+  """,
+  arguments = """
+    Arguments:
+      * left - The sketch buffer to extract the quantile from.
+        An expression that evaluates to a binary.
+      * right - The input rank, or array of ranks, to compute the quantile for.
+        An expression that evaluates to a double or array. Must be a constant.
   """,
   examples = """
     Examples:
       > SELECT _FUNC_(kll_sketch_agg_float(col), 0.5) > 1 FROM VALUES (CAST(1.0 AS FLOAT)), (CAST(2.0 AS FLOAT)), (CAST(3.0 AS FLOAT)), (CAST(4.0 AS FLOAT)), (CAST(5.0 AS FLOAT)) tab(col);
        true
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchGetQuantileFloat(left: Expression, right: Expression)
     extends KllSketchGetQuantileBase {
@@ -390,13 +463,24 @@ case class KllSketchGetQuantileFloat(left: Expression, right: Expression)
     desired quantile given the input rank. The desired quantile can either be a single value
     or an array. In the latter case, the function will return an array of results of equal
     length to the input array.
+    A NULL sketch, scalar NULL rank, or NULL rank array returns NULL.
+    When a rank array already has element type DOUBLE, NULL elements are treated as 0.0, requesting
+    the minimum quantile. A NULL-containing array that needs an implicit element cast fails
+    analysis. For example, SQL array(0.5D, NULL) is accepted, but array(0.5, NULL) fails.
+  """,
+  arguments = """
+    Arguments:
+      * left - The sketch buffer to extract the quantile from.
+        An expression that evaluates to a binary.
+      * right - The input rank, or array of ranks, to compute the quantile for.
+        An expression that evaluates to a double or array. Must be a constant.
   """,
   examples = """
     Examples:
       > SELECT _FUNC_(kll_sketch_agg_double(col), 0.5) > 1 FROM VALUES (CAST(1.0 AS DOUBLE)), (CAST(2.0 AS DOUBLE)), (CAST(3.0 AS DOUBLE)), (CAST(4.0 AS DOUBLE)), (CAST(5.0 AS DOUBLE)) tab(col);
        true
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchGetQuantileDouble(left: Expression, right: Expression)
     extends KllSketchGetQuantileBase {
@@ -456,12 +540,12 @@ abstract class KllSketchGetQuantileBase
     } catch {
       case e: org.apache.datasketches.common.SketchesArgumentException =>
         if (e.getMessage.contains("normalized rank")) {
-          throw QueryExecutionErrors.kllSketchInvalidQuantileRangeError(prettyName, rankForError)
+          throw QueryExecutionErrors.kllSketchInvalidQuantileRangeError(prettyName)
         } else {
-          throw QueryExecutionErrors.kllSketchInvalidInputError(prettyName, e.getMessage)
+          throw QueryExecutionErrors.kllInvalidInputSketchBuffer(prettyName)
         }
-      case e: Exception =>
-        throw QueryExecutionErrors.kllSketchInvalidInputError(prettyName, e.getMessage)
+      case _: Exception =>
+        throw QueryExecutionErrors.kllInvalidInputSketchBuffer(prettyName)
     }
   }
 
@@ -492,7 +576,7 @@ abstract class KllSketchGetQuantileBase
 
   override def dataType: DataType = {
     right.dataType match {
-      case ArrayType(_, _) => ArrayType(outputDataType, false)
+      case ArrayType(_, _) => ArrayType(outputDataType, containsNull = false)
       case _ => outputDataType
     }
   }
@@ -522,13 +606,24 @@ abstract class KllSketchGetQuantileBase
     desired rank given the input quantile. The desired rank can either be a single value
     or an array. In the latter case, the function will return an array of results of equal
     length to the input array.
+    A NULL sketch, scalar NULL quantile, or NULL quantile array returns NULL.
+    When a quantile array already has element type BIGINT, NULL elements are treated as zero,
+    returning the rank of zero. A NULL-containing array that needs an implicit element cast fails
+    analysis. For example, SQL array(3L, NULL) is accepted, but array(3, NULL) fails.
+  """,
+  arguments = """
+    Arguments:
+      * left - The sketch buffer to extract the rank from.
+        An expression that evaluates to a binary.
+      * right - The input quantile, or array of quantiles, to compute the rank for.
+        An expression that evaluates to a long or array. Must be a constant.
   """,
   examples = """
     Examples:
       > SELECT _FUNC_(kll_sketch_agg_bigint(col), 3) > 0.3 FROM VALUES (1), (2), (3), (4), (5) tab(col);
        true
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchGetRankBigint(left: Expression, right: Expression)
     extends KllSketchGetRankBase {
@@ -550,13 +645,24 @@ case class KllSketchGetRankBigint(left: Expression, right: Expression)
     desired rank given the input quantile. The desired rank can either be a single value
     or an array. In the latter case, the function will return an array of results of equal
     length to the input array.
+    A NULL sketch, scalar NULL quantile, or NULL quantile array returns NULL.
+    When a quantile array already has element type FLOAT, NULL elements are treated as zero,
+    returning the rank of zero. A NULL-containing array that needs an implicit element cast fails
+    analysis. For example, SQL array(3.0F, NULL) is accepted, but array(3.0, NULL) fails.
+  """,
+  arguments = """
+    Arguments:
+      * left - The sketch buffer to extract the rank from.
+        An expression that evaluates to a binary.
+      * right - The input quantile, or array of quantiles, to compute the rank for.
+        An expression that evaluates to a float or array. Must be a constant.
   """,
   examples = """
     Examples:
       > SELECT _FUNC_(kll_sketch_agg_float(col), 3.0) > 0.3 FROM VALUES (CAST(1.0 AS FLOAT)), (CAST(2.0 AS FLOAT)), (CAST(3.0 AS FLOAT)), (CAST(4.0 AS FLOAT)), (CAST(5.0 AS FLOAT)) tab(col);
        true
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchGetRankFloat(left: Expression, right: Expression)
     extends KllSketchGetRankBase {
@@ -578,13 +684,24 @@ case class KllSketchGetRankFloat(left: Expression, right: Expression)
     desired rank given the input quantile. The desired rank can either be a single value
     or an array. In the latter case, the function will return an array of results of equal
     length to the input array.
+    A NULL sketch, scalar NULL quantile, or NULL quantile array returns NULL.
+    When a quantile array already has element type DOUBLE, NULL elements are treated as zero,
+    returning the rank of zero. A NULL-containing array that needs an implicit element cast fails
+    analysis. For example, SQL array(3.0D, NULL) is accepted, but array(3.0, NULL) fails.
+  """,
+  arguments = """
+    Arguments:
+      * left - The sketch buffer to extract the rank from.
+        An expression that evaluates to a binary.
+      * right - The input quantile, or array of quantiles, to compute the rank for.
+        An expression that evaluates to a double or array. Must be a constant.
   """,
   examples = """
     Examples:
       > SELECT _FUNC_(kll_sketch_agg_double(col), 3.0) > 0.3 FROM VALUES (CAST(1.0 AS DOUBLE)), (CAST(2.0 AS DOUBLE)), (CAST(3.0 AS DOUBLE)), (CAST(4.0 AS DOUBLE)), (CAST(5.0 AS DOUBLE)) tab(col);
        true
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "4.1.0")
 case class KllSketchGetRankDouble(left: Expression, right: Expression)
     extends KllSketchGetRankBase {
@@ -617,8 +734,8 @@ abstract class KllSketchGetRankBase
     try {
       operation
     } catch {
-      case e: Exception =>
-        throw QueryExecutionErrors.kllSketchInvalidInputError(prettyName, e.getMessage)
+      case _: Exception =>
+        throw QueryExecutionErrors.kllInvalidInputSketchBuffer(prettyName)
     }
   }
 
@@ -657,7 +774,7 @@ abstract class KllSketchGetRankBase
   }
   override def dataType: DataType = {
     right.dataType match {
-      case ArrayType(_, _) => ArrayType(DoubleType, false)
+      case ArrayType(_, _) => ArrayType(DoubleType, containsNull = false)
       case _ => DoubleType
     }
   }

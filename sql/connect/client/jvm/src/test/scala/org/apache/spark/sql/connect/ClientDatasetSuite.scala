@@ -22,7 +22,6 @@ import java.util.concurrent.atomic.AtomicLong
 
 import io.grpc.Server
 import io.grpc.inprocess.{InProcessChannelBuilder, InProcessServerBuilder}
-import org.scalatest.BeforeAndAfterEach
 
 import org.apache.spark.connect.proto
 import org.apache.spark.sql.Column
@@ -35,7 +34,7 @@ import org.apache.spark.util.SparkSerDeUtils
 // - sample fraction: simple.sample(0.1)
 // - sample withReplacement_fraction: simple.sample(withReplacement = true, 0.11)
 // Add tests for exceptions thrown
-class ClientDatasetSuite extends ConnectFunSuite with BeforeAndAfterEach {
+class ClientDatasetSuite extends ConnectFunSuite {
 
   private var server: Server = _
   private var service: DummySparkConnectService = _
@@ -177,6 +176,64 @@ class ClientDatasetSuite extends ConnectFunSuite with BeforeAndAfterEach {
     intercept[IllegalArgumentException] {
       df.groupBy().pivot(Column("c"), Seq(Column("col")))
     }
+  }
+
+  test("BIN BY preserves bound columns and optional fields") {
+    val df = ss.newDataFrame(_ => ())
+    val end = df("end")
+    val binWidth = expr("INTERVAL 5 MINUTES")
+    val values = Array(df("value"), df("value2"))
+    val default = df
+      .binBy(
+        rangeStart = df("start"),
+        rangeEnd = end,
+        binWidth = binWidth,
+        distributeUniform = values)
+      .plan
+      .getRoot
+      .getBinBy
+    assert(default.getInput == df.plan.getRoot)
+    assert(
+      default.getRangeStart.getUnresolvedAttribute.getPlanId == df.plan.getRoot.getCommon.getPlanId)
+    assert(default.getRangeEnd == toExpr(end))
+    assert(default.getBinWidth == toExpr(binWidth))
+    assert(default.getDistributeUniformCount == 2)
+    assert(default.getDistributeUniform(0) == toExpr(values(0)))
+    assert(default.getDistributeUniform(1) == toExpr(values(1)))
+    assert(
+      !default.hasAlignTo && !default.hasBinStartName && !default.hasBinEndName &&
+        !default.hasBinDistributeRatioName)
+
+    val renamed = df
+      .binBy(
+        rangeStart = df("start"),
+        rangeEnd = end,
+        binWidth = binWidth,
+        distributeUniform = values,
+        alignTo = null,
+        binStartName = "bin.start",
+        binEndName = "bin`end",
+        binDistributeRatioName = "")
+      .plan
+      .getRoot
+      .getBinBy
+    assert(renamed.getBinStartName == "bin.start")
+    assert(renamed.getBinEndName == "bin`end")
+    assert(renamed.hasBinDistributeRatioName && renamed.getBinDistributeRatioName.isEmpty)
+    assert(!renamed.hasAlignTo)
+
+    val origin = lit(null).cast("timestamp")
+    val aligned = df
+      .binBy(
+        rangeStart = df("start"),
+        rangeEnd = end,
+        binWidth = binWidth,
+        distributeUniform = Array(df("value")),
+        alignTo = origin)
+      .plan
+      .getRoot
+      .getBinBy
+    assert(aligned.hasAlignTo && aligned.getAlignTo == toExpr(origin))
   }
 
   test("serialize as null") {

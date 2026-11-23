@@ -20,6 +20,7 @@ package org.apache.spark.sql.catalyst.expressions.codegen
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
+import org.apache.spark.sql.catalyst.types.ops.TypeOps
 import org.apache.spark.sql.types._
 
 /**
@@ -36,8 +37,15 @@ object GenerateUnsafeProjection extends CodeGenerator[Seq[Expression], UnsafePro
   case class Schema(dataType: DataType, nullable: Boolean)
 
   /** Returns true iff we support this data type. */
-  def canSupport(dataType: DataType): Boolean = UserDefinedType.sqlType(dataType) match {
+  def canSupport(dataType: DataType): Boolean = {
+    val sqlType = UserDefinedType.sqlType(dataType)
+    TypeOps(sqlType).flatMap(_.rowRepresentationType).map(canSupport)
+      .getOrElse(canSupportDefault(sqlType))
+  }
+
+  private def canSupportDefault(dataType: DataType): Boolean = dataType match {
     case NullType => true
+    case _: AnyTimestampNanoType => true
     case _: AtomicType => true
     case _: CalendarIntervalType => true
     case t: StructType => t.forall(field => canSupport(field.dataType))
@@ -81,6 +89,42 @@ object GenerateUnsafeProjection extends CodeGenerator[Seq[Expression], UnsafePro
      """.stripMargin
   }
 
+  /**
+   * Returns a single `writeNullable` call that subsumes the
+   * `if (isNull) { setNullAt } else { write }` pattern, or None when the pattern must be kept:
+   * either the data type is stored as a nested row (struct/array/map), or the value is a
+   * non-trivial expression that must stay inside the non-null branch so it is only evaluated for
+   * non-null inputs. Collapsing the null check keeps the generated code small: row writes of
+   * nullable columns are emitted for every key/row written by aggregates, sorts, exchanges, etc.
+   */
+  private def nullableWriteCall(
+      input: ExprCode,
+      index: Int,
+      dt: DataType,
+      rowWriter: String): Option[String] = {
+    val valueIsCheap = input.value match {
+      case _: VariableValue | _: GlobalValue | _: LiteralValue => true
+      case _ => false
+    }
+    if (!valueIsCheap) {
+      None
+    } else {
+      // Match the data type the same way `writeElement` does, so types that are stored as nested
+      // rows keep the if/else form.
+      dt match {
+        case _: StructType | _: ArrayType | _: MapType | NullType => None
+        // Framework types with a row representation are written by `writeElement` through that
+        // representation (e.g. as an InternalRow), so keep the if/else form for them.
+        case _ if TypeOps(dt).flatMap(_.rowRepresentationType).isDefined => None
+        case DecimalType.Fixed(precision, scale) =>
+          Some(s"$rowWriter.writeNullable($index, ${input.value}, ${input.isNull}, " +
+            s"$precision, $scale);")
+        case _ =>
+          Some(s"$rowWriter.writeNullable($index, ${input.value}, ${input.isNull});")
+      }
+    }
+  }
+
   private def writeExpressionsToBuffer(
       ctx: CodegenContext,
       row: String,
@@ -112,24 +156,42 @@ object GenerateUnsafeProjection extends CodeGenerator[Seq[Expression], UnsafePro
             // Can't call setNullAt() for DecimalType with precision larger than 18.
             s"$rowWriter.write($index, (Decimal) null, ${t.precision}, ${t.scale});"
           case CalendarIntervalType => s"$rowWriter.write($index, (CalendarInterval) null);"
+          case _: AnyTimestampNanoType =>
+            s"$rowWriter.write($index, (TimestampNanosVal) null);"
           case _ => s"$rowWriter.setNullAt($index);"
         }
 
         val writeField = writeElement(ctx, input.value, index.toString, dt, rowWriter)
-        if (!nullable) {
+        if (!nullable || input.isNull == FalseLiteral) {
+          // The value is statically known to be non-null, so skip the null check and the
+          // (dead) setNull branch and just write the value.
           s"""
              |${input.code}
              |${writeField.trim}
            """.stripMargin
-        } else {
+        } else if (input.isNull == TrueLiteral) {
+          // The value is statically known to be null, so only set the null bit.
           s"""
              |${input.code}
-             |if (${input.isNull}) {
-             |  ${setNull.trim}
-             |} else {
-             |  ${writeField.trim}
-             |}
+             |${setNull.trim}
            """.stripMargin
+        } else {
+          nullableWriteCall(input, index, dt, rowWriter) match {
+            case Some(writeCall) =>
+              s"""
+                 |${input.code}
+                 |$writeCall
+               """.stripMargin
+            case None =>
+              s"""
+                 |${input.code}
+                 |if (${input.isNull}) {
+                 |  ${setNull.trim}
+                 |} else {
+                 |  ${writeField.trim}
+                 |}
+               """.stripMargin
+          }
         }
     }
 
@@ -176,10 +238,19 @@ object GenerateUnsafeProjection extends CodeGenerator[Seq[Expression], UnsafePro
 
     val element = CodeGenerator.getValue(tmpInput, et, index)
 
+    val setNullElement = et match {
+      case t: DecimalType if t.precision > Decimal.MAX_LONG_DIGITS =>
+        s"$arrayWriter.write($index, (Decimal) null, ${t.precision}, ${t.scale});"
+      case CalendarIntervalType => s"$arrayWriter.write($index, (CalendarInterval) null);"
+      case _: AnyTimestampNanoType =>
+        s"$arrayWriter.write($index, (TimestampNanosVal) null);"
+      case _ => s"$arrayWriter.setNull${elementOrOffsetSize}Bytes($index);"
+    }
+
     val elementAssignment = if (containsNull) {
       s"""
          |if ($tmpInput.isNullAt($index)) {
-         |  $arrayWriter.setNull${elementOrOffsetSize}Bytes($index);
+         |  $setNullElement
          |} else {
          |  ${writeElement(ctx, element, index, et, arrayWriter)}
          |}
@@ -257,6 +328,15 @@ object GenerateUnsafeProjection extends CodeGenerator[Seq[Expression], UnsafePro
       input: String,
       index: String,
       dt: DataType,
+      writer: String): String =
+    TypeOps(dt).flatMap(_.rowRepresentationType).map(writeElement(ctx, input, index, _, writer))
+      .getOrElse(writeElementDefault(ctx, input, index, dt, writer))
+
+  private def writeElementDefault(
+      ctx: CodegenContext,
+      input: String,
+      index: String,
+      dt: DataType,
       writer: String): String = dt match {
     case t: StructType =>
       writeStructToBuffer(
@@ -279,6 +359,8 @@ object GenerateUnsafeProjection extends CodeGenerator[Seq[Expression], UnsafePro
       s"$writer.write($index, $input, $precision, $scale);"
 
     case NullType => ""
+
+    case udt: UserDefinedType[_] => writeElement(ctx, input, index, udt.sqlType, writer)
 
     case _ => s"$writer.write($index, $input);"
   }
@@ -357,10 +439,7 @@ object GenerateUnsafeProjection extends CodeGenerator[Seq[Expression], UnsafePro
          |    ${ctx.initPartition()}
          |  }
          |
-         |  // Scala.Function1 need this
-         |  public java.lang.Object apply(java.lang.Object row) {
-         |    return apply((InternalRow) row);
-         |  }
+         |  ${CodeGenerator.function1ApplyBridge(ctx.INPUT_ROW)}
          |
          |  public UnsafeRow apply(InternalRow ${ctx.INPUT_ROW}) {
          |    ${eval.code}

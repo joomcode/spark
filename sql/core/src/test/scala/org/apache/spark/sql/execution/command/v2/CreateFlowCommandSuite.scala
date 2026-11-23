@@ -25,10 +25,12 @@ import org.apache.spark.sql.catalyst.plans.logical.{
 import org.apache.spark.sql.connector.catalog.TableWritePrivilege
 import org.apache.spark.sql.execution.SparkSqlParser
 import org.apache.spark.sql.execution.command.v1.CommandSuiteBase
+import org.apache.spark.tags.DataSourceV2Test
 
 /**
  * The class contains tests for the `CREATE FLOW ...` command
  */
+@DataSourceV2Test
 class CreateFlowCommandSuite extends CommandSuiteBase with AnalysisTest {
   protected lazy val parser = new SparkSqlParser()
 
@@ -61,7 +63,7 @@ class CreateFlowCommandSuite extends CommandSuiteBase with AnalysisTest {
     val cmd = plan.asInstanceOf[CreateFlowCommand]
     assert(cmd.right == InsertIntoStatement(
       table = UnresolvedRelation(Seq("a"))
-        .requireWritePrivileges(Seq(TableWritePrivilege.INSERT, TableWritePrivilege.DELETE)),
+        .requireWritePrivileges(Set(TableWritePrivilege.INSERT, TableWritePrivilege.DELETE)),
       partitionSpec = Map("col1" -> None),
       userSpecifiedCols = Seq.empty,
       query = parser.parsePlan("SELECT col1, col2 FROM b"),

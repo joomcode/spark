@@ -29,7 +29,7 @@ import org.scalatest.time.SpanSugar._
 
 import org.apache.spark.SparkException
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.{DataFrame, Dataset, ForeachWriter, Row}
+import org.apache.spark.sql.{AnalysisException, DataFrame, Dataset, ForeachWriter, Row}
 import org.apache.spark.sql.connect.SparkSession
 import org.apache.spark.sql.connect.test.{IntegrationTestUtils, QueryTest, RemoteSparkSession}
 import org.apache.spark.sql.functions.{col, lit, udf, window}
@@ -53,6 +53,19 @@ class ClientStreamingQuerySuite extends QueryTest with RemoteSparkSession with L
       "test-data",
       "streaming")
 
+  /**
+   * Helper method to run tests with source evolution enabled. Enabling source evolution
+   * automatically forces offset log format V2 (OffsetMap) for new queries, since named sources
+   * require it.
+   */
+  private def testWithSourceEvolution(testName: String)(testFun: => Unit): Unit = {
+    test(testName) {
+      withSQLConf("spark.sql.streaming.queryEvolution.enableSourceEvolution" -> "true") {
+        testFun
+      }
+    }
+  }
+
   test("Streaming API with windowed aggregate query") {
     // This verifies standard streaming API by starting a streaming query with windowed count.
     withSQLConf(
@@ -73,7 +86,7 @@ class ClientStreamingQuerySuite extends QueryTest with RemoteSparkSession with L
         .count()
         .selectExpr("window.start as timestamp", "count as num_events")
 
-      assert(countsDF.schema.toDDL == "timestamp TIMESTAMP,num_events BIGINT NOT NULL")
+      assert(countsDF.schema.toDDL == "timestamp TIMESTAMP,num_events BIGINT")
 
       // Start the query
       val queryName = "sparkConnectStreamingQuery"
@@ -542,6 +555,8 @@ class ClientStreamingQuerySuite extends QueryTest with RemoteSparkSession with L
     // Remove the listener, length should be 1.
     spark.streams.removeListener(listener)
     assert(spark.streams.listListeners().length == 0)
+    // Wait for the executionThread to complete. See SPARK-58000.
+    Thread.sleep(5000)
   }
 
   test("listener events") {
@@ -568,6 +583,43 @@ class ClientStreamingQuerySuite extends QueryTest with RemoteSparkSession with L
         assert(!q.isActive)
         assert(listener.terminate.nonEmpty)
       }
+      spark.streams.removeListener(listener)
+      // Wait for the executionThread to complete. See SPARK-58000.
+      Thread.sleep(5000)
+    }
+  }
+
+  test("SPARK-60131: removing an unregistered listener keeps the other listeners") {
+    // The bug needs exactly one registered listener.
+    assert(spark.streams.listListeners().isEmpty)
+    val listener = new MyListener()
+    spark.streams.addListener(listener)
+
+    val q = spark.readStream
+      .format("rate")
+      .load()
+      .writeStream
+      .format("console")
+      .start()
+
+    try {
+      eventually(timeout(30.seconds)) {
+        assert(listener.progress.nonEmpty)
+      }
+
+      spark.streams.removeListener(new MyListener())
+      assert(spark.streams.listListeners().toSeq == Seq(listener))
+
+      // The registered listener still receives events.
+      val numProgress = listener.progress.length
+      eventually(timeout(30.seconds)) {
+        assert(listener.progress.length > numProgress)
+      }
+    } finally {
+      q.stop()
+      spark.streams.removeListener(listener)
+      // Wait for the executionThread to complete. See SPARK-58000.
+      Thread.sleep(5000)
     }
   }
 
@@ -604,7 +656,7 @@ class ClientStreamingQuerySuite extends QueryTest with RemoteSparkSession with L
           .sql(s"select * from $tableName")
           .collect()
           .toSeq
-        assert(rows.size > 0)
+        assert(rows.nonEmpty)
         assert(rows.map(_.getLong(1)).sum > 0)
         logInfo(s"Rows in $tableName: $rows")
       }
@@ -647,7 +699,7 @@ class ClientStreamingQuerySuite extends QueryTest with RemoteSparkSession with L
           .sql(s"select * from $tableName")
           .collect()
           .toSeq
-        assert(rows.size > 0)
+        assert(rows.nonEmpty)
         assert(rows.map(_.getLong(1)).sum > 0)
         logInfo(s"Rows in $tableName: $rows")
       }
@@ -752,6 +804,113 @@ class ClientStreamingQuerySuite extends QueryTest with RemoteSparkSession with L
     override def onQueryTerminated(event: QueryTerminatedEvent): Unit = {
       terminate = terminate :+ event.json
     }
+  }
+
+  // Tests for DataStreamReader.name() method
+  test("stream reader table source name is serialized") {
+    Seq(None, Some("orders_source")).foreach { sourceName =>
+      val reader = spark.readStream.option("maxFilesPerTrigger", "1")
+      sourceName.foreach(reader.name)
+      val read = reader.table("db.orders").plan.getRoot.getRead
+      assert(read.getIsStreaming)
+      assert(read.getNamedTable.getUnparsedIdentifier == "db.orders")
+      assert(read.getNamedTable.getOptionsMap.get("maxFilesPerTrigger") == "1")
+      assert(read.getNamedTable.hasSourceName == sourceName.isDefined)
+      sourceName.foreach(name => assert(read.getNamedTable.getSourceName == name))
+    }
+  }
+
+  testWithSourceEvolution("stream reader name() with valid source names") {
+    Seq("mySource", "my_source", "MySource123", "_private", "source_123_test", "123source")
+      .foreach { name =>
+        withTempPath { dir =>
+          val path = dir.getCanonicalPath
+          spark.range(10).write.parquet(path)
+
+          val df = spark.readStream
+            .format("parquet")
+            .schema("id LONG")
+            .name(name)
+            .load(path)
+
+          assert(df.isStreaming, s"DataFrame should be streaming for name: $name")
+        }
+      }
+  }
+
+  testWithSourceEvolution("stream reader name() method chaining") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      spark.range(10).write.parquet(path)
+
+      val df = spark.readStream
+        .format("parquet")
+        .schema("id LONG")
+        .name("my_source")
+        .option("maxFilesPerTrigger", "1")
+        .load(path)
+
+      assert(df.isStreaming, "DataFrame should be streaming")
+    }
+  }
+
+  // Seq of (sourceName, expectedExceptionClass, expectedConditionOpt)
+  val invalidSourceNames = Seq(
+    (
+      "my-source",
+      classOf[AnalysisException],
+      Some("STREAMING_QUERY_EVOLUTION_ERROR.INVALID_SOURCE_NAME")),
+    (
+      "my space",
+      classOf[AnalysisException],
+      Some("STREAMING_QUERY_EVOLUTION_ERROR.INVALID_SOURCE_NAME")),
+    (
+      "my.source",
+      classOf[AnalysisException],
+      Some("STREAMING_QUERY_EVOLUTION_ERROR.INVALID_SOURCE_NAME")),
+    ("", classOf[IllegalArgumentException], None) // empty string case
+  )
+
+  invalidSourceNames.foreach { case (sourceName, exceptionClass, conditionOpt) =>
+    test(s"stream reader invalid source name - '$sourceName'") {
+      withTempPath { dir =>
+        val path = dir.getCanonicalPath
+        spark.range(10).write.parquet(path)
+
+        val thrown = intercept[Exception] {
+          spark.readStream
+            .format("parquet")
+            .schema("id LONG")
+            .name(sourceName)
+            .load(path)
+        }
+
+        // Verify exception type
+        assert(exceptionClass.isInstance(thrown))
+
+        // Verify error condition only for AnalysisException cases
+        conditionOpt.foreach { condition =>
+          checkError(
+            exception = thrown.asInstanceOf[AnalysisException],
+            condition = condition,
+            parameters = Map("sourceName" -> sourceName))
+        }
+      }
+    }
+  }
+
+  test("withWatermark fails for nested column") {
+    val df = spark.sql(
+      "SELECT 1 as id, struct(to_timestamp('2024-01-01 10:00:00') as timestamp, 'val1' as value) " +
+        "as nested_struct")
+    val e = intercept[AnalysisException] {
+      df.withWatermark("nested_struct.timestamp", "0 seconds").schema
+    }
+    checkError(
+      e,
+      condition = "EVENT_TIME_MUST_BE_TOP_LEVEL_COLUMN",
+      parameters = Map("eventExpr" -> ".*nested_struct.*timestamp.*"),
+      matchPVals = true)
   }
 }
 

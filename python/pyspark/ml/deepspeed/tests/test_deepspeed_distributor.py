@@ -41,11 +41,12 @@ class DeepspeedTorchDistributorUnitTests(unittest.TestCase):
         os.environ[var_name] = str(default_value)
         return default_value
 
-    def _get_env_variables_distributed(self) -> Tuple[Any, Any, Any]:
+    def _get_env_variables_distributed(self) -> Tuple[Any, Any, Any, Any]:
         master_addr = self._get_env_var("MASTER_ADDR", "127.0.0.1")
         master_port = self._get_env_var("MASTER_PORT", 2000)
         rank = self._get_env_var("RANK", 0)
-        return master_addr, master_port, rank
+        rdzv_id = self._get_env_var("PYSPARK_TORCH_DISTRIBUTOR_RDZV_ID", "test-rdzv-id")
+        return master_addr, master_port, rank, rdzv_id
 
     def test_get_torchrun_args_local(self) -> None:
         number_of_processes = 5
@@ -60,12 +61,12 @@ class DeepspeedTorchDistributorUnitTests(unittest.TestCase):
 
     def test_get_torchrun_args_distributed(self) -> None:
         number_of_processes = 5
-        master_addr, master_port, rank = self._get_env_variables_distributed()
+        master_addr, master_port, rank, rdzv_id = self._get_env_variables_distributed()
         expected_torchrun_args_distributed = [
             f"--nnodes={number_of_processes}",
             f"--node_rank={rank}",
             f"--rdzv_endpoint={master_addr}:{master_port}",
-            "--rdzv_id=0",
+            f"--rdzv_id={rdzv_id}",
         ]
         torchrun_args_distributed, process_per_node = DeepspeedTorchDistributor._get_torchrun_args(
             False, number_of_processes
@@ -131,12 +132,13 @@ class DeepspeedTorchDistributorUnitTests(unittest.TestCase):
             distributed_master_address,
             distributed_master_port,
             distributed_rank,
+            distributed_rdzv_id,
         ) = self._get_env_variables_distributed()
         distributed_torchrun_args = [
             f"--nnodes={num_procs}",
             f"--node_rank={distributed_rank}",
             f"--rdzv_endpoint={distributed_master_address}:{distributed_master_port}",
-            "--rdzv_id=0",
+            f"--rdzv_id={distributed_rdzv_id}",
         ]
         with self.subTest(msg="Distributed training command verification with no extra args"):
             distributed_cmd_no_args_expected = [
@@ -192,14 +194,12 @@ def _create_pytorch_training_test_file():
     # Note: when Deepspeed CPU support becomes better,
     # switch in more realistic training files using Deepspeed
     # optimizations + constructs
-    str_to_write = textwrap.dedent(
-        """ 
+    str_to_write = textwrap.dedent(""" 
             import sys
             def pythagorean_thm(x : int, y: int): # type: ignore 
                 import deepspeed # type: ignore
                 return (x*x + y*y)**0.5 # type: ignore
-            print(pythagorean_thm(int(sys.argv[1]), int(sys.argv[2])))"""
-    )
+            print(pythagorean_thm(int(sys.argv[1]), int(sys.argv[2])))""")
     cp_path = "/tmp/test_deepspeed_training_file.py"
     with open(cp_path, "w") as f:
         f.write(str_to_write)
@@ -218,7 +218,7 @@ def _create_pytorch_training_test_file():
 class DeepspeedTorchDistributorDistributedEndToEnd(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        (cls.gpu_discovery_script_file_name, cls.mnist_dir_path) = set_up_test_dirs()  # noqa
+        cls.gpu_discovery_script_file_name, cls.mnist_dir_path = set_up_test_dirs()  # noqa
         # "loadDefaults" is set to False because if not, the SparkConf will
         # use contain configurations from the LocalEndToEnd test,
         # which causes the test to break.
@@ -290,12 +290,6 @@ class DeepspeedDistributorLocalEndToEndTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.deepspeed.tests.test_deepspeed_distributor import *  # noqa: F401,F403
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type:ignore
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

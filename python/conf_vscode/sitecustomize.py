@@ -19,14 +19,14 @@ try:
     import os
     import sys
 
-    if (
-        "DEBUGPY_ADAPTER_ENDPOINTS" in os.environ and
-        not any("debugpy" in arg for arg in sys.orig_argv)
+    if "DEBUGPY_ADAPTER_ENDPOINTS" in os.environ and not any(
+        "debugpy" in arg for arg in sys.orig_argv
     ):
 
         def install_debugpy():
-            import debugpy
             import fcntl
+
+            import debugpy
 
             lock_file = os.getenv("DEBUGPY_ADAPTER_ENDPOINTS") + ".lock"
             try:

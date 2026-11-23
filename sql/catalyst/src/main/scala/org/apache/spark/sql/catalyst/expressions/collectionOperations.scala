@@ -23,7 +23,6 @@ import scala.collection.mutable
 import scala.reflect.ClassTag
 
 import org.apache.spark.{QueryContext, SparkException, SparkIllegalArgumentException}
-import org.apache.spark.SparkException.internalError
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.{TypeCheckResult, TypeCoercion, UnresolvedAttribute, UnresolvedSeed}
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
@@ -31,6 +30,7 @@ import org.apache.spark.sql.catalyst.expressions.KnownNotContainsNull
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
+import org.apache.spark.sql.catalyst.optimizer.NormalizeFloatingNumbers
 import org.apache.spark.sql.catalyst.trees.{BinaryLike, UnaryLike}
 import org.apache.spark.sql.catalyst.trees.TreePattern.{
   ARRAYS_ZIP,
@@ -49,7 +49,7 @@ import org.apache.spark.sql.types._
 import org.apache.spark.sql.util.SQLOpenHashSet
 import org.apache.spark.unsafe.UTF8StringBuilder
 import org.apache.spark.unsafe.array.ByteArrayMethods
-import org.apache.spark.unsafe.types.{ByteArray, CalendarInterval, UTF8String}
+import org.apache.spark.unsafe.types.{ByteArray, CalendarInterval, TimestampNanosVal, UTF8String}
 
 /**
  * Base trait for [[BinaryExpression]]s with two arrays of the same element type and implicit
@@ -106,6 +106,11 @@ trait BinaryArrayExpressionWithImplicitCast
     spark.sql.legacy.sizeOfNull is true. Otherwise, it returns null for null input.
     With the default settings, the function returns null for null input.
   """,
+  arguments = """
+    Arguments:
+      * expr - The array or map whose size is returned.
+        An expression that evaluates to an array or map.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array('b', 'd', 'c', 'a'));
@@ -116,7 +121,7 @@ trait BinaryArrayExpressionWithImplicitCast
   since = "1.5.0",
   group = "collection_funcs")
 case class Size(child: Expression, legacySizeOfNull: Boolean)
-  extends UnaryExpression with ExpectsInputTypes {
+  extends UnaryExpression with ExpectsInputTypes with NoThrow {
 
   def this(child: Expression) = this(child, SQLConf.get.legacySizeOfNull)
 
@@ -162,6 +167,11 @@ object Size {
  */
 @ExpressionDescription(
   usage = "_FUNC_(expr) - Returns the size of an array. The function returns null for null input.",
+  arguments = """
+    Arguments:
+      * expr - The array to return the size of.
+        An expression that evaluates to an array.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array('b', 'd', 'c', 'a'));
@@ -186,6 +196,10 @@ case class ArraySize(child: Expression)
  */
 @ExpressionDescription(
   usage = "_FUNC_(map) - Returns an unordered array containing the keys of the map.",
+  arguments = """
+    Arguments:
+      * map - A map expression whose keys are returned as an array.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(map(1, 'a', 2, 'b'));
@@ -221,6 +235,11 @@ case class MapKeys(child: Expression)
  */
 @ExpressionDescription(
   usage = "_FUNC_(map, key) - Returns true if the map contains the key.",
+  arguments = """
+    Arguments:
+      * map - A map expression to search.
+      * key - A key to look for. Its type must match, or be coercible to, the map's key type.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(map(1, 'a', 2, 'b'), 1);
@@ -284,6 +303,13 @@ case class MapContainsKey(left: Expression, right: Expression)
     _FUNC_(a1, a2, ...) - Returns a merged array of structs in which the N-th struct contains all
     N-th values of input arrays.
   """,
+  arguments = """
+    Arguments:
+      * a1 - The first array to merge.
+        An expression that evaluates to an array.
+      * a2 - The second array to merge.
+        An expression that evaluates to an array.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 2, 3), array(2, 3, 4));
@@ -305,7 +331,7 @@ case class ArraysZip(children: Seq[Expression], names: Seq[Expression])
         case (e: NamedExpression, _) => NamePlaceholder
         case (g: GetStructField, _) => Literal(g.extractFieldName)
         case (g: GetArrayStructFields, _) => Literal(g.field.name)
-        case (g: GetMapValue, _) => Literal(g.key)
+        case (GetMapValue(_, StringLiteral(key)), _) => Literal(key)
         case (_, idx) => Literal(idx.toString)
       })
   }
@@ -476,6 +502,10 @@ object ArraysZip {
  */
 @ExpressionDescription(
   usage = "_FUNC_(map) - Returns an unordered array containing the values of the map.",
+  arguments = """
+    Arguments:
+      * map - A map expression whose values are returned as an array.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(map(1, 'a', 2, 'b'));
@@ -510,6 +540,10 @@ case class MapValues(child: Expression)
  */
 @ExpressionDescription(
   usage = "_FUNC_(map) - Returns an unordered array of all entries in the given map.",
+  arguments = """
+    Arguments:
+      * map - A map expression whose entries are returned as an array of key-value structs.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(map(1, 'a', 2, 'b'));
@@ -685,6 +719,11 @@ case class MapEntries(child: Expression)
  */
 @ExpressionDescription(
   usage = "_FUNC_(map, ...) - Returns the union of all the given maps",
+  arguments = """
+    Arguments:
+      * map - A map expression. There can be one or more of them, and all must share
+          compatible key and value types.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(map(1, 'a', 2, 'b'), map(3, 'c'));
@@ -813,6 +852,10 @@ case class MapConcat(children: Seq[Expression])
  */
 @ExpressionDescription(
   usage = "_FUNC_(arrayOfEntries) - Returns a map created from the given array of entries.",
+  arguments = """
+    Arguments:
+      * arrayOfEntries - An array of two-field key-value structs from which the map is built.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(struct(1, 'a'), struct(2, 'b')));
@@ -1049,6 +1092,13 @@ case class MapSort(base: Expression)
       elements for double/float type. Null elements will be placed at the beginning of the returned
       array in ascending order or at the end of the returned array in descending order.
   """,
+  arguments = """
+    Arguments:
+      * array - The array to sort.
+        An expression that evaluates to an array.
+      * ascendingOrder - Whether to sort in ascending order; false sorts in descending order.
+        An expression that evaluates to a boolean. Must be a constant.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array('b', 'd', null, 'c', 'a'), true);
@@ -1249,6 +1299,11 @@ case class SortArray(base: Expression, ascendingOrder: Expression)
  */
 @ExpressionDescription(
   usage = "_FUNC_(array) - Returns a random permutation of the given array.",
+  arguments = """
+    Arguments:
+      * array - The array to return a random permutation of.
+        An expression that evaluates to an array.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 20, 3, 5));
@@ -1343,21 +1398,31 @@ case class Shuffle(child: Expression, randomSeed: Option[Long] = None) extends U
 }
 
 /**
- * Returns a reversed string or an array with reverse order of elements.
+ * Returns a reversed string, a binary value with bytes in reverse order,
+ * or an array with reverse order of elements.
  */
 @ExpressionDescription(
-  usage = "_FUNC_(array) - Returns a reversed string or an array with reverse order of elements.",
+  usage = """_FUNC_(expr) - Returns a reversed string, a binary value with bytes in reverse order,
+    or an array with reverse order of elements.""",
+  arguments = """
+    Arguments:
+      * expr - The string, binary value, or array to reverse.
+        An expression that evaluates to a string, binary, or array.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_('Spark SQL');
        LQS krapS
       > SELECT _FUNC_(array(2, 1, 4, 3));
        [3,4,1,2]
+      > SELECT hex(_FUNC_(x'CAFE'));
+       FECA
   """,
   group = "collection_funcs",
   since = "1.5.0",
   note = """
     Reverse logic for arrays is available since 2.4.0.
+    Reverse logic for binary is available since 4.2.0.
   """
 )
 case class Reverse(child: Expression)
@@ -1365,8 +1430,13 @@ case class Reverse(child: Expression)
   override def nullIntolerant: Boolean = true
   // Input types are utilized by type coercion in ImplicitTypeCasts.
   override def inputTypes: Seq[AbstractDataType] =
-    Seq(TypeCollection(StringTypeWithCollation(supportsTrimCollation = true), ArrayType))
+    Seq(TypeCollection(
+      StringTypeWithCollation(supportsTrimCollation = true),
+      BinaryType,
+      ArrayType))
 
+  // Reversing a string transforms its content, so ImplicitTypeCasts promotes CHAR/VARCHAR to
+  // STRING. Array and binary inputs are unaffected.
   override def dataType: DataType = child.dataType
 
   private def resultArrayElementNullable = dataType.asInstanceOf[ArrayType].containsNull
@@ -1380,17 +1450,36 @@ case class Reverse(child: Expression)
         new GenericArrayData(arrayData.toObjectArray(elementType).reverse)
       }
     case _: StringType => _.asInstanceOf[UTF8String].reverse()
+    case BinaryType => input => input.asInstanceOf[Array[Byte]].reverse
   }
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     nullSafeCodeGen(ctx, ev, c => dataType match {
       case _: StringType => stringCodeGen(ev, c)
+      case BinaryType => binaryCodeGen(ctx, ev, c)
       case _: ArrayType => arrayCodeGen(ctx, ev, c)
     })
   }
 
   private def stringCodeGen(ev: ExprCode, childName: String): String = {
     s"${ev.value} = ($childName).reverse();"
+  }
+
+  private def binaryCodeGen(
+      ctx: CodegenContext, ev: ExprCode, childName: String): String = {
+    val input = ctx.freshName("input")
+    val len = ctx.freshName("len")
+    val result = ctx.freshName("result")
+    val i = ctx.freshName("i")
+    s"""
+       |byte[] $input = (byte[]) $childName;
+       |int $len = $input.length;
+       |byte[] $result = new byte[$len];
+       |for (int $i = 0; $i < $len; $i++) {
+       |  $result[$i] = $input[$len - 1 - $i];
+       |}
+       |${ev.value} = $result;
+     """.stripMargin
   }
 
   private def arrayCodeGen(ctx: CodegenContext, ev: ExprCode, childName: String): String = {
@@ -1427,15 +1516,26 @@ case class Reverse(child: Expression)
 /**
  * Checks if the array (left) has the element (right)
  */
+// scalastyle:off line.size.limit
 @ExpressionDescription(
-  usage = "_FUNC_(array, value) - Returns true if the array contains the value.",
+  usage = "_FUNC_(array, value) - Returns true if the array contains the value, false if not. Returns null if the array or value is null, or if the value is not found and the array contains a null element.",
+  arguments = """
+    Arguments:
+      * array - The array to search.
+        An expression that evaluates to an array.
+      * value - The value to check for membership in the array.
+        An expression of the same type as the array elements.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 2, 3), 2);
        true
+      > SELECT _FUNC_(array(1, NULL, 3), 2);
+       NULL
   """,
   group = "array_funcs",
   since = "1.5.0")
+// scalastyle:on line.size.limit
 case class ArrayContains(left: Expression, right: Expression)
   extends BinaryExpression with ImplicitCastInputTypes with Predicate
   with QueryErrorsBase {
@@ -1554,6 +1654,12 @@ case class ArrayContains(left: Expression, right: Expression)
 @ExpressionDescription(
   usage = "_FUNC_(array, value) - Return index (0-based) of the search value, " +
     "if it is contained in the array; otherwise, (-<insertion point> - 1).",
+  arguments = """
+    Arguments:
+      * array - A sorted array expression to search in.
+      * value - The value to search for. Its type must match, or be coercible to, the
+          array's element type.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 2, 3), 2);
@@ -1709,6 +1815,13 @@ trait ArrayPendBase extends RuntimeReplaceable
       Null element is also prepended to the array. But if the array passed is NULL
       output is NULL
     """,
+  arguments = """
+    Arguments:
+      * array - The array to prepend the element to.
+        An expression that evaluates to an array.
+      * element - The element to add at the beginning of the array.
+        An expression of the same type as the array elements.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array('b', 'd', 'c', 'a'), 'd');
@@ -1744,6 +1857,13 @@ case class ArrayPrepend(left: Expression, right: Expression) extends ArrayPendBa
       Null element is also appended into the array. But if the array passed, is NULL
       output is NULL
       """,
+  arguments = """
+    Arguments:
+      * array - The array to append the element to.
+        An expression that evaluates to an array.
+      * element - The element to add at the end of the array.
+        An expression of the same type as the array elements.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array('b', 'd', 'c', 'a'), 'd');
@@ -1772,6 +1892,13 @@ case class ArrayAppend(left: Expression, right: Expression) extends ArrayPendBas
 // scalastyle:off line.size.limit
 @ExpressionDescription(
   usage = "_FUNC_(a1, a2) - Returns true if a1 contains at least a non-null element present also in a2. If the arrays have no common element and they are both non-empty and either of them contains a null element null is returned, false otherwise.",
+  arguments = """
+    Arguments:
+      * a1 - The first array to compare.
+        An expression that evaluates to an array.
+      * a2 - The second array to compare.
+        An expression that evaluates to an array.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 2, 3), array(3, 4, 5));
@@ -1792,6 +1919,12 @@ case class ArraysOverlap(left: Expression, right: Expression)
 
   @transient private lazy val ordering: Ordering[Any] =
     TypeUtils.getInterpretedOrdering(elementType)
+
+  @transient private lazy val normalizeElement: Any => Any = elementType match {
+    case FloatType => NormalizeFloatingNumbers.FLOAT_NORMALIZER
+    case DoubleType => NormalizeFloatingNumbers.DOUBLE_NORMALIZER
+    case _ => identity
+  }
 
   @transient private lazy val doEvaluation = if (TypeUtils.typeWithProperEquals(elementType)) {
     fastEval _
@@ -1825,12 +1958,12 @@ case class ArraysOverlap(left: Expression, right: Expression)
         if (v == null) {
           hasNull = true
         } else {
-          smallestSet.add(v)
+          smallestSet.add(normalizeElement(v))
         })
       bigger.foreach(elementType, (_, v1) =>
         if (v1 == null) {
           hasNull = true
-        } else if (smallestSet.contains(v1)) {
+        } else if (smallestSet.contains(normalizeElement(v1))) {
           return true
         }
       )
@@ -1903,22 +2036,70 @@ case class ArraysOverlap(left: Expression, right: Expression)
     val i = ctx.freshName("i")
     val getFromSmaller = CodeGenerator.getValue(smaller, elementType, i)
     val getFromBigger = CodeGenerator.getValue(bigger, elementType, i)
+    val javaElementType = CodeGenerator.javaType(elementType)
     val javaElementClass = CodeGenerator.boxedType(elementType)
     val javaSet = classOf[java.util.HashSet[_]].getName
     val set = ctx.freshName("set")
+
+    def normalize(value: String): String = elementType match {
+      case DoubleType =>
+        s"""
+           |if (java.lang.Double.isNaN($value)) {
+           |  $value = java.lang.Double.NaN;
+           |} else if ($value == 0.0d) {
+           |  $value = 0.0d;
+           |}
+         """.stripMargin
+      case FloatType =>
+        s"""
+           |if (java.lang.Float.isNaN($value)) {
+           |  $value = java.lang.Float.NaN;
+           |} else if ($value == 0.0f) {
+           |  $value = 0.0f;
+           |}
+         """.stripMargin
+      case _ => ""
+    }
+
+    val smallerValue = ctx.freshName("smallerValue")
+    val addToSet = elementType match {
+      case FloatType | DoubleType =>
+        s"""
+           |$javaElementType $smallerValue = $getFromSmaller;
+           |${normalize(smallerValue)}
+           |$set.add($smallerValue);
+         """.stripMargin
+      case _ => s"$set.add($getFromSmaller);"
+    }
     val addToSetFromSmallerCode = nullSafeElementCodegen(
-      smaller, i, s"$set.add($getFromSmaller);", s"${ev.isNull} = true;")
+      smaller, i, addToSet, s"${ev.isNull} = true;")
     val setIsNullCode = if (nullable) s"${ev.isNull} = false;" else ""
+
+    val biggerValue = ctx.freshName("biggerValue")
+    val findInSet = elementType match {
+      case FloatType | DoubleType =>
+        s"""
+           |$javaElementType $biggerValue = $getFromBigger;
+           |${normalize(biggerValue)}
+           |if ($set.contains($biggerValue)) {
+           |  $setIsNullCode
+           |  ${ev.value} = true;
+           |  break;
+           |}
+         """.stripMargin
+      case _ =>
+        s"""
+           |if ($set.contains($getFromBigger)) {
+           |  $setIsNullCode
+           |  ${ev.value} = true;
+           |  break;
+           |}
+         """.stripMargin
+    }
     val elementIsInSetCode = nullSafeElementCodegen(
       bigger,
       i,
-      s"""
-         |if ($set.contains($getFromBigger)) {
-         |  $setIsNullCode
-         |  ${ev.value} = true;
-         |  break;
-         |}
-       """.stripMargin,
+      findInSet,
       s"${ev.isNull} = true;")
     s"""
        |$javaSet<$javaElementClass> $set = new $javaSet<$javaElementClass>();
@@ -1997,6 +2178,15 @@ case class ArraysOverlap(left: Expression, right: Expression)
 // scalastyle:off line.size.limit
 @ExpressionDescription(
   usage = "_FUNC_(x, start, length) - Subsets array x starting from index start (array indices start at 1, or starting from the end if start is negative) with the specified length.",
+  arguments = """
+    Arguments:
+      * x - The array to take a subset of.
+        An expression that evaluates to an array.
+      * start - The 1-based start index, or from the end if negative.
+        An expression that evaluates to an integer.
+      * length - The number of elements to take.
+        An expression that evaluates to an integer.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 2, 3, 4), 2, 2);
@@ -2027,49 +2217,35 @@ case class Slice(x: Expression, start: Expression, length: Expression)
     val startInt = startVal.asInstanceOf[Int]
     val lengthInt = lengthVal.asInstanceOf[Int]
     val arr = xVal.asInstanceOf[ArrayData]
-    val startIndex = if (startInt == 0) {
-      throw QueryExecutionErrors.unexpectedValueForStartInFunctionError(prettyName)
-    } else if (startInt < 0) {
-      startInt + arr.numElements()
-    } else {
-      startInt - 1
-    }
-    if (lengthInt < 0) {
-      throw QueryExecutionErrors.unexpectedValueForLengthInFunctionError(prettyName, lengthInt)
-    }
+    val startIndex = ArrayExpressionUtils.sliceStartIndex(startInt, arr.numElements(), prettyName)
+    // Resolve (and validate) the result length via the shared helper, mirroring the codegen path.
+    // Besides rejecting a negative length, this clamps the length to the elements remaining after
+    // `startIndex`. For an in-range `startIndex`, this clamp keeps `startIndex + resLength` from
+    // overflowing `Int` -- the unclamped `startIndex + lengthInt` could wrap negative and make
+    // `slice` drop all elements. An out-of-range `startIndex` (a large negative `start`) can
+    // still wrap the helper's own `numElements - startIndex`, but the guard below returns before
+    // `resLength` is used.
+    val resLength =
+      ArrayExpressionUtils.sliceLength(lengthInt, arr.numElements(), startIndex, prettyName)
     // startIndex can be negative if start is negative and its absolute value is greater than the
     // number of elements in the array
     if (startIndex < 0 || startIndex >= arr.numElements()) {
       return new GenericArrayData(Array.empty[AnyRef])
     }
     val data = arr.toSeq[AnyRef](elementType)
-    new GenericArrayData(data.slice(startIndex, startIndex + lengthInt))
+    new GenericArrayData(data.slice(startIndex, startIndex + resLength))
   }
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     nullSafeCodeGen(ctx, ev, (x, start, length) => {
       val startIdx = ctx.freshName("startIdx")
       val resLength = ctx.freshName("resLength")
-      val defaultIntValue = CodeGenerator.defaultValue(CodeGenerator.JAVA_INT, false)
+      val utils = classOf[ArrayExpressionUtils].getName
       s"""
-         |${CodeGenerator.JAVA_INT} $startIdx = $defaultIntValue;
-         |${CodeGenerator.JAVA_INT} $resLength = $defaultIntValue;
-         |if ($start == 0) {
-         |  throw QueryExecutionErrors.unexpectedValueForStartInFunctionError("$prettyName");
-         |} else if ($start < 0) {
-         |  $startIdx = $start + $x.numElements();
-         |} else {
-         |  // arrays in SQL are 1-based instead of 0-based
-         |  $startIdx = $start - 1;
-         |}
-         |if ($length < 0) {
-         |  throw QueryExecutionErrors.unexpectedValueForLengthInFunctionError(
-         |    "$prettyName", $length);
-         |} else if ($length > $x.numElements() - $startIdx) {
-         |  $resLength = $x.numElements() - $startIdx;
-         |} else {
-         |  $resLength = $length;
-         |}
+         |${CodeGenerator.JAVA_INT} $startIdx =
+         |  $utils.sliceStartIndex($start, $x.numElements(), "$prettyName");
+         |${CodeGenerator.JAVA_INT} $resLength =
+         |  $utils.sliceLength($length, $x.numElements(), $startIdx, "$prettyName");
          |${genCodeForResult(ctx, ev, x, startIdx, resLength)}
        """.stripMargin
     })
@@ -2109,6 +2285,91 @@ case class Slice(x: Expression, start: Expression, length: Expression)
 }
 
 /**
+ * Removes the last `n` elements from the given array, per the ANSI SQL `TRIM_ARRAY` function.
+ */
+@ExpressionDescription(
+  usage = """
+    _FUNC_(array, n) - Returns the given array with the last `n` elements removed. Raises an error
+      if `n` is negative or greater than the number of elements in the array.""",
+  arguments = """
+    Arguments:
+      * array - the array to trim.
+      * n - the number of elements to remove from the end of the array. Must be between 0 and the
+          number of elements in the array (inclusive).
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_(array(1, 2, 3, 4, 5), 2);
+       [1,2,3]
+      > SELECT _FUNC_(array('a', 'b', 'c'), 0);
+       ["a","b","c"]
+      > SELECT _FUNC_(array(1, 2, 3), 3);
+       []
+  """,
+  group = "array_funcs",
+  since = "4.4.0")
+case class TrimArray(left: Expression, right: Expression)
+  extends BinaryExpression with ImplicitCastInputTypes {
+  override def nullIntolerant: Boolean = true
+
+  override def prettyName: String = "trim_array"
+
+  override def dataType: DataType = left.dataType
+
+  private def resultArrayElementNullable = dataType.asInstanceOf[ArrayType].containsNull
+
+  override def inputTypes: Seq[AbstractDataType] = Seq(ArrayType, IntegerType)
+
+  @transient private lazy val elementType: DataType =
+    left.dataType.asInstanceOf[ArrayType].elementType
+
+  override def nullSafeEval(arrayVal: Any, nVal: Any): Any = {
+    val arr = arrayVal.asInstanceOf[ArrayData]
+    val n = nVal.asInstanceOf[Int]
+    val numElements = arr.numElements()
+    if (n < 0 || n > numElements) {
+      throw QueryExecutionErrors.invalidElementCountForTrimArrayError(prettyName, numElements, n)
+    }
+    val retainCount = numElements - n
+    val values = new Array[Any](retainCount)
+    for (i <- 0 until retainCount) {
+      if (!arr.isNullAt(i)) values(i) = arr.get(i, elementType)
+    }
+    new GenericArrayData(values)
+  }
+
+  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    nullSafeCodeGen(ctx, ev, (array, n) => {
+      val numElements = ctx.freshName("numElements")
+      val resLength = ctx.freshName("resLength")
+      val values = ctx.freshName("values")
+      val i = ctx.freshName("i")
+      val allocation = CodeGenerator.createArrayData(
+        values, elementType, resLength, s" $prettyName failed.")
+      val assignment = CodeGenerator.createArrayAssignment(
+        values, elementType, array, i, i, resultArrayElementNullable)
+      s"""
+         |${CodeGenerator.JAVA_INT} $numElements = $array.numElements();
+         |if ($n < 0 || $n > $numElements) {
+         |  throw QueryExecutionErrors.invalidElementCountForTrimArrayError(
+         |    "$prettyName", $numElements, $n);
+         |}
+         |${CodeGenerator.JAVA_INT} $resLength = $numElements - $n;
+         |$allocation
+         |for (int $i = 0; $i < $resLength; $i ++) {
+         |  $assignment
+         |}
+         |${ev.value} = $values;
+       """.stripMargin
+    })
+  }
+
+  override protected def withNewChildrenInternal(
+      newLeft: Expression, newRight: Expression): TrimArray =
+    copy(left = newLeft, right = newRight)
+}
+
+/**
  * Creates a String containing all the elements of the input array separated by the delimiter.
  */
 @ExpressionDescription(
@@ -2116,6 +2377,15 @@ case class Slice(x: Expression, start: Expression, length: Expression)
     _FUNC_(array, delimiter[, nullReplacement]) - Concatenates the elements of the given array
       using the delimiter and an optional string to replace nulls. If no value is set for
       nullReplacement, any null value is filtered.""",
+  arguments = """
+    Arguments:
+      * array - The array whose elements are concatenated.
+        An expression that evaluates to an array.
+      * delimiter - The delimiter placed between concatenated elements.
+        An expression that evaluates to a string.
+      * nullReplacement - The string used to replace null elements.
+        An expression that evaluates to a string.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array('hello', 'world'), ' ');
@@ -2283,16 +2553,27 @@ case class ArrayJoin(
         }
       }
     } else {
+      // When array and delimiter are both non-nullable, neither nullSafeExec wrapper above runs,
+      // so reset ev.isNull here. doGenCode initializes ev.isNull to true whenever the expression
+      // is nullable (e.g. a nullable nullReplacement), and without this reset the computed result
+      // would be discarded as NULL. When the expression is non-nullable, ev.isNull is a literal
+      // false and must not be assigned.
+      val resetIsNull = if (nullable) s"${ev.isNull} = false;" else ""
       s"""
          |${arrayGen.code}
          |${delimiterGen.code}
+         |$resetIsNull
          |$resultCode""".stripMargin
     }
   }
 
-  override def dataType: DataType = array.dataType.asInstanceOf[ArrayType].elementType
+  // After ImplicitTypeCasts, array elements that were CHAR/VARCHAR are STRING.
+  override def dataType: DataType =
+    array.dataType.asInstanceOf[ArrayType].elementType
 
   override def prettyName: String = "array_join"
+
+  override def expensive: Boolean = true
 }
 
 /**
@@ -2302,6 +2583,11 @@ case class ArrayJoin(
   usage = """
     _FUNC_(array) - Returns the minimum value in the array. NaN is greater than
     any non-NaN elements for double/float type. NULL elements are skipped.""",
+  arguments = """
+    Arguments:
+      * array - The array to find the minimum value of.
+        An expression that evaluates to an array.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 20, null, 3));
@@ -2375,6 +2661,11 @@ case class ArrayMin(child: Expression)
   usage = """
     _FUNC_(array) - Returns the maximum value in the array. NaN is greater than
     any non-NaN elements for double/float type. NULL elements are skipped.""",
+  arguments = """
+    Arguments:
+      * array - The array to find the maximum value of.
+        An expression that evaluates to an array.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 20, null, 3));
@@ -2454,6 +2745,13 @@ case class ArrayMax(child: Expression)
   usage = """
     _FUNC_(array, element) - Returns the (1-based) index of the first matching element of
       the array as long, or 0 if no match is found.
+  """,
+  arguments = """
+    Arguments:
+      * array - The array to search within.
+        An expression that evaluates to an array.
+      * element - The element to find the position of.
+        An expression of the same type as the array elements.
   """,
   examples = """
     Examples:
@@ -2557,6 +2855,13 @@ case class ArrayPosition(left: Expression, right: Expression)
     _FUNC_(array, index) - Returns element of array at given (0-based) index. If the index points
      outside of the array boundaries, then this function returns NULL.
   """,
+  arguments = """
+    Arguments:
+      * array - The array to retrieve an element from.
+        An expression that evaluates to an array.
+      * index - The 0-based index of the element to return.
+        An expression that evaluates to an integer.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 2, 3), 0);
@@ -2604,6 +2909,13 @@ case class Get(left: Expression, right: Expression)
 
     _FUNC_(map, key) - Returns value for given key. The function returns NULL if the key is not
        contained in the map.
+  """,
+  arguments = """
+    Arguments:
+      * array - The array to retrieve the element from.
+        An expression that evaluates to an array or map.
+      * index - The 1-based index of the array element, or the key of the map entry, to return.
+        An expression that evaluates to an integer for an array, or the key type for a map.
   """,
   examples = """
     Examples:
@@ -2687,9 +2999,11 @@ case class ElementAt(
   }
 
   private def nullability(elements: Seq[Expression], ordinal: Int): Boolean = {
+    // Widen `ordinal` to Long before `abs` to avoid overflow: `math.abs(Int.MinValue)`
+    // wraps back to a negative value and would bypass the out-of-bounds guard below.
     if (ordinal == 0) {
       false
-    } else if (elements.length < math.abs(ordinal)) {
+    } else if (elements.length < math.abs(ordinal.toLong)) {
       !failOnError
     } else {
       if (ordinal < 0) {
@@ -2709,27 +3023,33 @@ case class ElementAt(
   override def nullSafeEval(value: Any, ordinal: Any): Any = doElementAt(value, ordinal)
 
   @transient private lazy val doElementAt: (Any, Any) => Any = left.dataType match {
+    // ArrayType is split into ANSI (failOnError) and non-ANSI branches.
+    // Order matters: the guarded case must come first.
+    case _: ArrayType if failOnError =>
+      (value, ordinal) => {
+        val array = value.asInstanceOf[ArrayData]
+        val idx = ArrayExpressionUtils.resolveArrayIndex(
+          array.numElements(), ordinal.asInstanceOf[Int], getContextOrNull())
+        if (arrayElementNullable && array.isNullAt(idx)) null else array.get(idx, dataType)
+      }
     case _: ArrayType =>
       (value, ordinal) => {
         val array = value.asInstanceOf[ArrayData]
-        val index = ordinal.asInstanceOf[Int]
+        // Widen the index to Long before `abs` to avoid overflow: `math.abs(Int.MinValue)`
+        // wraps back to a negative value and would bypass this out-of-bounds guard.
+        val index = ordinal.asInstanceOf[Int].toLong
         if (array.numElements() < math.abs(index)) {
-          if (failOnError) {
-            throw QueryExecutionErrors.invalidElementAtIndexError(
-              index, array.numElements(), getContextOrNull())
-          } else {
-            defaultValueOutOfBound match {
-              case Some(value) => value.eval()
-              case None => null
-            }
+          defaultValueOutOfBound match {
+            case Some(value) => value.eval()
+            case None => null
           }
         } else {
           val idx = if (index == 0) {
             throw QueryExecutionErrors.invalidIndexOfZeroError(getContextOrNull())
           } else if (index > 0) {
-            index - 1
+            (index - 1).toInt
           } else {
-            array.numElements() + index
+            (array.numElements() + index).toInt
           }
           if (arrayElementNullable && array.isNullAt(idx)) {
             null
@@ -2744,12 +3064,43 @@ case class ElementAt(
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     left.dataType match {
+      // ArrayType is split into ANSI (failOnError) and non-ANSI branches.
+      // Order matters: the guarded case must come first.
+      case _: ArrayType if failOnError =>
+        nullSafeCodeGen(ctx, ev, (eval1, eval2) => {
+          val index = ctx.freshName("elementAtIndex")
+          val errorContext = getContextOrNullCode(ctx)
+          val utils = classOf[ArrayExpressionUtils].getName
+          val assignment = s"${ev.value} = ${CodeGenerator.getValue(eval1, dataType, index)};"
+          // `ev.isNull` is declared only for a nullable expression. Otherwise the index raises
+          // an error or selects an element that cannot be NULL.
+          val body = if (nullable && arrayElementNullable) {
+            s"""
+               |if ($eval1.isNullAt($index)) {
+               |  ${ev.isNull} = true;
+               |} else {
+               |  $assignment
+               |}
+             """.stripMargin
+          } else {
+            assignment
+          }
+          s"""
+             |int $index = $utils.resolveArrayIndex(
+             |  $eval1.numElements(), (int) $eval2, $errorContext);
+             |$body
+           """.stripMargin
+        })
       case _: ArrayType =>
         nullSafeCodeGen(ctx, ev, (eval1, eval2) => {
           val index = ctx.freshName("elementAtIndex")
-          val nullCheck = if (arrayElementNullable) {
+          val intIndex = ctx.freshName("elementAtIntIndex")
+          // `ev.isNull` is declared only for a nullable expression. Otherwise the index is 0, or
+          // selects an element that cannot be NULL, so neither this branch nor the out-of-bounds
+          // branch below is taken.
+          val nullCheck = if (nullable && arrayElementNullable) {
             s"""
-               |if ($eval1.isNullAt($index)) {
+               |if ($eval1.isNullAt($intIndex)) {
                |  ${ev.isNull} = true;
                |} else
              """.stripMargin
@@ -2757,25 +3108,22 @@ case class ElementAt(
             ""
           }
           val errorContext = getContextOrNullCode(ctx)
-          val indexOutOfBoundBranch = if (failOnError) {
-            // scalastyle:off line.size.limit
-            s"throw QueryExecutionErrors.invalidElementAtIndexError($index, $eval1.numElements(), $errorContext);"
-            // scalastyle:on line.size.limit
-          } else {
-            defaultValueOutOfBound match {
-              case Some(value) =>
-                val defaultValueEval = value.genCode(ctx)
-                s"""
-                  ${defaultValueEval.code}
-                  ${ev.isNull} = ${defaultValueEval.isNull};
-                  ${ev.value} = ${defaultValueEval.value};
-                """.stripMargin
-              case None => s"${ev.isNull} = true;"
-            }
+          val indexOutOfBoundBranch = defaultValueOutOfBound match {
+            case _ if !nullable => ""
+            case Some(value) =>
+              val defaultValueEval = value.genCode(ctx)
+              s"""
+                ${defaultValueEval.code}
+                ${ev.isNull} = ${defaultValueEval.isNull};
+                ${ev.value} = ${defaultValueEval.value};
+              """.stripMargin
+            case None => s"${ev.isNull} = true;"
           }
 
+          // Widen the index to long before Math.abs to avoid overflow: Math.abs(Int.MinValue)
+          // wraps back to a negative value and would bypass this out-of-bounds guard.
           s"""
-             |int $index = (int) $eval2;
+             |long $index = (long) $eval2;
              |if ($eval1.numElements() < Math.abs($index)) {
              |  $indexOutOfBoundBranch
              |} else {
@@ -2786,9 +3134,10 @@ case class ElementAt(
              |  } else {
              |    $index += $eval1.numElements();
              |  }
+             |  int $intIndex = (int) $index;
              |  $nullCheck
              |  {
-             |    ${ev.value} = ${CodeGenerator.getValue(eval1, dataType, index)};
+             |    ${ev.value} = ${CodeGenerator.getValue(eval1, dataType, intIndex)};
              |  }
              |}
            """.stripMargin
@@ -2827,6 +3176,13 @@ case class ElementAt(
     _FUNC_(map, key) - Returns value for given key. The function always returns NULL
       if the key is not contained in the map.
   """,
+  arguments = """
+    Arguments:
+      * array - The array or map to retrieve an element from.
+        An expression that evaluates to an array or map.
+      * index - The 1-based index of the array element, or the key of the map entry, to return.
+        An expression that evaluates to an integer for an array, or the key type for a map.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 2, 3), 2);
@@ -2855,6 +3211,11 @@ case class TryElementAt(left: Expression, right: Expression, replacement: Expres
  */
 @ExpressionDescription(
   usage = "_FUNC_(col1, col2, ..., colN) - Returns the concatenation of col1, col2, ..., colN.",
+  arguments = """
+    Arguments:
+      * colN - An expression to concatenate. There can be one or more of them, and all must be
+          of the same type: strings, binaries, or arrays.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_('Spark', 'SQL');
@@ -3017,10 +3378,16 @@ case class Concat(children: Seq[Expression]) extends ComplexTypeMergingExpressio
   private def genCodeForNumberOfElements(ctx: CodegenContext) : (String, String) = {
     val numElements = ctx.freshName("numElements")
     val z = ctx.freshName("z")
+    // The upper bound is checked here rather than left to the array allocation so that this path
+    // reports the same error as `eval`. Without it the allocation fails with an internal error.
     val code = s"""
         |long $numElements = 0L;
         |for (int $z = 0; $z < ${children.length}; $z++) {
         |  $numElements += args[$z].numElements();
+        |}
+        |if ($numElements > ${ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH}) {
+        |  throw QueryExecutionErrors.arrayFunctionWithElementsExceedLimitError(
+        |    "$prettyName", $numElements);
         |}
       """.stripMargin
 
@@ -3076,6 +3443,11 @@ case class Concat(children: Seq[Expression]) extends ComplexTypeMergingExpressio
  */
 @ExpressionDescription(
   usage = "_FUNC_(arrayOfArrays) - Transforms an array of arrays into a single array.",
+  arguments = """
+    Arguments:
+      * arrayOfArrays - An array whose elements are themselves arrays; they are concatenated
+          in order into one array.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(array(1, 2), array(3, 4)));
@@ -3123,7 +3495,7 @@ case class Flatten(child: Expression) extends UnaryExpression
         throw QueryExecutionErrors.arrayFunctionWithElementsExceedLimitError(
           prettyName, numberOfElements)
       }
-      val flattenedData = new Array(numberOfElements.toInt)
+      val flattenedData = new Array[Any](numberOfElements.toInt)
       var position = 0
       for (ad <- arrayData) {
         val arr = ad.toObjectArray(elementType)
@@ -3145,10 +3517,16 @@ case class Flatten(child: Expression) extends UnaryExpression
       ctx: CodegenContext,
       childVariableName: String) : (String, String) = {
     val variableName = ctx.freshName("numElements")
+    // The upper bound is checked here rather than left to the array allocation so that this path
+    // reports the same error as `eval`. Without it the allocation fails with an internal error.
     val code = s"""
       |long $variableName = 0;
       |for (int z = 0; z < $childVariableName.numElements(); z++) {
       |  $variableName += $childVariableName.getArray(z).numElements();
+      |}
+      |if ($variableName > ${ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH}) {
+      |  throw QueryExecutionErrors.arrayFunctionWithElementsExceedLimitError(
+      |    "$prettyName", $variableName);
       |}
       """.stripMargin
     (code, variableName)
@@ -3200,6 +3578,9 @@ case class Flatten(child: Expression) extends UnaryExpression
 
       Supported types are: byte, short, integer, long, date, timestamp.
 
+      The timestamp types include the nanosecond-precision timestamp types; their generated values
+      advance on the microsecond grid and keep the start value's sub-microsecond fraction.
+
       The start and stop expressions must resolve to the same type.
       If start and stop expressions resolve to the 'date' or 'timestamp' type
       then the step expression must resolve to the 'interval' or 'year-month interval' or
@@ -3208,11 +3589,14 @@ case class Flatten(child: Expression) extends UnaryExpression
   arguments = """
     Arguments:
       * start - an expression. The start of the range.
+        An expression that evaluates to an integral, date, or timestamp.
       * stop - an expression. The end the range (inclusive).
+        An expression that evaluates to an integral, date, or timestamp.
       * step - an optional expression. The step of the range.
           By default step is 1 if start is less than or equal to stop, otherwise -1.
           For the temporal sequences it's 1 day and -1 day respectively.
           If start is greater than stop then the step must be negative, and vice versa.
+        An expression that evaluates to an integral or interval.
   """,
   examples = """
     Examples:
@@ -3263,8 +3647,8 @@ case class Sequence(
 
   override def nullable: Boolean = children.exists(_.nullable)
 
-  // If step is defined, then an error will be thrown if the start and stop do not satisfy the step.
-  override lazy val throwable: Boolean = stepOpt.isDefined
+  // Can throw if step is defined and start and stop don't match or any of the children can throw.
+  override lazy val throwable: Boolean = stepOpt.isDefined || children.exists(_.throwable)
 
   override def dataType: ArrayType = ArrayType(start.dataType, containsNull = false)
 
@@ -3274,11 +3658,8 @@ case class Sequence(
     val typesCorrect =
       DataTypeUtils.sameType(startType, stop.dataType) &&
         (startType match {
-          case TimestampType | TimestampNTZType =>
-            stepOpt.isEmpty || CalendarIntervalType.acceptsType(stepType) ||
-              YearMonthIntervalType.acceptsType(stepType) ||
-              DayTimeIntervalType.acceptsType(stepType)
-          case DateType =>
+          case TimestampType | TimestampNTZType | DateType |
+              _: TimestampNTZNanosType | _: TimestampLTZNanosType =>
             stepOpt.isEmpty || CalendarIntervalType.acceptsType(stepType) ||
               YearMonthIntervalType.acceptsType(stepType) ||
               DayTimeIntervalType.acceptsType(stepType)
@@ -3294,7 +3675,8 @@ case class Sequence(
         errorSubClass = "SEQUENCE_WRONG_INPUT_TYPES",
         messageParameters = Map(
           "functionName" -> toSQLId(prettyName),
-          "startType" -> toSQLType(TypeCollection(TimestampType, TimestampNTZType, DateType)),
+          "startType" -> toSQLType(
+            TypeCollection(TimestampType, TimestampNTZType, AnyTimestampNanoType, DateType)),
           "stepType" -> toSQLType(
             TypeCollection(CalendarIntervalType, YearMonthIntervalType, DayTimeIntervalType)),
           "otherStartType" -> toSQLType(IntegralType)
@@ -3321,16 +3703,24 @@ case class Sequence(
       val physicalDataType = PhysicalDataType(iType)
       type T = physicalDataType.InternalType
       val integral = PhysicalIntegralType.integral(iType)
-      val ct = ClassTag[T](physicalDataType.tag.mirror.runtimeClass(physicalDataType.tag.tpe))
+      val ct = physicalDataType.tag
       new IntegralSequenceImpl[T](iType)(ct, integral.asInstanceOf[Integral[T]])
 
-    case TimestampType | TimestampNTZType =>
+    case TimestampType | TimestampNTZType |
+        _: TimestampLTZNanosType | _: TimestampNTZNanosType =>
+      // A nanosecond sequence reuses the microsecond machinery on epochMicros, so map each nanos
+      // type to its microsecond counterpart (which drives zone-aware interval addition).
+      val outerType: DataType = start.dataType match {
+        case _: TimestampLTZNanosType => TimestampType
+        case _: TimestampNTZNanosType => TimestampNTZType
+        case other => other
+      }
       if (stepOpt.isEmpty || CalendarIntervalType.acceptsType(stepOpt.get.dataType)) {
-        new TemporalSequenceImpl[Long](LongType, start.dataType, 1, identity, zoneId)
+        new TemporalSequenceImpl[Long](LongType, outerType, 1, identity, zoneId)
       } else if (YearMonthIntervalType.acceptsType(stepOpt.get.dataType)) {
-        new PeriodSequenceImpl[Long](LongType, start.dataType, 1, identity, zoneId)
+        new PeriodSequenceImpl[Long](LongType, outerType, 1, identity, zoneId)
       } else {
-        new DurationSequenceImpl[Long](LongType, start.dataType, 1, identity, zoneId)
+        new DurationSequenceImpl[Long](LongType, outerType, 1, identity, zoneId)
       }
 
     case DateType =>
@@ -3343,29 +3733,119 @@ case class Sequence(
       }
   }
 
+  private def isNanos: Boolean = start.dataType.isInstanceOf[AnyTimestampNanoType]
+
   override def eval(input: InternalRow): Any = {
     val startVal = start.eval(input)
     if (startVal == null) return null
     val stopVal = stop.eval(input)
     if (stopVal == null) return null
-    val stepVal = stepOpt.map(_.eval(input)).getOrElse(impl.defaultStep(startVal, stopVal))
-    if (stepVal == null) return null
 
-    ArrayData.toArrayData(impl.eval(startVal, stopVal, stepVal))
+    if (isNanos) {
+      // The sequence runs on epochMicros and every element carries the start value's fraction.
+      // The step sign and the microsecond bound honor the endpoints' fractions (an out-of-order
+      // same-microsecond pair still raises the boundary error), and a final full-precision check
+      // drops an endpoint the micros-only bound cannot exclude, so the result never overshoots
+      // stop. See nanosStepIsNegative / nanosBoundedStopMicros.
+      val startNanos = startVal.asInstanceOf[TimestampNanosVal]
+      val stopNanos = stopVal.asInstanceOf[TimestampNanosVal]
+      val startMicros = startNanos.epochMicros
+      val startFrac = startNanos.nanosWithinMicro.toInt
+      // Default step sign comes from the full-precision comparison: defaultStep picks the positive
+      // unit when its first arg <= second, so pass (compareTo, 0) => ascending iff start <= stop.
+      val stepVal = stepOpt.map(_.eval(input)).getOrElse {
+        impl.defaultStep(startNanos.compareTo(stopNanos).toLong, 0L)
+      }
+      if (stepVal == null) return null
+      val stepNegative = Sequence.nanosStepIsNegative(stepVal)
+      val stopMicros = Sequence.nanosBoundedStopMicros(
+        startFrac, stopNanos.epochMicros, stopNanos.nanosWithinMicro.toInt, stepNegative)
+      val microsArr = impl.eval(startMicros, stopMicros, stepVal).asInstanceOf[Array[Long]]
+      val out = new Array[TimestampNanosVal](microsArr.length)
+      var i = 0
+      while (i < microsArr.length) {
+        // startFrac is already a valid fraction, so skip the per-element range check.
+        out(i) = TimestampNanosVal.fromTrustedRowBytes(microsArr(i), startFrac.toShort)
+        i += 1
+      }
+      // Membership is decided on the microsecond grid, but every element carries startFrac, so the
+      // element landing on stop's microsecond can still fall outside [start, stop] when the
+      // fractions differ (calendar/day/month and default steps use the while-loop machinery, whose
+      // micro-nudged bound cannot drop it). Only that endpoint element can be out of range, so
+      // compare it against stop in full precision and drop it if it overshoots.
+      val n = out.length
+      val trimmed =
+        if (n > 0 && (if (stepNegative) out(n - 1).compareTo(stopNanos) < 0
+                      else out(n - 1).compareTo(stopNanos) > 0)) {
+          out.slice(0, n - 1)
+        } else {
+          out
+        }
+      ArrayData.toArrayData(trimmed)
+    } else {
+      val stepVal = stepOpt.map(_.eval(input)).getOrElse(impl.defaultStep(startVal, stopVal))
+      if (stepVal == null) return null
+      ArrayData.toArrayData(impl.eval(startVal, stopVal, stepVal))
+    }
   }
 
   override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     val startGen = start.genCode(ctx)
     val stopGen = stop.genCode(ctx)
+    // Nanosecond endpoints box as TimestampNanosVal; the default-step sign uses the full-precision
+    // comparison (compareTo(start, stop) <= 0 => ascending), and the sequence math runs on
+    // epochMicros before each element is re-wrapped with the start value's fraction.
+    val (defaultStepStart, defaultStepStop) = if (isNanos) {
+      (startGen.copy(value =
+        JavaCode.expression(s"${startGen.value}.compareTo(${stopGen.value})", IntegerType)),
+        stopGen.copy(value = JavaCode.expression("0", IntegerType)))
+    } else {
+      (startGen, stopGen)
+    }
     val stepGen = stepOpt.map(_.genCode(ctx)).getOrElse(
-      impl.defaultStep.genCode(ctx, startGen, stopGen))
+      impl.defaultStep.genCode(ctx, defaultStepStart, defaultStepStop))
 
     val resultType = CodeGenerator.javaType(dataType)
-    val resultCode = {
+    val resultCode = if (isNanos) {
+      val microsArr = ctx.freshName("microsArr")
+      val nanosArr = ctx.freshName("nanosArr")
+      val startFrac = ctx.freshName("startFrac")
+      val startMicros = ctx.freshName("startMicros")
+      val stopMicros = ctx.freshName("stopMicros")
+      val stepNeg = ctx.freshName("stepNeg")
+      val idx = ctx.freshName("idx")
+      val tnv = classOf[TimestampNanosVal].getName
+      val genericArr = "org.apache.spark.sql.catalyst.util.GenericArrayData"
+      val seqObj = classOf[Sequence].getName + "$.MODULE$"
+      val microsGen = impl.genCode(ctx, startMicros, stopMicros, stepGen.value, microsArr, "long")
+      s"""
+         |long $startMicros = ${startGen.value}.epochMicros;
+         |short $startFrac = ${startGen.value}.nanosWithinMicro;
+         |boolean $stepNeg = $seqObj.nanosStepIsNegative(${stepGen.value});
+         |long $stopMicros = $seqObj.nanosBoundedStopMicros(
+         |  $startFrac, ${stopGen.value}.epochMicros, ${stopGen.value}.nanosWithinMicro, $stepNeg);
+         |long[] $microsArr = null;
+         |$microsGen
+         |$tnv[] $nanosArr = new $tnv[$microsArr.length];
+         |for (int $idx = 0; $idx < $microsArr.length; $idx++) {
+         |  // startFrac is already a valid fraction, so skip the per-element range check.
+         |  $nanosArr[$idx] = $tnv.fromTrustedRowBytes($microsArr[$idx], $startFrac);
+         |}
+         |// The endpoint landing on stop's microsecond carries startFrac and can overshoot stop
+         |// when the fractions differ; the micros-only bound cannot always drop it (see the eval
+         |// path). Only the last element can be out of range, so drop it with a full-precision cmp.
+         |if ($nanosArr.length > 0 &&
+         |    ($stepNeg ? $nanosArr[$nanosArr.length - 1].compareTo(${stopGen.value}) < 0
+         |              : $nanosArr[$nanosArr.length - 1].compareTo(${stopGen.value}) > 0)) {
+         |  $nanosArr = ($tnv[]) java.util.Arrays.copyOf($nanosArr, $nanosArr.length - 1);
+         |}
+         |${ev.value} = new $genericArr($nanosArr);
+       """.stripMargin
+    } else {
       val arr = ctx.freshName("arr")
       val arrElemType = CodeGenerator.javaType(dataType.elementType)
       s"""
-         |final $arrElemType[] $arr = null;
+         |$arrElemType[] $arr = null;
          |${impl.genCode(ctx, startGen.value, stopGen.value, stepGen.value, arr, arrElemType)}
          |${ev.value} = UnsafeArrayData.fromPrimitiveArray($arr);
        """.stripMargin
@@ -3422,16 +3902,49 @@ object Sequence {
       }
       len.toInt
     } catch {
-      // We handle overflows in the previous try block by raising an appropriate exception.
+      // An overflow in the previous try block does not by itself mean the sequence is too long:
+      // `stop - start` can exceed the `Long` range while a large `step` still yields only a few
+      // elements. Recompute the length exactly and reject it only if it really cannot be
+      // allocated, otherwise return it.
       case _: ArithmeticException =>
         val safeLen =
           BigInt(1) + (BigInt(stop) - BigInt(start)) / BigInt(step)
         if (safeLen > ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH) {
           throw QueryExecutionErrors.createArrayWithElementsExceedLimitError(prettyName, safeLen)
         }
-        throw internalError("Unreachable code reached.")
+        // The check above bounds `safeLen` by `MAX_ROUNDED_ARRAY_LENGTH`, and the caller has
+        // already rejected boundaries whose step points the wrong way, so `safeLen` is positive
+        // and `toInt` is exact.
+        safeLen.toInt
       case e: Exception => throw e
     }
+  }
+
+  /**
+   * The microsecond bound handed to the microsecond sequence machinery for a nanosecond sequence.
+   * Every generated element lands on the microsecond grid and carries `startFrac`, so an element
+   * that falls exactly on `stopMicros` should be kept only when `startFrac` does not carry it past
+   * `stop` in the step's direction; nudging the bound one microsecond off the boundary drops it on
+   * the count-based micros path and makes the machinery reject an out-of-order same-microsecond
+   * pair. The nudge cannot express that drop on the while-loop path (calendar/day/month and default
+   * steps), so the endpoint is finalized by a full-precision `compareTo` against `stop` in
+   * `eval` / `doGenCode`; this bound only has to be right for sizing and the boundary error.
+   */
+  def nanosBoundedStopMicros(
+      startFrac: Int, stopMicros: Long, stopFrac: Int, stepNegative: Boolean): Long = {
+    if (startFrac == stopFrac) stopMicros
+    else if (stepNegative) if (startFrac < stopFrac) stopMicros + 1 else stopMicros
+    else if (startFrac > stopFrac) stopMicros - 1 else stopMicros
+  }
+
+  /** Whether a sequence step points backwards, matching the microsecond machinery's sign rule. */
+  def nanosStepIsNegative(step: Any): Boolean = step match {
+    case ci: CalendarInterval =>
+      val totalMicros =
+        ci.months.toLong * (28 * MICROS_PER_DAY) + ci.days.toLong * MICROS_PER_DAY + ci.microseconds
+      totalMicros < 0
+    case months: Int => months < 0
+    case micros: Long => micros < 0
   }
 
   private type LessThanOrEqualFn = (Any, Any) => Boolean
@@ -3817,14 +4330,20 @@ object Sequence {
       estimatedStep: String,
       len: String): String = {
     val calcFn = classOf[Sequence].getName + ".sequenceLength"
+    // `$start` and `$stop` are numeric expressions and `$step` is numeric or a
+    // CalendarInterval reference, so they have to be converted before going into a
+    // `Map<String, String>`. Janino, which compiles the generated code, erases the type
+    // arguments and binds `put` to `put(Object, Object)`, which lets the raw values through
+    // and leaves the parameter map holding non-String values that
+    // `SparkThrowable.getMessageParameters` then hands out as Strings.
     s"""
        |if (!(($estimatedStep > 0 && $start <= $stop) ||
        |  ($estimatedStep < 0 && $start >= $stop) ||
        |  ($estimatedStep == 0 && $start == $stop))) {
        |  java.util.Map<String, String> params = new java.util.HashMap<String, String>();
-       |  params.put("start", $start);
-       |  params.put("stop", $stop);
-       |  params.put("step", $step);
+       |  params.put("start", String.valueOf($start));
+       |  params.put("stop", String.valueOf($stop));
+       |  params.put("step", String.valueOf($step));
        |  throw new org.apache.spark.SparkIllegalArgumentException(
        |    "_LEGACY_ERROR_TEMP_3243", params);
        |}
@@ -3838,6 +4357,13 @@ object Sequence {
  */
 @ExpressionDescription(
   usage = "_FUNC_(element, count) - Returns the array containing element count times.",
+  arguments = """
+    Arguments:
+      * element - The element to repeat.
+        An expression of any type.
+      * count - The number of times to repeat the element.
+        An expression that evaluates to an integer.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_('123', 2);
@@ -3910,8 +4436,14 @@ case class ArrayRepeat(left: Expression, right: Expression)
 
   private def genCodeForNumberOfElements(ctx: CodegenContext, count: String): (String, String) = {
     val numElements = ctx.freshName("numElements")
+    // The upper bound is checked here rather than left to the array allocation so that this path
+    // reports the same error as `eval`. Without it the allocation fails with an internal error.
     val numElementsCode =
       s"""
+         |if ($count > ${ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH}) {
+         |  throw QueryExecutionErrors.createArrayWithElementsExceedLimitError(
+         |    "$prettyName", $count);
+         |}
          |int $numElements = 0;
          |if ($count > 0) {
          |  $numElements = $count;
@@ -3962,6 +4494,13 @@ case class ArrayRepeat(left: Expression, right: Expression)
  */
 @ExpressionDescription(
   usage = "_FUNC_(array, element) - Remove all elements that equal to element from array.",
+  arguments = """
+    Arguments:
+      * array - The array to remove elements from.
+        An expression that evaluates to an array.
+      * element - The element to remove from the array.
+        An expression of the same type as the array elements.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 2, 3, null, 3), 3);
@@ -4097,6 +4636,15 @@ trait ArraySetLike {
   @transient protected lazy val ordering: Ordering[Any] =
     TypeUtils.getInterpretedOrdering(et)
 
+  @transient protected lazy val normalizedElement: Any => Any =
+    if (NormalizeFloatingNumbers.needNormalize(et)) {
+      val ref = BoundReference(0, et, nullable = true)
+      val normalizer = NormalizeFloatingNumbers.normalize(ref)
+      (value: Any) => InternalRow.copyValue(normalizer.eval(InternalRow(value)))
+    } else {
+      identity
+    }
+
   protected def resultArrayElementNullable = dt.asInstanceOf[ArrayType].containsNull
 
   protected def genGetValue(array: String, i: String): String =
@@ -4174,6 +4722,11 @@ trait ArraySetLike {
  */
 @ExpressionDescription(
   usage = "_FUNC_(array) - Removes duplicate values from the array.",
+  arguments = """
+    Arguments:
+      * array - The array to remove duplicate values from.
+        An expression that evaluates to an array.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 2, 3, null, 3));
@@ -4245,7 +4798,7 @@ case class ArrayDistinct(child: Expression)
             j += 1
           }
           if (!found) {
-            arrayBuffer += array(i)
+            arrayBuffer += normalizedElement(array(i)).asInstanceOf[AnyRef]
           }
         } else {
           // De-duplicate the null values.
@@ -4275,7 +4828,7 @@ case class ArrayDistinct(child: Expression)
         val classTag = s"scala.reflect.ClassTag$$.MODULE$$.$hsTypeName()"
         val hashSet = ctx.freshName("hashSet")
         val arrayBuilder = classOf[mutable.ArrayBuilder[_]].getName
-        val arrayBuilderClass = s"$arrayBuilder$$of$ptName"
+        val arrayBuilderClass = s"$arrayBuilder.of$ptName"
 
         // Only need to track null element index when array's element is nullable.
         val declareNullTrackVariables = if (resultArrayElementNullable) {
@@ -4369,6 +4922,13 @@ trait ArrayBinaryLike
     _FUNC_(array1, array2) - Returns an array of the elements in the union of array1 and array2,
       without duplicates.
   """,
+  arguments = """
+    Arguments:
+      * array1 - The first array to union.
+        An expression that evaluates to an array.
+      * array2 - The second array to union.
+        An expression that evaluates to an array.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 2, 3), array(1, 3, 5));
@@ -4435,7 +4995,7 @@ case class ArrayUnion(left: Expression, right: Expression) extends ArrayBinaryLi
               throw QueryExecutionErrors.arrayFunctionWithElementsExceedLimitError(
                 prettyName, arrayBuffer.length)
             }
-            arrayBuffer += elem
+            arrayBuffer += normalizedElement(elem)
           }
         }))
         new GenericArrayData(arrayBuffer)
@@ -4467,7 +5027,7 @@ case class ArrayUnion(left: Expression, right: Expression) extends ArrayBinaryLi
         val classTag = s"scala.reflect.ClassTag$$.MODULE$$.$hsTypeName()"
         val hashSet = ctx.freshName("hashSet")
         val arrayBuilder = classOf[mutable.ArrayBuilder[_]].getName
-        val arrayBuilderClass = s"$arrayBuilder$$of$ptName"
+        val arrayBuilderClass = s"$arrayBuilder.of$ptName"
 
         val body =
           s"""
@@ -4545,6 +5105,13 @@ case class ArrayUnion(left: Expression, right: Expression) extends ArrayBinaryLi
   usage = """
   _FUNC_(array1, array2) - Returns an array of the elements in the intersection of array1 and
     array2, without duplicates.
+  """,
+  arguments = """
+    Arguments:
+      * array1 - The first array to intersect.
+        An expression that evaluates to an array.
+      * array2 - The second array to intersect.
+        An expression that evaluates to an array.
   """,
   examples = """
     Examples:
@@ -4649,7 +5216,7 @@ case class ArrayIntersect(left: Expression, right: Expression) extends ArrayBina
               }
             }
             if (found) {
-              arrayBuffer += elem1
+              arrayBuffer += normalizedElement(elem1)
             }
             i += 1
           }
@@ -4683,7 +5250,7 @@ case class ArrayIntersect(left: Expression, right: Expression) extends ArrayBina
         val hashSet = ctx.freshName("hashSet")
         val hashSetResult = ctx.freshName("hashSetResult")
         val arrayBuilder = classOf[mutable.ArrayBuilder[_]].getName
-        val arrayBuilderClass = s"$arrayBuilder$$of$ptName"
+        val arrayBuilderClass = s"$arrayBuilder.of$ptName"
 
         val withArray2NaNCheckCodeGenerator =
           (array: String, index: String) =>
@@ -4771,12 +5338,19 @@ case class ArrayIntersect(left: Expression, right: Expression) extends ArrayBina
 }
 
 /**
- * Returns an array of the elements in the intersect of x and y, without duplicates
+ * Returns an array of the elements in x but not in y, without duplicates
  */
 @ExpressionDescription(
   usage = """
   _FUNC_(array1, array2) - Returns an array of the elements in array1 but not in array2,
     without duplicates.
+  """,
+  arguments = """
+    Arguments:
+      * array1 - The array to take elements from.
+        An expression that evaluates to an array.
+      * array2 - The array of elements to exclude.
+        An expression that evaluates to an array.
   """,
   examples = """
     Examples:
@@ -4869,7 +5443,7 @@ case class ArrayExcept(left: Expression, right: Expression) extends ArrayBinaryL
             }
           }
           if (!found) {
-            arrayBuffer += elem1
+            arrayBuffer += normalizedElement(elem1)
           }
           i += 1
         }
@@ -4899,7 +5473,7 @@ case class ArrayExcept(left: Expression, right: Expression) extends ArrayBinaryL
         val classTag = s"scala.reflect.ClassTag$$.MODULE$$.$hsTypeName()"
         val hashSet = ctx.freshName("hashSet")
         val arrayBuilder = classOf[mutable.ArrayBuilder[_]].getName
-        val arrayBuilderClass = s"$arrayBuilder$$of$ptName"
+        val arrayBuilderClass = s"$arrayBuilder.of$ptName"
 
         val withArray2NaNCheckCodeGenerator =
           (array: String, index: String) =>
@@ -4989,6 +5563,15 @@ case class ArrayExcept(left: Expression, right: Expression) extends ArrayBinaryL
       Index above array size appends the array, or prepends the array if index is negative,
       with 'null' elements.
   """,
+  arguments = """
+    Arguments:
+      * x - The array to insert the value into.
+        An expression that evaluates to an array.
+      * pos - The 1-based index at which to insert the value.
+        An expression that evaluates to an integer.
+      * val - The value to insert into the array.
+        An expression of the same type as the array elements.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 2, 3, 4), 5, 5);
@@ -5049,15 +5632,9 @@ case class ArrayInsert(
     }
   }
 
-  private lazy val positivePos = if (second.foldable) {
-    val pos = second.eval().asInstanceOf[Int]
-    if (pos > 0) {
-      Some(pos)
-    } else {
-      None
-    }
-  } else {
-    None
+  private lazy val positivePos = ExprUtils.tryEvalFoldable(second) match {
+    case Some(pos: Int) if pos > 0 => Some(pos)
+    case _ => None
   }
 
   override def eval(input: InternalRow): Any = {
@@ -5097,31 +5674,33 @@ case class ArrayInsert(
 
       new GenericArrayData(newArray)
     } else {
-      var posInt = pos.asInstanceOf[Int]
-      if (posInt == 0) {
+      // Widen `pos` to Long to avoid overflow (e.g. `-Int.MinValue` wraps back to `Int.MinValue`).
+      var posLong: Long = pos.asInstanceOf[Int].toLong
+      if (posLong == 0L) {
         throw QueryExecutionErrors.invalidIndexOfZeroError(getContextOrNull())
       }
 
-      val newPosExtendsArrayLeft = (posInt < 0) && (-posInt > baseArr.numElements())
+      val newPosExtendsArrayLeft = (posLong < 0) && (-posLong > baseArr.numElements())
 
       if (newPosExtendsArrayLeft) {
-        val baseOffset = if (legacyNegativeIndex) 1 else 0
+        val baseOffset: Long = if (legacyNegativeIndex) 1L else 0L
         // special case- if the new position is negative but larger than the current array size
         // place the new item at start of array, place the current array contents at the end
         // and fill the newly created array elements inbetween with a null
 
-        val newArrayLength = -posInt + baseOffset
+        val newArrayLength: Long = -posLong + baseOffset
 
         if (newArrayLength > ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH) {
           throw QueryExecutionErrors.arrayFunctionWithElementsExceedLimitError(
             prettyName, newArrayLength)
         }
 
-        val newArray = new Array[Any](newArrayLength)
+        val newArray = new Array[Any](newArrayLength.toInt)
 
         baseArr.foreach(elementType, (i, v) => {
           // current position, offset by new item + new null array elements
-          val elementPosition = i + baseOffset + math.abs(posInt + baseArr.numElements())
+          val elementPosition =
+            (i + baseOffset + math.abs(posLong + baseArr.numElements())).toInt
           newArray(elementPosition) = v
         })
 
@@ -5129,20 +5708,21 @@ case class ArrayInsert(
 
         new GenericArrayData(newArray)
       } else {
-        if (posInt < 0) {
-          posInt = posInt + baseArr.numElements() + (if (legacyNegativeIndex) 0 else 1)
-        } else if (posInt > 0) {
-          posInt = posInt - 1
+        if (posLong < 0) {
+          posLong = posLong + baseArr.numElements() + (if (legacyNegativeIndex) 0 else 1)
+        } else if (posLong > 0) {
+          posLong = posLong - 1
         }
 
-        val newArrayLength = math.max(baseArr.numElements() + 1, posInt + 1)
+        val newArrayLength: Long = math.max(baseArr.numElements() + 1L, posLong + 1L)
 
         if (newArrayLength > ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH) {
           throw QueryExecutionErrors.arrayFunctionWithElementsExceedLimitError(
             prettyName, newArrayLength)
         }
 
-        val newArray = new Array[Any](newArrayLength)
+        val newArray = new Array[Any](newArrayLength.toInt)
+        val posInt = posLong.toInt
 
         baseArr.foreach(elementType, (i, v) => {
           if (i >= posInt) {
@@ -5209,23 +5789,29 @@ case class ArrayInsert(
       } else {
         val pos = posExpr.value
         val baseOffset = if (legacyNegativeIndex) 1 else 0
+        // Widen `pos` arithmetic to long so that `Int.MIN_VALUE` doesn't silently overflow
+        // (e.g. `Math.abs(Int.MIN_VALUE)` returns `Int.MIN_VALUE`).
+        val posLong = ctx.freshName("posLong")
+        val resLengthLong = ctx.freshName("resLengthLong")
         s"""
+           |long $posLong = (long) $pos;
            |int $itemInsertionIndex = 0;
            |int $resLength = 0;
            |int $adjustedAllocIdx = 0;
            |boolean $insertedItemIsNull = ${itemExpr.isNull};
            |
-           |if ($pos == 0) {
+           |if ($posLong == 0L) {
            |  throw QueryExecutionErrors.invalidIndexOfZeroError($errorContext);
            |}
            |
-           |if ($pos < 0 && (java.lang.Math.abs($pos) > $arr.numElements())) {
+           |if ($posLong < 0L && (-$posLong > $arr.numElements())) {
            |
-           |  $resLength = java.lang.Math.abs($pos) + $baseOffset;
-           |  if ($resLength > ${ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH}) {
+           |  long $resLengthLong = -$posLong + ${baseOffset}L;
+           |  if ($resLengthLong > ${ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH}) {
            |    throw QueryExecutionErrors.arrayFunctionWithElementsExceedLimitError(
-           |      "$prettyName", $resLength);
+           |      "$prettyName", $resLengthLong);
            |  }
+           |  $resLength = (int) $resLengthLong;
            |
            |  $allocation
            |  for (int $i = 0; $i < $arr.numElements(); $i ++) {
@@ -5251,7 +5837,7 @@ case class ArrayInsert(
            |
            |  $resLength = java.lang.Math.max($arr.numElements() + 1, $itemInsertionIndex + 1);
            |  if ($resLength > ${ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH}) {
-           |    throw QueryExecutionErrors.createArrayWithElementsExceedLimitError(
+           |    throw QueryExecutionErrors.arrayFunctionWithElementsExceedLimitError(
            |      "$prettyName", $resLength);
            |  }
            |
@@ -5328,6 +5914,11 @@ case class ArrayInsert(
 
 @ExpressionDescription(
   usage = "_FUNC_(array) - Removes null values from the array.",
+  arguments = """
+    Arguments:
+      * array - The array to remove null values from.
+        An expression that evaluates to an array.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 2, 3, null));

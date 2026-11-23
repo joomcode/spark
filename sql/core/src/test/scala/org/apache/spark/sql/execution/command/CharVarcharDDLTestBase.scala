@@ -22,10 +22,11 @@ import org.apache.spark.sql.{AnalysisException, QueryTest, Row}
 import org.apache.spark.sql.catalyst.util.CharVarcharUtils
 import org.apache.spark.sql.connector.catalog.InMemoryPartitionTableCatalog
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.{SharedSparkSession, SQLTestUtils}
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
+import org.apache.spark.tags.DataSourceV2Test
 
-trait CharVarcharDDLTestBase extends QueryTest with SQLTestUtils {
+trait CharVarcharDDLTestBase extends QueryTest {
 
   def format: String
 
@@ -250,6 +251,7 @@ class FileSourceCharVarcharDDLTestSuite extends CharVarcharDDLTestBase with Shar
   }
 }
 
+@DataSourceV2Test
 class DSV2CharVarcharDDLTestSuite extends CharVarcharDDLTestBase
   with SharedSparkSession {
   override def format: String = "foo"

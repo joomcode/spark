@@ -24,11 +24,11 @@ import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.{Inner, PlanTest}
+import org.apache.spark.sql.catalyst.plans.{Inner, LeftAnti, LeftSemi, PlanTest}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.RuleExecutor
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{StringType, StructType}
+import org.apache.spark.sql.types.{DoubleType, StringType, StructType, TimestampType}
 
 class ColumnPruningSuite extends PlanTest {
 
@@ -38,6 +38,39 @@ class ColumnPruningSuite extends PlanTest {
       ColumnPruning,
       RemoveNoopOperators,
       CollapseProject) :: Nil
+  }
+
+  test("Column pruning for an external lookup join keeps the lookup columns its parent reads") {
+    val stream = LocalRelation($"id".int, $"label".string)
+    val lookup = LocalRelation($"key".int, $"value".string, $"extra".string)
+    val Seq(streamId, label) = stream.output
+    val Seq(lookupKey, value, _) = lookup.output
+    val condition = Some(streamId === lookupKey)
+    val noCache =
+      ExternalLookupCacheOptions(enabled = false, maxBytes = 1, ttlMillis = 0)
+    val join = ExternalLookupJoin(stream, lookup, Inner, condition, noCache, lookup.output)
+
+    val optimized = Optimize.execute(Project(Seq(label, value), join))
+    val correctAnswer = Project(Seq(label, value),
+      ExternalLookupJoin(stream, Project(Seq(lookupKey, value), lookup), Inner, condition,
+        noCache, Seq(value)))
+    comparePlans(optimized, correctAnswer)
+  }
+
+  test("Column pruning for an external lookup semi or anti join keeps no lookup column") {
+    val stream = LocalRelation($"id".int, $"label".string)
+    val lookup = LocalRelation($"key".int, $"value".string)
+    val streamId = stream.output.head
+    val lookupKey = lookup.output.head
+    val condition = Some(streamId === lookupKey)
+    val noCache =
+      ExternalLookupCacheOptions(enabled = false, maxBytes = 1, ttlMillis = 0)
+    Seq(LeftSemi, LeftAnti).foreach { joinType =>
+      val join = ExternalLookupJoin(stream, lookup, joinType, condition, noCache, lookup.output)
+      val correctAnswer = ExternalLookupJoin(
+        stream, Project(Seq(lookupKey), lookup), joinType, condition, noCache, Seq.empty)
+      comparePlans(Optimize.execute(join), correctAnswer)
+    }
   }
 
   test("Column pruning for Generate when Generate.unrequiredChildIndex = child.output") {
@@ -481,5 +514,34 @@ class ColumnPruningSuite extends PlanTest {
     val correctAnswer = relation.select($"a", $"c")
 
     comparePlans(CustomOptimize.execute(originalQuery.analyze), correctAnswer.analyze)
+  }
+
+  test("Column pruning for BinBy") {
+    // Two range inputs, one DISTRIBUTE column, one unused pass-through.
+    val tsStart = AttributeReference("ts_start", TimestampType, nullable = false)()
+    val tsEnd = AttributeReference("ts_end", TimestampType, nullable = false)()
+    val value = AttributeReference("value", DoubleType, nullable = false)()
+    val label = AttributeReference("label", StringType, nullable = true)()
+    val relation = LocalRelation(tsStart, tsEnd, value, label)
+
+    // Produced attributes: scaled DISTRIBUTE column + three appended columns.
+    val scaledValue = AttributeReference("value", DoubleType, nullable = true)()
+    val binStart = AttributeReference("bin_start", TimestampType, nullable = true)()
+    val binEnd = AttributeReference("bin_end", TimestampType, nullable = true)()
+    val binRatio = AttributeReference("bin_distribute_ratio", DoubleType, nullable = true)()
+
+    val query = relation
+      .binBy(tsStart, tsEnd, Seq(value), Seq(scaledValue), Seq(binStart, binEnd, binRatio))
+      .select(binStart)
+
+    val optimized = Optimize.execute(query)
+
+    // `label` is pruned from the child; the range and DISTRIBUTE inputs the kernel reads stay.
+    val correctAnswer = relation
+      .select(tsStart, tsEnd, value)
+      .binBy(tsStart, tsEnd, Seq(value), Seq(scaledValue), Seq(binStart, binEnd, binRatio))
+      .select(binStart)
+
+    comparePlans(optimized, correctAnswer, checkAnalysis = false)
   }
 }

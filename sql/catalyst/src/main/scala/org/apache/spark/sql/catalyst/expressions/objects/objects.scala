@@ -39,6 +39,7 @@ import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.trees.TernaryLike
 import org.apache.spark.sql.catalyst.trees.TreePattern._
+import org.apache.spark.sql.catalyst.types.ops.TypeOps
 import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, ArrayData, GenericArrayData, MapData}
 import org.apache.spark.sql.connector.catalog.functions.ScalarFunction
 import org.apache.spark.sql.errors.QueryExecutionErrors
@@ -219,10 +220,17 @@ trait InvokeLike extends Expression with NonSQLExpression with ImplicitCastInput
       returnType: Option[String] = None): String = {
     val castFuncCall = if (returnType.isEmpty) funcCall else s"(${returnType.get}) $funcCall"
     if (needTryCatch) {
+      // Catch Throwable rather than Exception: invoked methods may declare
+      // `throws Throwable` (common in reflection-derived signatures), and the
+      // JDK compiler requires the catch type to cover the declared throw. Janino
+      // erases checked-exception checks; javac enforces them. Platform.throwException
+      // rethrows the caught value unchanged (an Unsafe sneaky-throw, no wrapping), so
+      // an Error passing through here is observably identical to one propagating
+      // uncaught - the wider catch type must not change runtime behavior.
       s"""
         try {
           $resultVal = $castFuncCall;
-        } catch (Exception e) {
+        } catch (Throwable e) {
           org.apache.spark.unsafe.Platform.throwException(e);
         }
       """
@@ -595,7 +603,13 @@ case class NewInstance(
     propagateNull: Boolean,
     dataType: DataType,
     outerPointer: Option[() => AnyRef]) extends InvokeLike {
+  // JVM-form binary name (with `$` for inner classes); used where literal `$`
+  // is intentional (e.g., Scala companion access `Foo$.MODULE$`).
   private val className = cls.getName
+  // The same binary name as `className`, routed through `javaSourceName` to mark
+  // it as a type reference the JDK backend rewrites to a javac-legal form at
+  // compile time (see JdkCodeCompiler.rewriteInnerClassRefs).
+  private val javaSourceClassName = CodeGenerator.javaSourceName(cls)
 
   override def nullable: Boolean = needNullCheck
 
@@ -678,7 +692,7 @@ case class NewInstance(
       case _ => outer.map { gen =>
         s"${gen.value}.new ${Utils.getSimpleName(cls)}($argString)"
       }.getOrElse {
-        s"new $className($argString)"
+        s"new $javaSourceClassName($argString)"
       }
     }
 
@@ -1163,7 +1177,10 @@ case class MapObjects private(
     // Make a copy of the data if it's unsafe-backed
     def makeCopyIfInstanceOf(clazz: Class[_ <: Any], value: String) =
       s"$value instanceof ${clazz.getSimpleName}? ${value}.copy() : $value"
-    val genFunctionValue: String = lambdaFunction.dataType match {
+    // Resolve UDTs and framework types so that struct-backed types are copied like a StructType.
+    val lambdaSqlType = UserDefinedType.sqlType(lambdaFunction.dataType)
+    val genFunctionValue: String = TypeOps(lambdaSqlType)
+        .flatMap(_.rowRepresentationType).getOrElse(lambdaSqlType) match {
       case StructType(_) => makeCopyIfInstanceOf(classOf[UnsafeRow], genFunction.value)
       case ArrayType(_, _) => makeCopyIfInstanceOf(classOf[UnsafeArrayData], genFunction.value)
       case MapType(_, _, _) => makeCopyIfInstanceOf(classOf[UnsafeMapData], genFunction.value)
@@ -1182,7 +1199,11 @@ case class MapObjects private(
     val (initCollection, addElement, getResult): (String, String => String, String) =
       customCollectionCls match {
         case Some(cls) if classOf[mutable.ArraySeq[_]].isAssignableFrom(cls) =>
-          val tag = ctx.addReferenceObj("tag", elementClassTag())
+          // Cast the reference to the public ClassTag interface rather than the
+          // ClassTag's concrete runtime class, which can be a non-public inner class
+          // (e.g. scala.reflect.ClassTag$GenericClassTag). The JDK compiler rejects a
+          // cast to an inaccessible type ("has private access"); Janino does not.
+          val tag = ctx.addReferenceObj("tag", elementClassTag(), classOf[ClassTag[_]].getName)
           val builderClassName = classOf[mutable.ArrayBuilder[_]].getName
           val getBuilder = s"$builderClassName$$.MODULE$$.make($tag)"
           val builder = ctx.freshName("collectionBuilder")
@@ -1196,7 +1217,11 @@ case class MapObjects private(
               s"MODULE$$.make($builder.result());"
           )
         case Some(cls) if classOf[immutable.ArraySeq[_]].isAssignableFrom(cls) =>
-          val tag = ctx.addReferenceObj("tag", elementClassTag())
+          // Cast the reference to the public ClassTag interface rather than the
+          // ClassTag's concrete runtime class, which can be a non-public inner class
+          // (e.g. scala.reflect.ClassTag$GenericClassTag). The JDK compiler rejects a
+          // cast to an inaccessible type ("has private access"); Janino does not.
+          val tag = ctx.addReferenceObj("tag", elementClassTag(), classOf[ClassTag[_]].getName)
           val builderClassName = classOf[mutable.ArrayBuilder[_]].getName
           val getBuilder = s"$builderClassName$$.MODULE$$.make($tag)"
           val builder = ctx.freshName("collectionBuilder")
@@ -1423,13 +1448,17 @@ case class CatalystToExternalMap private(
     // Make a copy of the data if it's unsafe-backed
     def makeCopyIfInstanceOf(clazz: Class[_ <: Any], value: String) =
       s"$value instanceof ${clazz.getSimpleName}? $value.copy() : $value"
-    def genFunctionValue(lambdaFunction: Expression, genFunction: ExprCode) =
-      lambdaFunction.dataType match {
+    // Resolve UDTs and framework types so that struct-backed types are copied like a StructType.
+    def genFunctionValue(lambdaFunction: Expression, genFunction: ExprCode) = {
+      val lambdaSqlType = UserDefinedType.sqlType(lambdaFunction.dataType)
+      TypeOps(lambdaSqlType)
+        .flatMap(_.rowRepresentationType).getOrElse(lambdaSqlType) match {
         case StructType(_) => makeCopyIfInstanceOf(classOf[UnsafeRow], genFunction.value)
         case ArrayType(_, _) => makeCopyIfInstanceOf(classOf[UnsafeArrayData], genFunction.value)
         case MapType(_, _, _) => makeCopyIfInstanceOf(classOf[UnsafeMapData], genFunction.value)
         case _ => genFunction.value
       }
+    }
     val genKeyFunctionValue = genFunctionValue(keyLambdaFunction, genKeyFunction)
     val genValueFunctionValue = genFunctionValue(valueLambdaFunction, genValueFunction)
 

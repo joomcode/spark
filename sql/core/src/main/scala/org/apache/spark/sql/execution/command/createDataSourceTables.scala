@@ -28,6 +28,7 @@ import org.apache.spark.sql.classic.ClassicConversions.castToImpl
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.CommandExecutionMode
 import org.apache.spark.sql.execution.datasources._
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources.BaseRelation
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.ArrayImplicits._
@@ -49,7 +50,7 @@ case class CreateDataSourceTableCommand(table: CatalogTable, ignoreIfExists: Boo
   extends LeafRunnableCommand {
 
   override def run(sparkSession: SparkSession): Seq[Row] = {
-    assert(table.tableType != CatalogTableType.VIEW)
+    assert(!table.isViewLike)
     assert(table.provider.isDefined)
 
     val sessionState = sparkSession.sessionState
@@ -79,7 +80,9 @@ case class CreateDataSourceTableCommand(table: CatalogTable, ignoreIfExists: Boo
         bucketSpec = table.bucketSpec,
         options = table.storage.properties ++ pathOption,
         // As discussed in SPARK-19583, we don't check if the location is existed
-        catalogTable = Some(tableWithDefaultOptions)).resolveRelation(checkFilesExist = false)
+        catalogTable = Some(tableWithDefaultOptions))
+        .resolveRelation(checkFilesExist = false,
+          forceNullable = !sessionState.conf.getConf(SQLConf.FILE_SOURCE_INSERT_ENFORCE_NOT_NULL))
 
     val partitionColumnNames = if (table.schema.nonEmpty) {
       table.partitionColumnNames
@@ -122,6 +125,7 @@ case class CreateDataSourceTableCommand(table: CatalogTable, ignoreIfExists: Boo
 
     Seq.empty[Row]
   }
+
 }
 
 /**
@@ -147,18 +151,16 @@ case class CreateDataSourceTableAsSelectCommand(
   override def innerChildren: Seq[LogicalPlan] = query :: Nil
 
   override def run(sparkSession: SparkSession): Seq[Row] = {
-    assert(table.tableType != CatalogTableType.VIEW)
+    assert(!table.isViewLike)
     assert(table.provider.isDefined)
 
     val sessionState = sparkSession.sessionState
     val db = table.identifier.database.getOrElse(sessionState.catalog.getCurrentDatabase)
     val tableIdentWithDB = table.identifier.copy(database = Some(db))
     val tableName = tableIdentWithDB.unquotedString
+    val tableExists = sessionState.catalog.tableExists(tableIdentWithDB)
 
-    if (sessionState.catalog.tableExists(tableIdentWithDB)) {
-      assert(mode != SaveMode.Overwrite,
-        s"Expect the table $tableName has been dropped when the save mode is Overwrite")
-
+    if (tableExists && mode != SaveMode.Overwrite) {
       if (mode == SaveMode.ErrorIfExists) {
         throw QueryCompilationErrors.tableAlreadyExistsError(tableName)
       }
@@ -174,14 +176,26 @@ case class CreateDataSourceTableAsSelectCommand(
         DataWritingCommand.assertEmptyRootPath(p, mode, sparkSession.sessionState.newHadoopConf())
       }
       assert(table.schema.isEmpty)
-      sparkSession.sessionState.catalog.validateTableLocation(table)
+      val beforeWrite = if (tableExists) {
+        // `SaveAsV1TableCommand` runs this command with `SaveMode.Overwrite` to replace the
+        // table. Drop it right before writing, after the write passes its checks, so that an
+        // invalid write keeps it. Validate the location after the drop, which deletes the data
+        // of a managed table.
+        () => {
+          sessionState.catalog.dropTable(tableIdentWithDB, ignoreIfNotExists = true, purge = false)
+          sessionState.catalog.validateTableLocation(table)
+        }
+      } else {
+        sessionState.catalog.validateTableLocation(table)
+        () => ()
+      }
       val tableLocation = if (table.tableType == CatalogTableType.MANAGED) {
         Some(sessionState.catalog.defaultTablePath(table.identifier))
       } else {
         table.storage.locationUri
       }
       val result = saveDataIntoTable(
-        sparkSession, table, tableLocation, SaveMode.Overwrite, tableExists = false)
+        sparkSession, table, tableLocation, SaveMode.Overwrite, tableExists = false, beforeWrite)
       val tableSchema = CharVarcharUtils.getRawSchema(
         removeInternalMetadata(result.schema), sessionState.conf)
       val newTable = table.copy(
@@ -215,7 +229,8 @@ case class CreateDataSourceTableAsSelectCommand(
       table: CatalogTable,
       tableLocation: Option[URI],
       mode: SaveMode,
-      tableExists: Boolean): BaseRelation = {
+      tableExists: Boolean,
+      beforeWrite: () => Unit = () => ()): BaseRelation = {
     // Create the relation based on the input logical plan: `query`.
     val pathOption = tableLocation.map("path" -> CatalogUtils.URIToString(_))
     val dataSource = DataSource(
@@ -227,7 +242,7 @@ case class CreateDataSourceTableAsSelectCommand(
       catalogTable = if (tableExists) Some(table) else None)
 
     try {
-      dataSource.writeAndRead(mode, query, outputColumnNames)
+      dataSource.writeAndRead(mode, query, outputColumnNames, beforeWrite)
     } catch {
       case ex: AnalysisException =>
         logError(log"Failed to write to table " +

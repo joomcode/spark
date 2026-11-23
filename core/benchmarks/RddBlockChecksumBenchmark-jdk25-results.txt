@@ -1,0 +1,46 @@
+================================================================================================
+RDD block store-time checksum overhead
+================================================================================================
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+64k long rows, spark.rdd.compress=false:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns) Relative time
+------------------------------------------------------------------------------------------------------------------------
+serialize only (feature off)                        482            488          12          0.0     2409705.3       1.0X
+serialize + CRC32C checksum (feature on)            486            488           2          0.0     2430197.9       1.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+64k long rows, spark.rdd.compress=true:   Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns) Relative time
+------------------------------------------------------------------------------------------------------------------------
+serialize only (feature off)                        637            640           3          0.0     3183441.1       1.0X
+serialize + CRC32C checksum (feature on)            659            664           5          0.0     3293308.6       1.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+8k x 128B records, spark.rdd.compress=false:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns) Relative time
+---------------------------------------------------------------------------------------------------------------------------
+serialize only (feature off)                           185            186           1          0.0      926790.5       1.0X
+serialize + CRC32C checksum (feature on)               193            194           1          0.0      965296.2       1.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+8k x 128B records, spark.rdd.compress=true:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns) Relative time
+--------------------------------------------------------------------------------------------------------------------------
+serialize only (feature off)                          284            285           2          0.0     1419082.4       1.0X
+serialize + CRC32C checksum (feature on)              285            285           0          0.0     1424381.5       1.0X
+
+
+================================================================================================
+Raw checksum algorithm over 4 MiB (reference)
+================================================================================================
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Checksum algorithm:                       Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ADLER32                                             386            386           0          0.0     1506516.8       1.0X
+CRC32                                                84             84           1          0.0      328536.0       4.6X
+CRC32C                                               46             46           1          0.0      178420.9       8.4X
+
+

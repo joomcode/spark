@@ -18,15 +18,20 @@
 
 package org.apache.spark.sql.jdbc
 
-import java.sql.Connection
+import java.sql.{Connection, ResultSet, ResultSetMetaData, SQLException, Statement, Types}
 
+import org.mockito.ArgumentCaptor
+import org.mockito.ArgumentMatchers.anyString
 import org.mockito.Mockito._
 import org.scalatestplus.mockito.MockitoSugar
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions
+import org.apache.spark.sql.types.MetadataBuilder
 
 class PostgresDialectSuite extends SparkFunSuite with MockitoSugar {
+
+  private val dialect = PostgresDialect()
 
   private def createJDBCOptions(extraOptions: Map[String, String]): JDBCOptions = {
     new JDBCOptions(Map(
@@ -37,29 +42,76 @@ class PostgresDialectSuite extends SparkFunSuite with MockitoSugar {
 
   test("beforeFetch sets autoCommit=false with lowercase fetchsize") {
     val conn = mock[Connection]
-    val dialect = PostgresDialect()
     dialect.beforeFetch(conn, createJDBCOptions(Map("fetchsize" -> "100")))
     verify(conn).setAutoCommit(false)
   }
 
   test("beforeFetch sets autoCommit=false with camelCase fetchSize") {
     val conn = mock[Connection]
-    val dialect = PostgresDialect()
     dialect.beforeFetch(conn, createJDBCOptions(Map("fetchSize" -> "100")))
     verify(conn).setAutoCommit(false)
   }
 
   test("beforeFetch sets autoCommit=false with uppercase FETCHSIZE") {
     val conn = mock[Connection]
-    val dialect = PostgresDialect()
     dialect.beforeFetch(conn, createJDBCOptions(Map("FETCHSIZE" -> "100")))
     verify(conn).setAutoCommit(false)
   }
 
   test("beforeFetch does not set autoCommit when fetchSize is 0") {
     val conn = mock[Connection]
-    val dialect = PostgresDialect()
     dialect.beforeFetch(conn, createJDBCOptions(Map("fetchsize" -> "0")))
     verify(conn, never()).setAutoCommit(false)
+  }
+
+  test("SPARK-56251: getFetchSize: returns 1000 when not set (Postgres default)") {
+    assert(dialect.getFetchSize(createJDBCOptions(Map.empty)) === 1000)
+  }
+
+  test("SPARK-56251: getFetchSize: base dialect returns 0 when not set") {
+    val baseDialect = new JdbcDialect {
+      override def canHandle(url: String): Boolean = true
+    }
+    assert(baseDialect.getFetchSize(createJDBCOptions(Map.empty)) === 0)
+  }
+
+  test("SPARK-56251: beforeFetch sets autoCommit=false when using default fetchSize") {
+    val conn = mock[Connection]
+    // No explicit fetchsize - should use Postgres default (1000) and set autoCommit=false
+    dialect.beforeFetch(conn, createJDBCOptions(Map.empty))
+    verify(conn).setAutoCommit(false)
+  }
+
+  test("SPARK-59336: classify only SQLSTATE 42601 as a syntax error") {
+    assert(dialect.isSyntaxErrorBestEffort(new SQLException("syntax error", "42601")))
+    assert(!dialect.isSyntaxErrorBestEffort(new SQLException("access rule violation", "42000")))
+    assert(!dialect.isSyntaxErrorBestEffort(new SQLException("permission denied", "42501")))
+    assert(!dialect.isSyntaxErrorBestEffort(new SQLException("undefined table", "42P01")))
+    assert(!dialect.isSyntaxErrorBestEffort(new SQLException("undefined column", "42703")))
+    assert(!dialect.isSyntaxErrorBestEffort(new SQLException("undefined function", "42883")))
+    assert(!dialect.isSyntaxErrorBestEffort(new SQLException("error without SQLSTATE")))
+  }
+
+  test("updateExtraColumnMeta escapes a single quote in the table and column name") {
+    // The array-dimension lookup embeds the table and column name as SQL string literals, so a
+    // single quote in either must be escaped to keep the WHERE clause well-formed.
+    val conn = mock[Connection]
+    val stmt = mock[Statement]
+    val rs = mock[ResultSet]
+    val rsmd = mock[ResultSetMetaData]
+    when(conn.createStatement()).thenReturn(stmt)
+    when(stmt.executeQuery(anyString())).thenReturn(rs)
+    when(rsmd.getColumnType(1)).thenReturn(Types.ARRAY)
+    when(rsmd.getTableName(1)).thenReturn("ta'ble")
+    when(rsmd.getColumnName(1)).thenReturn("co'l")
+
+    dialect.updateExtraColumnMeta(conn, rsmd, 1, new MetadataBuilder())
+
+    val sqlCaptor = ArgumentCaptor.forClass(classOf[String])
+    verify(stmt).executeQuery(sqlCaptor.capture())
+    assert(sqlCaptor.getValue.contains("pg_class.relname = 'ta''ble'"),
+      s"Unexpected lookup SQL: ${sqlCaptor.getValue}")
+    assert(sqlCaptor.getValue.contains("pg_attribute.attname = 'co''l'"),
+      s"Unexpected lookup SQL: ${sqlCaptor.getValue}")
   }
 }

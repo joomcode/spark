@@ -19,12 +19,13 @@ import unittest
 from collections import defaultdict
 
 from pyspark.testing.connectutils import (
-    should_test_connect,
     connect_requirement_message,
+    should_test_connect,
 )
 
 if should_test_connect:
     import grpc
+
     from pyspark.sql.connect.client.core import Retrying
     from pyspark.sql.connect.client.retries import RetryPolicy
 
@@ -166,13 +167,6 @@ class RetryTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.connect.test_connect_retry import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

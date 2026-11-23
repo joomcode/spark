@@ -28,7 +28,7 @@ import org.apache.spark.sql.connector.expressions.aggregate.Aggregation
 import org.apache.spark.sql.connector.read.{PartitionReaderFactory, VariantExtraction}
 import org.apache.spark.sql.execution.datasources.{AggregatePushDownUtils, PartitioningAwareFileIndex, VariantMetadata}
 import org.apache.spark.sql.execution.datasources.parquet.{ParquetOptions, ParquetReadSupport, ParquetWriteSupport}
-import org.apache.spark.sql.execution.datasources.v2.FileScan
+import org.apache.spark.sql.execution.datasources.v2.RuntimePartitionPruningFileScan
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.{BooleanType, DataType, StructField, StructType, VariantType}
@@ -48,7 +48,8 @@ case class ParquetScan(
     pushedAggregate: Option[Aggregation] = None,
     partitionFilters: Seq[Expression] = Seq.empty,
     dataFilters: Seq[Expression] = Seq.empty,
-    pushedVariantExtractions: Array[VariantExtraction] = Array.empty) extends FileScan {
+    pushedVariantExtractions: Array[VariantExtraction] = Array.empty)
+  extends RuntimePartitionPruningFileScan {
   override def isSplitable(path: Path): Boolean = {
     // If aggregate is pushed down, only the file footer will be read once,
     // so file should not be split across multiple tasks.
@@ -65,13 +66,12 @@ case class ParquetScan(
   }
 
   private def rewriteVariantPushdownSchema(schema: StructType): StructType = {
-    // Group extractions by column name and build extracted schemas
+    // Field names follow the defer-cast-error contract: companion metadata refers to
+    // the paired data field by its group-local name.
     val variantSchemaMap: Map[Seq[String], StructType] = pushedVariantExtractions
       .groupBy(e => e.columnName().toSeq)
       .map { case (colName, extractions) =>
-        // Build struct schema with ordinal-named fields for each extraction
         var fields = extractions.zipWithIndex.map { case (extraction, idx) =>
-          // Attach VariantMetadata so Parquet reader knows this is a variant extraction
           StructField(idx.toString, extraction.expectedDataType(), nullable = true,
             extraction.metadata())
         }
@@ -161,6 +161,15 @@ case class ParquetScan(
     hadoopConf.setBoolean(
       SQLConf.LEGACY_PARQUET_NANOS_AS_LONG.key,
       conf.legacyParquetNanosAsLong)
+    hadoopConf.setBoolean(
+      SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key,
+      conf.timestampNanosTypesEnabled)
+    hadoopConf.setBoolean(
+      SQLConf.PARQUET_READER_RESPECT_UNKNOWN_TYPE_ANNOTATION.key,
+      conf.parquetReaderRespectUnknownTypeAnnotation)
+    hadoopConf.setBoolean(
+      SQLConf.PARQUET_TIME_TYPE_ALLOW_IS_ADJUSTED_TO_UTC_READ.key,
+      conf.parquetTimeTypeAllowIsAdjustedToUtcRead)
 
     val broadcastedConf =
       SerializableConfiguration.broadcast(sparkSession.sparkContext, hadoopConf)

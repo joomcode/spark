@@ -78,6 +78,7 @@ object Constants {
   val ENV_EXECUTOR_ATTRIBUTE_EXECUTOR_ID = "SPARK_EXECUTOR_ATTRIBUTE_EXECUTOR_ID"
   val ENV_JAVA_OPT_PREFIX = "SPARK_JAVA_OPT_"
   val ENV_CLASSPATH = "SPARK_CLASSPATH"
+  val ENV_EXECUTOR_LIBRARY_PATH = "SPARK_EXECUTOR_LIBRARY_PATH"
   val ENV_DRIVER_BIND_ADDRESS = "SPARK_DRIVER_BIND_ADDRESS"
   val ENV_SPARK_CONF_DIR = "SPARK_CONF_DIR"
   val ENV_SPARK_USER = "SPARK_USER"
@@ -105,9 +106,11 @@ object Constants {
   val KUBERNETES_MASTER_INTERNAL_URL = "https://kubernetes.default.svc"
   val DEFAULT_DRIVER_CONTAINER_NAME = "spark-kubernetes-driver"
   val DEFAULT_EXECUTOR_CONTAINER_NAME = "spark-kubernetes-executor"
+  val DEFAULT_PVC_ACCESS_MODE = "ReadWriteOncePod"
   val NON_JVM_MEMORY_OVERHEAD_FACTOR = 0.4d
   val CONNECT_GRPC_BINDING_PORT = "spark.connect.grpc.binding.port"
   val EXIT_EXCEPTION_ANNOTATION = "spark.exit-exception"
+  val POD_DELETION_COST = "controller.kubernetes.io/pod-deletion-cost"
 
   // Hadoop Configuration
   val HADOOP_CONF_VOLUME = "hadoop-properties"

@@ -17,19 +17,195 @@
 
 package org.apache.spark.sql.connector
 
-import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.Row
-import org.apache.spark.sql.classic.MergeIntoWriter
-import org.apache.spark.sql.connector.catalog.Column
-import org.apache.spark.sql.connector.catalog.Identifier
-import org.apache.spark.sql.connector.catalog.TableInfo
-import org.apache.spark.sql.functions._
-import org.apache.spark.sql.types.IntegerType
-import org.apache.spark.sql.types.StringType
+import java.util
 
+import scala.jdk.CollectionConverters._
+
+import org.apache.logging.log4j.Level
+
+import org.apache.spark.SparkConf
+import org.apache.spark.sql.{sources, Column, DataFrame, Row}
+import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.catalyst.analysis.ResolveSchemaEvolution
+import org.apache.spark.sql.classic.MergeIntoWriter
+import org.apache.spark.sql.connector.catalog.{Aborted, Column => V2Column, Committed, InMemoryBaseTable, InMemoryRowLevelOperationTable, InMemoryRowLevelOperationTableCatalog, InMemoryTableCatalog, TableCapability}
+import org.apache.spark.sql.connector.catalog.Identifier
+import org.apache.spark.sql.connector.catalog.TableCapability.{ACCEPT_ANY_SCHEMA, AUTOMATIC_SCHEMA_EVOLUTION}
+import org.apache.spark.sql.connector.catalog.TableInfo
+import org.apache.spark.sql.connector.catalog.constraints.Constraint
+import org.apache.spark.sql.connector.distributions.Distribution
+import org.apache.spark.sql.connector.expressions.{SortOrder, Transform}
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.internal.connector.SchemaAlignmentConfig
+import org.apache.spark.sql.types.{BooleanType, IntegerType, LongType, StringType, StructType}
+import org.apache.spark.tags.DataSourceV2Test
+
+@DataSourceV2Test
 class MergeIntoDataFrameSuite extends RowLevelOperationSuiteBase {
 
+  override protected def sparkConf: SparkConf = super.sparkConf
+    .set(InMemoryBaseTable.ASSIGN_COLUMN_IDS, "true")
+    .set("spark.sql.catalog.non_txn", classOf[NonTransactionalRowLevelOperationCatalog].getName)
+
   import testImplicits._
+
+  private def targetTableCol(colName: String): Column = {
+    col(tableNameAsString + "." + colName)
+  }
+
+  test("self merge with transactional checks") {
+    // create table
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    // create a source on top of itself that will be fully resolved and analyzed
+    val sourceDF = spark.table(tableNameAsString)
+      .where("salary == 100")
+      .as("source")
+    sourceDF.queryExecution.assertAnalyzed()
+
+    // merge into table using the source on top of itself
+    val (txn, txnTables) = executeTransaction {
+      sourceDF
+        .mergeInto(
+          tableNameAsString,
+          $"source.pk" === targetTableCol("pk") && targetTableCol("dep") === "hr")
+        .whenMatched()
+        .update(Map("salary" -> targetTableCol("salary").plus(1)))
+        .whenNotMatched()
+        .insertAll()
+        .merge()
+    }
+
+    // check txn was properly committed and closed
+    assert(txn.currentState == Committed)
+    assert(txn.isClosed)
+    assert(txnTables.size == 1)
+    assert(table.version() == "2")
+
+    // check all table scans
+    val targetTxnTable = txnTables(tableNameAsString)
+    assert(targetTxnTable.scanEvents.size == 4)
+
+    // check table scans as MERGE target
+    val numTargetScans = targetTxnTable.scanEvents.flatten.count {
+      case sources.EqualTo("dep", "hr") => true
+      case _ => false
+    }
+    assert(numTargetScans == 2)
+
+    // check table scans as MERGE source
+    val numSourceScans = targetTxnTable.scanEvents.flatten.count {
+      case sources.EqualTo("salary", 100) => true
+      case _ => false
+    }
+    assert(numSourceScans == 2)
+
+    // check txn state was propagated correctly
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, 101, "hr"), // update
+        Row(2, 200, "software"), // unchanged
+        Row(3, 300, "hr"))) // unchanged
+  }
+
+  for (alterClause <- Seq(
+         "ADD COLUMN new_col INT",
+         "DROP COLUMN salary",
+         "ALTER COLUMN salary TYPE BIGINT",
+         "ALTER COLUMN pk DROP NOT NULL"))
+  test(s"self merge fails when source schema changes after analysis - DDL: $alterClause" ) {
+    withTable(tableNameAsString) {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceDF = spark.table(tableNameAsString).where("salary == 100").as("source")
+      sourceDF.queryExecution.assertAnalyzed()
+
+      sql(s"ALTER TABLE $tableNameAsString $alterClause")
+
+      val e = intercept[AnalysisException] {
+        sourceDF
+          .mergeInto(tableNameAsString, $"source.pk" === targetTableCol("pk"))
+          .whenMatched()
+          .update(Map("salary" -> targetTableCol("salary").plus(1)))
+          .merge()
+      }
+
+      assert(
+        e.getCondition == "INCOMPATIBLE_TABLE_CHANGE_AFTER_ANALYSIS.COLUMNS_MISMATCH",
+        alterClause)
+      assert(catalog.lastTransaction.currentState == Aborted, alterClause)
+      assert(catalog.lastTransaction.isClosed, alterClause)
+    }
+  }
+
+  test("self merge fails when source table is dropped and recreated after analysis") {
+    withTable(tableNameAsString) {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceDF = spark.table(tableNameAsString).where("salary == 100").as("source")
+      sourceDF.queryExecution.assertAnalyzed()
+
+      val originalId = catalog.loadTable(ident).id
+
+      sql(s"DROP TABLE $tableNameAsString")
+      sql(s"CREATE TABLE $tableNameAsString (pk INT NOT NULL, salary INT, dep STRING)")
+      val newId = catalog.loadTable(ident).id
+      assert(originalId != newId)
+
+      val e = intercept[AnalysisException] {
+        sourceDF
+          .mergeInto(tableNameAsString, $"source.pk" === targetTableCol("pk"))
+          .whenMatched()
+          .update(Map("salary" -> targetTableCol("salary").plus(1)))
+          .merge()
+      }
+
+      assert(e.getCondition == "INCOMPATIBLE_TABLE_CHANGE_AFTER_ANALYSIS.TABLE_ID_MISMATCH")
+      assert(catalog.lastTransaction.currentState == Aborted)
+      assert(catalog.lastTransaction.isClosed)
+    }
+  }
+
+  test("self merge fails when column is dropped and re-added after analysis") {
+    withTable(tableNameAsString) {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceDF = spark.table(tableNameAsString).where("salary == 100").as("source")
+      sourceDF.queryExecution.assertAnalyzed()
+
+      sql(s"ALTER TABLE $tableNameAsString DROP COLUMN salary")
+      sql(s"ALTER TABLE $tableNameAsString ADD COLUMN salary INT")
+
+      checkError(
+        exception = intercept[AnalysisException] {
+          sourceDF
+            .mergeInto(tableNameAsString, $"source.pk" === targetTableCol("pk"))
+            .whenMatched()
+            .update(Map("salary" -> targetTableCol("salary").plus(1)))
+            .merge()
+        },
+        condition = "INCOMPATIBLE_TABLE_CHANGE_AFTER_ANALYSIS.COLUMNS_MISMATCH",
+        matchPVals = true,
+        parameters = Map("tableName" -> ".*", "errors" -> ".*"))
+
+      assert(catalog.lastTransaction.currentState == Aborted)
+      assert(catalog.lastTransaction.isClosed)
+    }
+  }
 
   test("merge into empty table with NOT MATCHED clause") {
     withTempView("source") {
@@ -761,6 +937,39 @@ class MergeIntoDataFrameSuite extends RowLevelOperationSuiteBase {
     }
   }
 
+  test("SPARK-60721: merge with assignments to metadata columns") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      Seq((1, "hr"), (3, "hr")).toDF("pk", "dep").createOrReplaceTempView("source")
+
+      def mergeBuilder: MergeIntoWriter[Row] = spark.table("source")
+        .mergeInto(tableNameAsString, $"source.pk" === col(tableNameAsString + ".pk"))
+
+      Seq(
+        mergeBuilder.whenMatched().update(Map("index" -> lit(5))) -> "index",
+        mergeBuilder.whenNotMatched().insert(Map(
+          "pk" -> col("source.pk"),
+          "salary" -> lit(0),
+          "dep" -> col("source.dep"),
+          "_partition" -> lit("x"))) -> "_partition"
+      ).foreach { case (writer, metadataCol) =>
+        val e = intercept[AnalysisException](writer.merge())
+        assert(e.getCondition == "DATATYPE_MISMATCH.INVALID_ROW_LEVEL_OPERATION_ASSIGNMENTS")
+        assert(e.getMessage.contains(s"Cannot assign to metadata column '$metadataCol'"))
+      }
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 100, "hr"), // unchanged
+          Row(2, 200, "software"))) // unchanged
+    }
+  }
+
   test("merge refreshed relation cache") {
     withTempView("temp", "source") {
       withCache("temp") {
@@ -979,6 +1188,7 @@ class MergeIntoDataFrameSuite extends RowLevelOperationSuiteBase {
   }
 
   test("SPARK-54157: version is refreshed when source is V2 table") {
+    import org.apache.spark.sql.connector.catalog.Column
     val sourceTable = "cat.ns1.source_table"
     withTable(sourceTable) {
       createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
@@ -1025,7 +1235,78 @@ class MergeIntoDataFrameSuite extends RowLevelOperationSuiteBase {
     }
   }
 
+  test("schema evolution warns once per write only when both capabilities are present") {
+    val tableName = "non_txn.ns1.test_table"
+    for {
+      command <- Seq("INSERT", "MERGE")
+      (description, capabilities) <- Seq(
+        "neither capability" -> Set.empty[TableCapability],
+        "only ACCEPT_ANY_SCHEMA" -> Set(ACCEPT_ANY_SCHEMA),
+        "only AUTOMATIC_SCHEMA_EVOLUTION" -> Set(AUTOMATIC_SCHEMA_EVOLUTION),
+        "both capabilities" -> Set(AUTOMATIC_SCHEMA_EVOLUTION, ACCEPT_ANY_SCHEMA))
+      evolutionEnabled <- Seq(false, true)
+    } {
+      withClue(s"$command with $description, schema evolution=$evolutionEnabled: ") {
+        withTable(tableName) {
+          val acceptAnySchema = capabilities.contains(ACCEPT_ANY_SCHEMA)
+          val autoSchemaEvolution = capabilities.contains(AUTOMATIC_SCHEMA_EVOLUTION)
+          val warnOnEvolution = evolutionEnabled && acceptAnySchema && autoSchemaEvolution
+          sql(
+            s"""CREATE TABLE $tableName (pk INT) USING foo
+               |TBLPROPERTIES (
+               |  'accept-any-schema' = '$acceptAnySchema',
+               |  'auto-schema-evolution' = '$autoSchemaEvolution')
+               |""".stripMargin)
+          val initial = spark.createDataFrame(
+            Seq(Row(0)).asJava,
+            new StructType().add("pk", IntegerType))
+          val first = spark.createDataFrame(
+            Seq(Row(1, "a", true)).asJava,
+            initial.schema.add("data", StringType).add("active", BooleanType))
+          val next = spark.createDataFrame(
+            Seq(Row(2, "b", false, 2L)).asJava,
+            first.schema.add("score", LongType))
+
+          // A write matching the table schema does not warn.
+          checkSchemaEvolutionWriteWithWarning(
+            tableName, command, initial, evolutionEnabled, capabilities,
+            expectWarning = false)
+
+          // Adding multiple columns emits at most one warning for the entire write.
+          checkSchemaEvolutionWriteWithWarning(
+            tableName, command, first, evolutionEnabled, capabilities,
+            expectWarning = warnOnEvolution)
+
+          // A later request adding another column gets its own warning when applicable.
+          checkSchemaEvolutionWriteWithWarning(
+            tableName, command, next, evolutionEnabled, capabilities,
+            expectWarning = warnOnEvolution)
+
+          // Repeating the write does not warn.
+          checkSchemaEvolutionWriteWithWarning(
+            tableName, command, next, evolutionEnabled, capabilities, expectWarning = false)
+
+          val acceptsWrite = command == "INSERT" && acceptAnySchema
+          val evolvesAndWrites = evolutionEnabled && autoSchemaEvolution && !acceptAnySchema
+          val expectedRows = if (acceptsWrite || evolvesAndWrites) {
+            Seq(
+              Row(0, null, null, null),
+              Row(1, "a", true, null),
+              Row(2, "b", false, 2L),
+              Row(2, "b", false, 2L))
+          } else if (command == "MERGE" && acceptAnySchema) {
+            Nil
+          } else {
+            Seq(Row(0))
+          }
+          checkAnswer(spark.table(tableName), expectedRows)
+        }
+      }
+    }
+  }
+
   test("SPARK-54444: any schema changes after analysis are prohibited") {
+    import org.apache.spark.sql.connector.catalog.Column
     val sourceTable = "cat.ns1.source_table"
     withTable(sourceTable) {
       createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
@@ -1072,5 +1353,426 @@ class MergeIntoDataFrameSuite extends RowLevelOperationSuiteBase {
       }
       assert(e.message.contains("incompatible changes to table `cat`.`ns1`.`source_table`"))
     }
+  }
+
+  // Cache-substitution tests for the txn path: connector approves stale-free cached scans via
+  // Transaction.registerScans.
+  test("cached merge source is reused when the table is unchanged since caching") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    val tableVersionBeforeCache = table.version()
+
+    val sourceDF = spark.table(tableNameAsString).where("salary < 250").as("source")
+    sourceDF.cache()
+    sourceDF.count()
+
+    assert(table.version() == tableVersionBeforeCache, "sanity: caching does not bump version")
+
+    val (txn, txnTables) = executeTransaction {
+      sourceDF
+        .mergeInto(tableNameAsString, $"source.pk" === targetTableCol("pk"))
+        .whenMatched()
+        .update(Map("salary" -> targetTableCol("salary").plus(1)))
+        .merge()
+    }
+
+    assert(txn.currentState == Committed)
+    assert(txn.isClosed)
+    assert(txnTables.size == 1)
+    assert(table.version() == "2")
+    assert(txn.registeredScans.nonEmpty, "registerScans should have accepted the cached scan")
+
+    val targetTxnTable = txnTables(tableNameAsString)
+    assert(targetTxnTable.scanEvents.size == 4)
+    val sourceFilterScans = targetTxnTable.scanEvents.flatten.count {
+      case sources.LessThan("salary", 250) => true
+      case _ => false
+    }
+    assert(sourceFilterScans == 2,
+      s"expected two salary < 250 scan events, got " +
+        s"${targetTxnTable.scanEvents.map(_.toSeq).mkString("[", ", ", "]")}")
+    val targetScans = targetTxnTable.scanEvents.count(_.isEmpty)
+    assert(targetScans == 2,
+      s"expected two target-side scans with no pushed filters, got " +
+        s"${targetTxnTable.scanEvents.map(_.toSeq).mkString("[", ", ", "]")}")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, 101, "hr"),
+        Row(2, 201, "software"),
+        Row(3, 300, "hr")))
+  }
+
+  test("cached merge source is dropped when the table version moves on between caching and MERGE") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    val sourceDF = spark.table(tableNameAsString).where("salary < 250").as("source")
+    sourceDF.cache()
+    sourceDF.count()
+    val versionAtCache = table.version()
+
+    // Bump the version directly to simulate an out-of-band committer. A Spark-side write would
+    // also bump the version but would trigger CacheManager.refreshCache and defeat the test.
+    table.increaseVersion()
+    assert(table.version() != versionAtCache, "sanity: bump should change the version")
+
+    val (txn, txnTables) = executeTransaction {
+      sourceDF
+        .mergeInto(tableNameAsString, $"source.pk" === targetTableCol("pk"))
+        .whenMatched()
+        .update(Map("salary" -> targetTableCol("salary").plus(1)))
+        .merge()
+    }
+
+    assert(txn.currentState == Committed)
+    assert(txn.isClosed)
+    assert(txnTables.size == 1)
+    assert(table.version() == "3")
+    assert(txn.registeredScans.isEmpty, "registerScans should refuse the stale cached scan")
+
+    val targetTxnTable = txnTables(tableNameAsString)
+    assert(targetTxnTable.scanEvents.size == 4)
+    val sourceFilterScans = targetTxnTable.scanEvents.flatten.count {
+      case sources.LessThan("salary", 250) => true
+      case _ => false
+    }
+    assert(sourceFilterScans == 2,
+      s"expected two salary<250 scan events (fresh, since cache was bypassed), got " +
+        s"${targetTxnTable.scanEvents.map(_.toSeq).mkString("[", ", ", "]")}")
+    val targetScans = targetTxnTable.scanEvents.count(_.isEmpty)
+    assert(targetScans == 2,
+      s"expected two target-side scans with no pushed filters, got " +
+        s"${targetTxnTable.scanEvents.map(_.toSeq).mkString("[", ", ", "]")}")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, 101, "hr"),
+        Row(2, 201, "software"),
+        Row(3, 300, "hr")))
+  }
+
+  test("cached source from outside the txn catalog is reused without consulting registerScans") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    // Source has no DataSourceV2Relation, so validateCachedEntryForTransaction's txnTables set
+    // is empty and the cache is accepted without consulting registerScans.
+    val sourceDF = spark.range(2)
+      .select(
+        (col("id") + 1).cast(IntegerType).as("pk"),
+        lit(999).cast(IntegerType).as("salary"),
+        lit("hr").cast(StringType).as("dep"))
+      .as("source")
+    sourceDF.cache()
+    sourceDF.count()
+
+    val (txn, txnTables) = executeTransaction {
+      sourceDF
+        .mergeInto(tableNameAsString, $"source.pk" === targetTableCol("pk"))
+        .whenMatched()
+        .update(Map("salary" -> $"source.salary"))
+        .merge()
+    }
+
+    assert(txn.currentState == Committed)
+    assert(txn.isClosed)
+    assert(txnTables.size == 1)
+    assert(table.version() == "2")
+    assert(txn.registeredScans.isEmpty,
+      "registerScans should not be consulted when the cached subtree has no txn-catalog reads")
+
+    val targetTxnTable = txnTables(tableNameAsString)
+    val targetScans = targetTxnTable.scanEvents.count(_.isEmpty)
+    assert(targetScans == 2,
+      s"expected two target-side scans, got " +
+        s"${targetTxnTable.scanEvents.map(_.toSeq).mkString("[", ", ", "]")}")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, 999, "hr"),
+        Row(2, 999, "software")))
+  }
+
+  test("cached relation inside an IN-subquery is substituted via useCachedData recursion") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    // The cached entry sits inside an IN-subquery, so substitution requires useCachedData's
+    // recursion into SubqueryExpression - transformDown alone wouldn't reach it.
+    val lookupName = "cat.ns1.cache_lookup"
+    withTable(lookupName) {
+      sql(s"CREATE TABLE $lookupName (pk INT) USING foo")
+      sql(s"INSERT INTO $lookupName VALUES (1), (2)")
+
+      val lookupDF = spark.table(lookupName)
+      lookupDF.cache()
+      lookupDF.count()
+      lookupDF.createOrReplaceTempView("cache_lookup_view")
+
+      val sourceDF = spark.table(tableNameAsString)
+        .where("pk IN (SELECT pk FROM cache_lookup_view)")
+        .as("source")
+
+      val (txn, txnTables) = executeTransaction {
+        sourceDF
+          .mergeInto(tableNameAsString, $"source.pk" === targetTableCol("pk"))
+          .whenMatched()
+          .update(Map("salary" -> targetTableCol("salary").plus(1)))
+          .merge()
+      }
+
+      assert(txn.currentState == Committed)
+      assert(txn.isClosed)
+      // The helper `txnTables` is built from physical BatchScanExec nodes in the executed plan;
+      // since cache_lookup is cache-served, it has no BatchScanExec and doesn't appear here.
+      assert(txnTables.size == 1)
+      // Both the target (test_table) and the IN-subquery's lookup (cache_lookup) must be
+      // tracked through the txn catalog via TxnTableCatalog.loadTable. This is the diagnostic
+      // that surfaces UnresolveRelationsInTransaction subquery-walking gaps.
+      assert(txn.catalog.txnTables.size == 2)
+      assert(table.version() == "2")
+      // Every registered scan must point at the lookup (the only cached subtree in this plan).
+      val lookupIdent = Identifier.of(Array("ns1"), "cache_lookup")
+      val lookupTable = catalog.loadTable(lookupIdent)
+      assert(txn.registeredScans.flatten.collect {
+        case s: InMemoryBaseTable#InMemoryBatchScan => s.table
+      }.distinct == Seq(lookupTable))
+      val lookupTxnTable = txn.catalog.txnTables(lookupIdent)
+      assert(lookupTxnTable.scanEvents.nonEmpty,
+        "lookup scan events should be recorded via registerScans")
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 101, "hr"),
+          Row(2, 201, "software"),
+          Row(3, 300, "hr")))
+    }
+  }
+
+  test("connector rejecting registerScans causes cache bypass") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    val sourceDF = spark.table(tableNameAsString).where("salary < 250").as("source")
+    sourceDF.cache()
+    sourceDF.count()
+
+    // Force the connector to reject `registerScans` (return false) so Spark must bypass
+    // the cache.
+    catalog.nextTxnRejectRegisteredScansAttempt = true
+
+    val (txn, txnTables) = executeTransaction {
+      sourceDF
+        .mergeInto(tableNameAsString, $"source.pk" === targetTableCol("pk"))
+        .whenMatched()
+        .update(Map("salary" -> targetTableCol("salary").plus(1)))
+        .merge()
+    }
+
+    assert(txn.currentState == Committed)
+    assert(txn.isClosed)
+    assert(txnTables.size == 1)
+    assert(table.version() == "2")
+    assert(txn.registeredScans.isEmpty, "rejected registerScans attempt")
+
+    val targetTxnTable = txnTables(tableNameAsString)
+    assert(targetTxnTable.scanEvents.size == 4)
+    val sourceFilterScans = targetTxnTable.scanEvents.flatten.count {
+      case sources.LessThan("salary", 250) => true
+      case _ => false
+    }
+    assert(sourceFilterScans == 2,
+      s"expected two salary < 250 scan events (fresh, since cache was bypassed), got " +
+        s"${targetTxnTable.scanEvents.map(_.toSeq).mkString("[", ", ", "]")}")
+    val targetScans = targetTxnTable.scanEvents.count(_.isEmpty)
+    assert(targetScans == 2,
+      s"expected two target-side scans, got " +
+        s"${targetTxnTable.scanEvents.map(_.toSeq).mkString("[", ", ", "]")}")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, 101, "hr"),
+        Row(2, 201, "software"),
+        Row(3, 300, "hr")))
+  }
+
+  test("registerScans receives only scans for the transaction's catalog") {
+    withSQLConf("spark.sql.catalog.cat2" ->
+        classOf[InMemoryRowLevelOperationTableCatalog].getName) {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      withTable("cat2.ns.lookup") {
+        sql("CREATE TABLE cat2.ns.lookup (pk INT) USING foo")
+        sql("INSERT INTO cat2.ns.lookup VALUES (1), (2)")
+
+        // Cache a subtree that joins a `cat` table (the txn catalog) with a `cat2` table.
+        val sourceDF = spark.table(tableNameAsString)
+          .join(spark.table("cat2.ns.lookup"), "pk")
+          .as("source")
+        sourceDF.cache()
+        sourceDF.count()
+
+        val (txn, txnTables) = executeTransaction {
+          sourceDF
+            .mergeInto(tableNameAsString, $"source.pk" === targetTableCol("pk"))
+            .whenMatched()
+            .update(Map("salary" -> targetTableCol("salary").plus(1)))
+            .merge()
+        }
+
+        assert(txn.currentState == Committed)
+        assert(txn.isClosed)
+        // Only the cat-side target is tracked in the txn's catalog; cat2.lookup goes through
+        // a different (non-transactional) catalog and must not appear here.
+        assert(txnTables.size == 1)
+        assert(txn.catalog.txnTables.size == 1)
+        assert(table.version() == "2")
+        val passed = txn.registeredScans.flatten.collect {
+          case s: InMemoryBaseTable#InMemoryBatchScan => s
+        }
+        assert(passed.nonEmpty, "registerScans should have been consulted")
+        // The filter should pass only the cat-side scan; the cat2 scan must be filtered out.
+        val catTable = catalog.loadTable(ident)
+        assert(passed.forall(_.table.id() == catTable.id()),
+          "only the txn-catalog's scan should reach registerScans")
+
+        checkAnswer(
+          sql(s"SELECT * FROM $tableNameAsString"),
+          Seq(
+            Row(1, 101, "hr"),
+            Row(2, 201, "software")))
+      }
+    }
+  }
+
+  // Test helpers.
+
+  private def checkSchemaEvolutionWriteWithWarning(
+      tableName: String,
+      command: String,
+      source: DataFrame,
+      evolutionEnabled: Boolean,
+      capabilities: Set[TableCapability],
+      expectWarning: Boolean): Unit = {
+    val originalSchema = spark.table(tableName).schema
+    val sourceSchema = source.schema.asNullable.toDDL
+    val schemaMatches = originalSchema.asNullable.toDDL == sourceSchema
+    val acceptAnySchema = capabilities.contains(ACCEPT_ANY_SCHEMA)
+    val evolvesSchema = evolutionEnabled &&
+      capabilities.contains(AUTOMATIC_SCHEMA_EVOLUTION) && !schemaMatches
+    val writeSucceeds = if (command == "MERGE" && acceptAnySchema) {
+      false
+    } else {
+      schemaMatches || evolvesSchema || acceptAnySchema
+    }
+    val expectedWarnings = if (expectWarning) {
+      Seq(schemaEvolutionWarning(tableName))
+    } else {
+      Nil
+    }
+    val appender = new LogAppender("schema evolution warning")
+    withLogAppender(
+        appender,
+        loggerNames = Seq(ResolveSchemaEvolution.getClass.getName.stripSuffix("$")),
+        level = Some(Level.WARN)) {
+      if (writeSucceeds) {
+        writeWithSchemaEvolution(tableName, command, source, evolutionEnabled)
+        assert(spark.table(tableName).schema.asNullable.toDDL == sourceSchema)
+      } else {
+        val error = intercept[AnalysisException] {
+          writeWithSchemaEvolution(tableName, command, source, evolutionEnabled)
+        }
+        val expectedError = if (command == "INSERT") {
+          "INSERT_COLUMN_ARITY_MISMATCH.TOO_MANY_DATA_COLUMNS"
+        } else {
+          "UNRESOLVED_COLUMN.WITH_SUGGESTION"
+        }
+        assert(error.getCondition == expectedError)
+        val expectedSchema = if (evolvesSchema) sourceSchema else originalSchema.toDDL
+        assert(spark.table(tableName).schema.toDDL == expectedSchema)
+      }
+    }
+    val warnings = appender.loggingEvents.filter(_.getLevel == Level.WARN)
+      .map(_.getMessage.getFormattedMessage).toSeq
+    assert(warnings == expectedWarnings)
+  }
+
+  private def writeWithSchemaEvolution(
+      tableName: String,
+      command: String,
+      source: DataFrame,
+      evolutionEnabled: Boolean): Unit = {
+    if (command == "INSERT") {
+      val writer = source.write.mode("append")
+      if (evolutionEnabled) {
+        writer.withSchemaEvolution()
+      }
+      writer.insertInto(tableName)
+    } else {
+      // DataFrame columns supply resolved source values; Spark must still resolve target keys.
+      val assignments = source.columns.map(name => name -> source(name)).toMap
+      val writer = source.mergeInto(tableName, lit(false))
+        .whenNotMatched().insert(assignments)
+      if (evolutionEnabled) {
+        writer.withSchemaEvolution()
+      }
+      writer.merge()
+    }
+  }
+
+  private def schemaEvolutionWarning(tableName: String): String = {
+    s"Applying schema evolution to foo table $tableName, which reports both " +
+      "AUTOMATIC_SCHEMA_EVOLUTION and ACCEPT_ANY_SCHEMA capabilities. While " +
+      "AUTOMATIC_SCHEMA_EVOLUTION natively resolves and evolves the schema on a write " +
+      "schema evolution request, ACCEPT_ANY_SCHEMA skips native write schema " +
+      "resolution and alignment. This may cause the write to fail after the table " +
+      "schema has been updated. Consider disabling ACCEPT_ANY_SCHEMA."
+  }
+}
+
+class NonTransactionalRowLevelOperationCatalog extends InMemoryTableCatalog {
+
+  // scalastyle:off argcount
+  override protected def newInMemoryTable(
+      name: String,
+      columns: Array[V2Column],
+      partitioning: Array[Transform],
+      properties: util.Map[String, String],
+      constraints: Array[Constraint],
+      distribution: Distribution,
+      ordering: Array[SortOrder],
+      requiredNumPartitions: Option[Int],
+      advisoryPartitionSize: Option[Long],
+      distributionStrictlyRequired: Boolean,
+      numRowsPerSplit: Int,
+      id: String,
+      schemaAlignmentConfig: SchemaAlignmentConfig): InMemoryBaseTable = {
+    // scalastyle:on argcount
+    InMemoryRowLevelOperationTable.withColumns(
+      name, columns, partitioning, properties, constraints, id, schemaAlignmentConfig)
   }
 }

@@ -22,7 +22,7 @@ import scala.xml.Node
 import jakarta.servlet.http.HttpServletRequest
 import org.json4s.JValue
 
-import org.apache.spark.deploy.DeployMessages.{KillDriverResponse, MasterStateResponse, RequestKillDriver, RequestMasterState}
+import org.apache.spark.deploy.DeployMessages.{KillDriverResponse, MasterStateResponse, RequestApplicationHold, RequestKillDriver, RequestMasterState}
 import org.apache.spark.deploy.JsonProtocol
 import org.apache.spark.deploy.StandaloneResourceUtils._
 import org.apache.spark.deploy.master._
@@ -60,6 +60,27 @@ private[ui] class MasterPage(parent: MasterWebUI) extends WebUIPage("") {
     handleKillRequest(request, id => {
       master.ask[KillDriverResponse](RequestKillDriver(id))
     })
+  }
+
+  def handleAppHoldRequest(request: HttpServletRequest): Unit = {
+    handleHoldRequest(request, hold = true)
+  }
+
+  def handleAppResumeRequest(request: HttpServletRequest): Unit = {
+    handleHoldRequest(request, hold = false)
+  }
+
+  private def handleHoldRequest(request: HttpServletRequest, hold: Boolean): Unit = {
+    if (parent.holdEnabled &&
+        parent.master.securityMgr.checkModifyPermissions(request.getRemoteUser)) {
+      Option(request.getParameter("id")).foreach { id =>
+        // Sent rather than asked: the driver drains its executors before answering, which takes
+        // far longer than this request should. The outcome is rendered on a later page load.
+        master.send(RequestApplicationHold(id, hold))
+
+        Thread.sleep(100)
+      }
+    }
   }
 
   private def handleKillRequest(request: HttpServletRequest, action: String => Unit): Unit = {
@@ -101,7 +122,7 @@ private[ui] class MasterPage(parent: MasterWebUI) extends WebUIPage("") {
   def render(request: HttpServletRequest): Seq[Node] = {
     val state = getMasterState
 
-    val showResourceColumn = state.workers.filter(_.resourcesInfoUsed.nonEmpty).nonEmpty
+    val showResourceColumn = state.workers.exists(_.resourcesInfoUsed.nonEmpty)
     val workerHeaders = if (showResourceColumn) {
       Seq("Worker Id", "Address", "State", "Cores", "Memory", "Resources")
     } else {
@@ -172,8 +193,8 @@ private[ui] class MasterPage(parent: MasterWebUI) extends WebUIPage("") {
                 {state.completedDrivers.count(_.state == DriverState.RELAUNCHING)} Relaunching)
               </li>
               <li><strong>Status:</strong> {state.status}
-                (<a href={"/environment/"}>Environment</a>,
-                <a href={"/logPage/?self&logType=out"}>Log</a>)
+                (<a href={UIUtils.prependBaseUri(request, "/environment/")}>Environment</a>,
+                <a href={UIUtils.prependBaseUri(request, "/logPage/?self&logType=out")}>Log</a>)
               </li>
             </ul>
           </div>
@@ -181,14 +202,16 @@ private[ui] class MasterPage(parent: MasterWebUI) extends WebUIPage("") {
 
         <div class="row">
           <div class="col-12">
-            <span class="collapse-aggregated-workers collapse-table"
-                onClick="collapseTable('collapse-aggregated-workers','aggregated-workers')">
+            <span class="collapse-table" data-bs-toggle="collapse"
+                data-bs-target="#aggregated-workers"
+                aria-expanded="true" aria-controls="aggregated-workers"
+                data-collapse-name="collapse-aggregated-workers">
               <h4>
                 <span class="collapse-table-arrow arrow-open"></span>
                 <a>Workers ({workers.length})</a>
               </h4>
             </span>
-            <div class="aggregated-workers collapsible-table">
+            <div class="collapsible-table collapse show" id="aggregated-workers">
               {workerTable}
             </div>
           </div>
@@ -196,14 +219,17 @@ private[ui] class MasterPage(parent: MasterWebUI) extends WebUIPage("") {
 
         <div class="row">
           <div class="col-12">
-            <span id="running-app" class="collapse-aggregated-activeApps collapse-table"
-                onClick="collapseTable('collapse-aggregated-activeApps','aggregated-activeApps')">
+            <span id="running-app" class="collapse-table"
+                data-bs-toggle="collapse"
+                data-bs-target="#aggregated-activeApps"
+                aria-expanded="true" aria-controls="aggregated-activeApps"
+                data-collapse-name="collapse-aggregated-activeApps">
               <h4>
                 <span class="collapse-table-arrow arrow-open"></span>
                 <a>Running Applications ({activeApps.length})</a>
               </h4>
             </span>
-            <div class="aggregated-activeApps collapsible-table">
+            <div class="collapsible-table collapse show" id="aggregated-activeApps">
               {activeAppsTable}
             </div>
           </div>
@@ -213,15 +239,18 @@ private[ui] class MasterPage(parent: MasterWebUI) extends WebUIPage("") {
           {if (hasDrivers) {
              <div class="row">
                <div class="col-12">
-                 <span class="collapse-aggregated-activeDrivers collapse-table"
-                     onClick="collapseTable('collapse-aggregated-activeDrivers',
-                     'aggregated-activeDrivers')">
+                 <span class="collapse-table" data-bs-toggle="collapse"
+                     data-bs-target="#aggregated-activeDrivers"
+                     aria-expanded="true"
+                     aria-controls="aggregated-activeDrivers"
+                     data-collapse-name="collapse-aggregated-activeDrivers">
                    <h4>
                      <span class="collapse-table-arrow arrow-open"></span>
                      <a>Running Drivers ({activeDrivers.length})</a>
                    </h4>
                  </span>
-                 <div class="aggregated-activeDrivers collapsible-table">
+                 <div class="collapsible-table collapse show"
+                     id="aggregated-activeDrivers">
                    {activeDriversTable}
                  </div>
                </div>
@@ -232,15 +261,18 @@ private[ui] class MasterPage(parent: MasterWebUI) extends WebUIPage("") {
 
         <div class="row">
           <div class="col-12">
-            <span id="completed-app" class="collapse-aggregated-completedApps collapse-table"
-                onClick="collapseTable('collapse-aggregated-completedApps',
-                'aggregated-completedApps')">
+            <span id="completed-app" class="collapse-table"
+                data-bs-toggle="collapse"
+                data-bs-target="#aggregated-completedApps"
+                aria-expanded="true" aria-controls="aggregated-completedApps"
+                data-collapse-name="collapse-aggregated-completedApps">
               <h4>
                 <span class="collapse-table-arrow arrow-open"></span>
                 <a>Completed Applications ({completedApps.length})</a>
               </h4>
             </span>
-            <div class="aggregated-completedApps collapsible-table">
+            <div class="collapsible-table collapse show"
+                id="aggregated-completedApps">
               {completedAppsTable}
             </div>
           </div>
@@ -251,15 +283,18 @@ private[ui] class MasterPage(parent: MasterWebUI) extends WebUIPage("") {
             if (hasDrivers) {
               <div class="row">
                 <div class="col-12">
-                  <span class="collapse-aggregated-completedDrivers collapse-table"
-                      onClick="collapseTable('collapse-aggregated-completedDrivers',
-                      'aggregated-completedDrivers')">
+                  <span class="collapse-table" data-bs-toggle="collapse"
+                      data-bs-target="#aggregated-completedDrivers"
+                      aria-expanded="true"
+                      aria-controls="aggregated-completedDrivers"
+                      data-collapse-name="collapse-aggregated-completedDrivers">
                     <h4>
                       <span class="collapse-table-arrow arrow-open"></span>
                       <a>Completed Drivers ({completedDrivers.length})</a>
                     </h4>
                   </span>
-                  <div class="aggregated-completedDrivers collapsible-table">
+                  <div class="collapsible-table collapse show"
+                      id="aggregated-completedDrivers">
                     {completedDriversTable}
                   </div>
                 </div>
@@ -300,18 +335,39 @@ private[ui] class MasterPage(parent: MasterWebUI) extends WebUIPage("") {
   private def appRow(app: ApplicationInfo): Seq[Node] = {
     val killLink = if (parent.killEnabled &&
       (app.state == ApplicationState.RUNNING || app.state == ApplicationState.WAITING)) {
-      val confirm =
-        s"if (window.confirm('Are you sure you want to kill application ${app.id} ?')) " +
-          "{ this.parentNode.submit(); return true; } else { return false; }"
-      <form action="app/kill/" method="POST" style="display:inline">
+      <form action="app/kill/" method="POST" class="d-inline float-end">
         <input type="hidden" name="id" value={app.id}/>
         <input type="hidden" name="terminate" value="true"/>
-        <a href="#" onclick={confirm} class="kill-link">(kill)</a>
+        <input type="hidden" name="csrfToken" value={parent.csrfToken}/>
+        <button type="submit"
+                data-kill-message={s"Are you sure you want to kill application ${app.id} ?"}
+                class="btn btn-sm btn-outline-danger kill-link">Kill</button>
+      </form>
+    }
+    // Offered only for an application whose driver reported it as holdable and which did not
+    // disable the controls itself through spark.ui.holdEnabled. Rendered before the kill link:
+    // floated controls stack right to left, so this keeps the two adjacent and leaves the kill
+    // button's left margin between the application id and the pair.
+    val holdLink = if (parent.holdEnabled && app.desc.holdEnabled && app.holdSupported &&
+      !app.isFinished) {
+      val (action, message) = if (app.isHeld) {
+        ("resume", s"Are you sure you want to resume application ${app.id} ?")
+      } else {
+        ("hold", s"Are you sure you want to hold application ${app.id}? All executors will " +
+          "be decommissioned after finishing their running tasks, and cached blocks are lost.")
+      }
+      val label = action.capitalize
+      <form action={s"app/$action/"} method="POST" class="d-inline float-end">
+        <input type="hidden" name="id" value={app.id}/>
+        <input type="hidden" name="csrfToken" value={parent.csrfToken}/>
+        <button type="submit" data-confirm-message={message}
+                class="btn btn-sm btn-outline-secondary confirm-link">{label}</button>
       </form>
     }
     <tr>
       <td>
         <a href={"app/?appId=" + app.id}>{app.id}</a>
+        {holdLink}
         {killLink}
       </td>
       <td>
@@ -335,7 +391,7 @@ private[ui] class MasterPage(parent: MasterWebUI) extends WebUIPage("") {
       </td>
       <td>{UIUtils.formatDate(app.submitDate)}</td>
       <td>{app.desc.user}</td>
-      <td>{app.state.toString}</td>
+      <td>{app.stateText}</td>
       <td sorttable_customkey={app.duration.toString}>
         {UIUtils.formatDuration(app.duration)}
       </td>
@@ -350,13 +406,13 @@ private[ui] class MasterPage(parent: MasterWebUI) extends WebUIPage("") {
     val killLink = if (parent.killEnabled &&
       (driver.state == DriverState.RUNNING ||
         driver.state == DriverState.SUBMITTED)) {
-      val confirm =
-        s"if (window.confirm('Are you sure you want to kill driver ${driver.id} ?')) " +
-          "{ this.parentNode.submit(); return true; } else { return false; }"
-      <form action="driver/kill/" method="POST" style="display:inline">
+      <form action="driver/kill/" method="POST" class="d-inline float-end">
         <input type="hidden" name="id" value={driver.id}/>
         <input type="hidden" name="terminate" value="true"/>
-        <a href="#" onclick={confirm} class="kill-link">(kill)</a>
+        <input type="hidden" name="csrfToken" value={parent.csrfToken}/>
+        <button type="submit"
+                data-kill-message={s"Are you sure you want to kill driver ${driver.id} ?"}
+                class="btn btn-sm btn-outline-danger kill-link">Kill</button>
       </form>
     }
     <tr>

@@ -28,16 +28,18 @@ import org.apache.arrow.vector.VectorSchemaRoot
 import org.apache.arrow.vector.ipc.ArrowStreamWriter
 
 import org.apache.spark.{SparkEnv, SparkException, TaskContext}
-import org.apache.spark.api.python.{BasePythonRunner, ChainedPythonFunctions, PythonFunction, PythonRDD, PythonWorkerUtils, StreamingPythonRunner}
+import org.apache.spark.api.python.{BasePythonRunner, ChainedPythonFunctions, PythonFunction, PythonWorkerUtils, StreamingPythonRunner}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.Python.{PYTHON_UNIX_DOMAIN_SOCKET_DIR, PYTHON_UNIX_DOMAIN_SOCKET_ENABLED}
+import org.apache.spark.security.SocketAuthHelper
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.execution.metric.SQLMetric
-import org.apache.spark.sql.execution.python.{BasicPythonArrowOutput, PythonArrowInput, PythonUDFRunner}
+import org.apache.spark.sql.execution.python.{BasicPythonArrowOutput, PythonArrowInput, PythonUDFRunner, PythonWorkerEnvironment}
 import org.apache.spark.sql.execution.python.streaming.TransformWithStateInPySparkPythonRunner.{GroupedInType, InType}
 import org.apache.spark.sql.execution.streaming.operators.stateful.transformwithstate.statefulprocessor.{DriverStatefulProcessorHandleImpl, StatefulProcessorHandleImpl}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.util.ArrowUtils
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.ThreadUtils
 
@@ -49,9 +51,9 @@ class TransformWithStateInPySparkPythonRunner(
     funcs: Seq[(ChainedPythonFunctions, Long)],
     evalType: Int,
     argOffsets: Array[Array[Int]],
-    _schema: StructType,
+    schema: StructType,
     processorHandle: StatefulProcessorHandleImpl,
-    _timeZoneId: String,
+    timeZoneId: String,
     initialRunnerConf: Map[String, String],
     override val pythonMetrics: Map[String, SQLMetric],
     jobArtifactUUID: Option[String],
@@ -59,7 +61,7 @@ class TransformWithStateInPySparkPythonRunner(
     batchTimestampMs: Option[Long],
     eventTimeWatermarkForEviction: Option[Long])
   extends TransformWithStateInPySparkPythonBaseRunner[InType](
-    funcs, evalType, argOffsets, _schema, processorHandle, _timeZoneId,
+    funcs, evalType, argOffsets, schema, processorHandle, timeZoneId,
     initialRunnerConf, pythonMetrics, jobArtifactUUID, groupingKeySchema,
     batchTimestampMs, eventTimeWatermarkForEviction)
   with PythonArrowInput[InType] {
@@ -89,7 +91,9 @@ class TransformWithStateInPySparkPythonRunner(
       currentDataIterator = dataIter
     }
 
-    val startData = dataOut.size()
+    // The batches go through `writer`, which stays bound to the stream of the first call, while
+    // `dataOut` can be a new stream on every call. So count the bytes that `writer` writes.
+    val startData = writer.bytesWritten()
     val hasInput = if (currentDataIterator != null) {
       var isCurrentBatchFull = false
       // Stop writing when the current arrowBatch is finalized/full. If we have rows left
@@ -108,7 +112,7 @@ class TransformWithStateInPySparkPythonRunner(
       super[PythonArrowInput].close()
       false
     }
-    val deltaData = dataOut.size() - startData
+    val deltaData = writer.bytesWritten() - startData
     pythonMetrics("pythonDataSent") += deltaData
     hasInput
   }
@@ -125,7 +129,7 @@ class TransformWithStateInPySparkPythonInitialStateRunner(
     dataSchema: StructType,
     initStateSchema: StructType,
     processorHandle: StatefulProcessorHandleImpl,
-    _timeZoneId: String,
+    timeZoneId: String,
     initialRunnerConf: Map[String, String],
     override val pythonMetrics: Map[String, SQLMetric],
     jobArtifactUUID: Option[String],
@@ -133,12 +137,12 @@ class TransformWithStateInPySparkPythonInitialStateRunner(
     batchTimestampMs: Option[Long],
     eventTimeWatermarkForEviction: Option[Long])
   extends TransformWithStateInPySparkPythonBaseRunner[GroupedInType](
-    funcs, evalType, argOffsets, dataSchema, processorHandle, _timeZoneId,
+    funcs, evalType, argOffsets, dataSchema, processorHandle, timeZoneId,
     initialRunnerConf, pythonMetrics, jobArtifactUUID, groupingKeySchema,
     batchTimestampMs, eventTimeWatermarkForEviction)
   with PythonArrowInput[GroupedInType] {
 
-  override protected lazy val schema: StructType = new StructType()
+  override protected val schema: StructType = new StructType()
     .add("inputData", dataSchema)
     .add("initState", initStateSchema)
 
@@ -161,6 +165,9 @@ class TransformWithStateInPySparkPythonInitialStateRunner(
       )
     }
 
+    // The batches go through `writer`, which stays bound to the stream of the first call, while
+    // `dataOut` can be a new stream on every call. So count the bytes that `writer` writes.
+    val startData = writer.bytesWritten()
 
     // If we don't have data left for the current group, move to the next group.
     if (currentDataIterator == null && inputIterator.hasNext) {
@@ -173,11 +180,10 @@ class TransformWithStateInPySparkPythonInitialStateRunner(
         pandasWriter.getTotalNumRowsForBatch > 0) {
         // So we won't have batches with mixed data and init state.
         pandasWriter.finalizeCurrentArrowBatch()
+        pythonMetrics("pythonDataSent") += writer.bytesWritten() - startData
         return true
       }
     }
-
-    val startData = dataOut.size()
 
     val hasInput = if (currentDataIterator != null) {
       var isCurrentBatchFull = false
@@ -205,7 +211,7 @@ class TransformWithStateInPySparkPythonInitialStateRunner(
       false
     }
 
-    val deltaData = dataOut.size() - startData
+    val deltaData = writer.bytesWritten() - startData
     pythonMetrics("pythonDataSent") += deltaData
     hasInput
   }
@@ -218,9 +224,9 @@ abstract class TransformWithStateInPySparkPythonBaseRunner[I](
     funcs: Seq[(ChainedPythonFunctions, Long)],
     evalType: Int,
     argOffsets: Array[Array[Int]],
-    _schema: StructType,
+    override protected val schema: StructType,
     processorHandle: StatefulProcessorHandleImpl,
-    _timeZoneId: String,
+    override protected val timeZoneId: String,
     initialRunnerConf: Map[String, String],
     override val pythonMetrics: Map[String, SQLMetric],
     jobArtifactUUID: Option[String],
@@ -233,33 +239,42 @@ abstract class TransformWithStateInPySparkPythonBaseRunner[I](
   with BasicPythonArrowOutput
   with TransformWithStateInPySparkPythonRunnerUtils
   with Logging {
+  ArrowUtils.failDuplicatedFieldNames(schema)
+
+  // Installed at worker launch. This runner is constructed per task, so each launch reads the
+  // configuration that task carries. A running streaming query carries a snapshot:
+  // `StreamExecution` runs its batches on `sparkSession.cloneSession()`, whose conf is copied at
+  // query start, so a change made while the query runs is not seen until it restarts.
+  override val envVars: java.util.Map[String, String] =
+    PythonWorkerEnvironment.mergeValidated(funcs.head._1.funcs.head.envVars, SQLConf.get)
 
   protected val sqlConf = SQLConf.get
   protected val arrowMaxRecordsPerBatch = sqlConf.arrowMaxRecordsPerBatch
   protected val arrowMaxBytesPerBatch = sqlConf.arrowMaxBytesPerBatch
 
-  override protected val runnerConf: Map[String, String] = initialRunnerConf +
-    (SQLConf.ARROW_EXECUTION_MAX_RECORDS_PER_BATCH.key -> arrowMaxRecordsPerBatch.toString) +
-    (SQLConf.ARROW_EXECUTION_MAX_BYTES_PER_BATCH.key -> arrowMaxBytesPerBatch.toString)
+  override protected def runnerConf: Map[String, String] =
+    super.runnerConf ++ initialRunnerConf ++ Map(
+      SQLConf.ARROW_EXECUTION_MAX_RECORDS_PER_BATCH.key -> arrowMaxRecordsPerBatch.toString,
+      SQLConf.ARROW_EXECUTION_MAX_BYTES_PER_BATCH.key -> arrowMaxBytesPerBatch.toString
+    )
 
-  // Use lazy val to initialize the fields before these are accessed in [[PythonArrowInput]]'s
-  // constructor.
-  override protected lazy val schema: StructType = _schema
-  override protected lazy val timeZoneId: String = _timeZoneId
-  override protected val errorOnDuplicatedFieldNames: Boolean = true
+  override protected def evalConf: Map[String, String] =
+    super.evalConf ++ Map(
+      "grouping_key_schema" -> groupingKeySchema.json,
+      "state_server_socket_port" ->
+        (if (isUnixDomainSock) stateServerSocketPath else stateServerSocketPort.toString)
+    ) ++ (
+      // Share the state server secret with the Python worker, the same scheme
+      // BasePythonRunner uses for its barrier-server secret. Unix domain sockets need
+      // no secret: they rely on filesystem permissions.
+      if (isUnixDomainSock) {
+        Map.empty
+      } else {
+        Map("state_server_auth_secret" -> stateServerAuthHelper.secret)
+      }
+    )
+
   override protected val largeVarTypes: Boolean = sqlConf.arrowUseLargeVarTypes
-
-  override protected def handleMetadataBeforeExec(stream: DataOutputStream): Unit = {
-    super.handleMetadataBeforeExec(stream)
-    // Write the port/path number for state server
-    if (isUnixDomainSock) {
-      stream.writeInt(-1)
-      PythonWorkerUtils.writeUTF(stateServerSocketPath, stream)
-    } else {
-      stream.writeInt(stateServerSocketPort)
-    }
-    PythonRDD.writeUTF(groupingKeySchema.json, stream)
-  }
 
   override def compute(
       inputIterator: Iterator[I],
@@ -274,7 +289,8 @@ abstract class TransformWithStateInPySparkPythonBaseRunner[I](
       new TransformWithStateInPySparkStateServer(stateServerSocket, processorHandle,
         groupingKeySchema,
         sqlConf.arrowTransformWithStateInPySparkMaxStateRecordsPerBatch,
-        batchTimestampMs, eventTimeWatermarkForEviction))
+        batchTimestampMs, eventTimeWatermarkForEviction,
+        authHelper = stateServerAuthHelper))
 
     context.addTaskCompletionListener[Unit] { _ =>
       logInfo(log"completion listener called")
@@ -286,7 +302,7 @@ abstract class TransformWithStateInPySparkPythonBaseRunner[I](
   }
 
   override protected def writeUDF(dataOut: DataOutputStream): Unit = {
-    PythonUDFRunner.writeUDFs(dataOut, funcs, argOffsets, None)
+    PythonUDFRunner.writeUDFs(dataOut, funcs, argOffsets)
   }
 }
 
@@ -299,7 +315,8 @@ class TransformWithStateInPySparkPythonPreInitRunner(
     workerModule: String,
     groupingKeySchema: StructType,
     processorHandleImpl: DriverStatefulProcessorHandleImpl)
-  extends StreamingPythonRunner(func, "", "", workerModule)
+  extends StreamingPythonRunner(
+    func, "", "", workerModule, PythonWorkerEnvironment.readValidated(SQLConf.get))
   with TransformWithStateInPySparkPythonRunnerUtils
   with Logging {
   protected val sqlConf = SQLConf.get
@@ -326,6 +343,9 @@ class TransformWithStateInPySparkPythonPreInitRunner(
       PythonWorkerUtils.writeUTF(stateServerSocketPath, dataOut)
     } else {
       dataOut.writeInt(stateServerSocketPort)
+      // The driver-side Python worker presents this secret when connecting to the state
+      // server (same protocol as SocketAuthHelper).
+      PythonWorkerUtils.writeUTF(stateServerAuthHelper.secret, dataOut)
     }
     PythonWorkerUtils.writeUTF(groupingKeySchema.json, dataOut)
     dataOut.flush()
@@ -339,8 +359,10 @@ class TransformWithStateInPySparkPythonPreInitRunner(
 
   override def stop(): Unit = {
     super.stop()
+    if (daemonThread != null) {
+      daemonThread.interrupt()
+    }
     closeServerSocketChannelSilently(stateServerSocket)
-    daemonThread.interrupt()
   }
 
   private def startStateServer(): Unit = {
@@ -351,7 +373,8 @@ class TransformWithStateInPySparkPythonPreInitRunner(
         try {
           new TransformWithStateInPySparkStateServer(stateServerSocket, processorHandleImpl,
             groupingKeySchema,
-            sqlConf.arrowTransformWithStateInPySparkMaxStateRecordsPerBatch).run()
+            sqlConf.arrowTransformWithStateInPySparkMaxStateRecordsPerBatch,
+            authHelper = stateServerAuthHelper).run()
         } catch {
           case e: Exception =>
             throw new SparkException("TransformWithStateInPySpark state server " +
@@ -371,6 +394,10 @@ class TransformWithStateInPySparkPythonPreInitRunner(
  */
 trait TransformWithStateInPySparkPythonRunnerUtils extends Logging {
   protected val isUnixDomainSock: Boolean = SparkEnv.get.conf.get(PYTHON_UNIX_DOMAIN_SOCKET_ENABLED)
+  // Per-runner secret used to verify the Python worker's connection to the TCP state
+  // server, the same scheme BasePythonRunner uses for its barrier server.
+  protected lazy val stateServerAuthHelper: SocketAuthHelper = new SocketAuthHelper(
+    SparkEnv.get.conf)
   protected var stateServerSocketPort: Int = -1
   protected var stateServerSocketPath: String = null
   protected var stateServerSocket: ServerSocketChannel = null

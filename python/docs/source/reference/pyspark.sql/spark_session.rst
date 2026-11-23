@@ -52,11 +52,14 @@ See also :class:`SparkSession`.
     SparkSession.conf
     SparkSession.createDataFrame
     SparkSession.dataSource
+    SparkSession.emptyDataFrame
     SparkSession.getActiveSession
     SparkSession.getTags
     SparkSession.interruptAll
     SparkSession.interruptOperation
     SparkSession.interruptTag
+    SparkSession.listArchives
+    SparkSession.listFiles
     SparkSession.newSession
     SparkSession.profile
     SparkSession.removeTag

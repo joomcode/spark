@@ -22,12 +22,12 @@ import io.fabric8.kubernetes.client.KubernetesClient
 import io.fabric8.kubernetes.client.dsl._
 import org.mockito.{ArgumentCaptor, Mock, MockitoAnnotations}
 import org.mockito.ArgumentMatchers.{any, eq => meq}
-import org.mockito.Mockito.{never, times, verify, when}
+import org.mockito.Mockito.{clearInvocations, never, times, verify, when}
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
 import org.scalatest.BeforeAndAfter
 
-import org.apache.spark.{SecurityManager, SparkConf, SparkFunSuite}
+import org.apache.spark.{SecurityManager, SparkConf, SparkFunSuite, SSLOptions}
 import org.apache.spark.deploy.k8s.{KubernetesExecutorConf, KubernetesExecutorSpec}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
@@ -119,13 +119,43 @@ class StatefulSetAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     when(podsWithNamespace.resource(any())).thenReturn(podResource)
     when(driverPodOperations.get).thenReturn(driverPod)
     when(driverPodOperations.waitUntilReady(any(), any())).thenReturn(driverPod)
-    when(executorBuilder.buildFromFeatures(any(classOf[KubernetesExecutorConf]), meq(secMgr),
+    when(executorBuilder.buildFromFeatures(any(classOf[KubernetesExecutorConf]),
       meq(kubernetesClient), any(classOf[ResourceProfile]))).thenAnswer(executorPodAnswer())
     snapshotsStore = new DeterministicExecutorPodsSnapshotsStore()
     podsAllocatorUnderTest = new StatefulSetPodsAllocator(
       conf, secMgr, executorBuilder, kubernetesClient, snapshotsStore, null)
     when(schedulerBackend.getExecutorIds()).thenReturn(Seq.empty)
     podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
+  }
+
+  test("SPARK-58113: wait for driver readiness by default") {
+    // The allocator in `before` was started with the default conf.
+    verify(driverPodOperations, times(1)).waitUntilReady(any(), any())
+  }
+
+  test("SPARK-58113: skip driver readiness wait when publishNotReadyAddresses is enabled") {
+    clearInvocations(driverPodOperations)
+    val confWithPublishNotReady = conf.clone()
+      .set(KUBERNETES_DRIVER_SERVICE_PUBLISH_NOT_READY_ADDRESSES, true)
+    val podsAllocator = new StatefulSetPodsAllocator(
+      confWithPublishNotReady, secMgr, executorBuilder, kubernetesClient, snapshotsStore, null)
+    podsAllocator.start(TEST_SPARK_APP_ID, schedulerBackend)
+    verify(driverPodOperations, never()).waitUntilReady(any(), any())
+  }
+
+  test("SPARK-58776: executor conf carries the auth secret and SparkConf SSL RPC passwords") {
+    val sslConf = confWithAuthAndSslRpc(conf)
+    val sslAllocator = new StatefulSetPodsAllocator(sslConf, new SecurityManager(sslConf),
+      executorBuilder, kubernetesClient, snapshotsStore, null)
+    sslAllocator.start(TEST_SPARK_APP_ID, schedulerBackend)
+    sslAllocator.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+
+    val captor = ArgumentCaptor.forClass(classOf[KubernetesExecutorConf])
+    verify(executorBuilder).buildFromFeatures(
+      captor.capture(), meq(kubernetesClient), any(classOf[ResourceProfile]))
+    assert(captor.getValue.authSecret === Some(TEST_AUTH_SECRET))
+    assert(captor.getValue.sslRpcPasswordEnvs ===
+      Map(SSLOptions.ENV_RPC_SSL_KEY_STORE_PASSWORD -> TEST_RPC_SSL_KEY_STORE_PASSWORD))
   }
 
   test("Validate initial statefulSet creation & cleanup with two resource profiles") {

@@ -33,6 +33,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
 import builtins
 import collections.abc
 import google.protobuf.any_pb2
@@ -109,6 +110,10 @@ class Relation(google.protobuf.message.Message):
     UNRESOLVED_TABLE_VALUED_FUNCTION_FIELD_NUMBER: builtins.int
     LATERAL_JOIN_FIELD_NUMBER: builtins.int
     CHUNKED_CACHED_LOCAL_RELATION_FIELD_NUMBER: builtins.int
+    RELATION_CHANGES_FIELD_NUMBER: builtins.int
+    NEAREST_BY_JOIN_FIELD_NUMBER: builtins.int
+    ZIP_FIELD_NUMBER: builtins.int
+    BIN_BY_FIELD_NUMBER: builtins.int
     FILL_NA_FIELD_NUMBER: builtins.int
     DROP_NA_FIELD_NUMBER: builtins.int
     REPLACE_FIELD_NUMBER: builtins.int
@@ -219,6 +224,14 @@ class Relation(google.protobuf.message.Message):
     @property
     def chunked_cached_local_relation(self) -> global___ChunkedCachedLocalRelation: ...
     @property
+    def relation_changes(self) -> global___RelationChanges: ...
+    @property
+    def nearest_by_join(self) -> global___NearestByJoin: ...
+    @property
+    def zip(self) -> global___Zip: ...
+    @property
+    def bin_by(self) -> global___BinBy: ...
+    @property
     def fill_na(self) -> global___NAFill:
         """NA functions"""
     @property
@@ -305,6 +318,10 @@ class Relation(google.protobuf.message.Message):
         unresolved_table_valued_function: global___UnresolvedTableValuedFunction | None = ...,
         lateral_join: global___LateralJoin | None = ...,
         chunked_cached_local_relation: global___ChunkedCachedLocalRelation | None = ...,
+        relation_changes: global___RelationChanges | None = ...,
+        nearest_by_join: global___NearestByJoin | None = ...,
+        zip: global___Zip | None = ...,
+        bin_by: global___BinBy | None = ...,
         fill_na: global___NAFill | None = ...,
         drop_na: global___NADrop | None = ...,
         replace: global___NAReplace | None = ...,
@@ -332,6 +349,8 @@ class Relation(google.protobuf.message.Message):
             b"approx_quantile",
             "as_of_join",
             b"as_of_join",
+            "bin_by",
+            b"bin_by",
             "cached_local_relation",
             b"cached_local_relation",
             "cached_remote_relation",
@@ -390,6 +409,8 @@ class Relation(google.protobuf.message.Message):
             b"map_partitions",
             "ml_relation",
             b"ml_relation",
+            "nearest_by_join",
+            b"nearest_by_join",
             "offset",
             b"offset",
             "parse",
@@ -402,6 +423,8 @@ class Relation(google.protobuf.message.Message):
             b"read",
             "rel_type",
             b"rel_type",
+            "relation_changes",
+            b"relation_changes",
             "repartition",
             b"repartition",
             "repartition_by_expression",
@@ -446,6 +469,8 @@ class Relation(google.protobuf.message.Message):
             b"with_relations",
             "with_watermark",
             b"with_watermark",
+            "zip",
+            b"zip",
         ],
     ) -> builtins.bool: ...
     def ClearField(
@@ -459,6 +484,8 @@ class Relation(google.protobuf.message.Message):
             b"approx_quantile",
             "as_of_join",
             b"as_of_join",
+            "bin_by",
+            b"bin_by",
             "cached_local_relation",
             b"cached_local_relation",
             "cached_remote_relation",
@@ -517,6 +544,8 @@ class Relation(google.protobuf.message.Message):
             b"map_partitions",
             "ml_relation",
             b"ml_relation",
+            "nearest_by_join",
+            b"nearest_by_join",
             "offset",
             b"offset",
             "parse",
@@ -529,6 +558,8 @@ class Relation(google.protobuf.message.Message):
             b"read",
             "rel_type",
             b"rel_type",
+            "relation_changes",
+            b"relation_changes",
             "repartition",
             b"repartition",
             "repartition_by_expression",
@@ -573,6 +604,8 @@ class Relation(google.protobuf.message.Message):
             b"with_relations",
             "with_watermark",
             b"with_watermark",
+            "zip",
+            b"zip",
         ],
     ) -> None: ...
     def WhichOneof(
@@ -623,6 +656,10 @@ class Relation(google.protobuf.message.Message):
             "unresolved_table_valued_function",
             "lateral_join",
             "chunked_cached_local_relation",
+            "relation_changes",
+            "nearest_by_join",
+            "zip",
+            "bin_by",
             "fill_na",
             "drop_na",
             "replace",
@@ -1116,6 +1153,7 @@ class Read(google.protobuf.message.Message):
 
         UNPARSED_IDENTIFIER_FIELD_NUMBER: builtins.int
         OPTIONS_FIELD_NUMBER: builtins.int
+        SOURCE_NAME_FIELD_NUMBER: builtins.int
         unparsed_identifier: builtins.str
         """(Required) Unparsed identifier for the table."""
         @property
@@ -1123,18 +1161,36 @@ class Read(google.protobuf.message.Message):
             self,
         ) -> google.protobuf.internal.containers.ScalarMap[builtins.str, builtins.str]:
             """Options for the named table. The map key is case insensitive."""
+        source_name: builtins.str
         def __init__(
             self,
             *,
             unparsed_identifier: builtins.str = ...,
             options: collections.abc.Mapping[builtins.str, builtins.str] | None = ...,
+            source_name: builtins.str | None = ...,
         ) -> None: ...
+        def HasField(
+            self,
+            field_name: typing_extensions.Literal[
+                "_source_name", b"_source_name", "source_name", b"source_name"
+            ],
+        ) -> builtins.bool: ...
         def ClearField(
             self,
             field_name: typing_extensions.Literal[
-                "options", b"options", "unparsed_identifier", b"unparsed_identifier"
+                "_source_name",
+                b"_source_name",
+                "options",
+                b"options",
+                "source_name",
+                b"source_name",
+                "unparsed_identifier",
+                b"unparsed_identifier",
             ],
         ) -> None: ...
+        def WhichOneof(
+            self, oneof_group: typing_extensions.Literal["_source_name", b"_source_name"]
+        ) -> typing_extensions.Literal["source_name"] | None: ...
 
     class DataSource(google.protobuf.message.Message):
         DESCRIPTOR: google.protobuf.descriptor.Descriptor
@@ -1161,6 +1217,7 @@ class Read(google.protobuf.message.Message):
         OPTIONS_FIELD_NUMBER: builtins.int
         PATHS_FIELD_NUMBER: builtins.int
         PREDICATES_FIELD_NUMBER: builtins.int
+        SOURCE_NAME_FIELD_NUMBER: builtins.int
         format: builtins.str
         """(Optional) Supported formats include: parquet, orc, text, json, parquet, csv, avro.
 
@@ -1192,6 +1249,11 @@ class Read(google.protobuf.message.Message):
 
             This is only supported by the JDBC data source.
             """
+        source_name: builtins.str
+        """(Optional) A user-provided name for the streaming source.
+        This name is used in checkpoint metadata and enables stable checkpoint locations
+        for source evolution.
+        """
         def __init__(
             self,
             *,
@@ -1200,6 +1262,7 @@ class Read(google.protobuf.message.Message):
             options: collections.abc.Mapping[builtins.str, builtins.str] | None = ...,
             paths: collections.abc.Iterable[builtins.str] | None = ...,
             predicates: collections.abc.Iterable[builtins.str] | None = ...,
+            source_name: builtins.str | None = ...,
         ) -> None: ...
         def HasField(
             self,
@@ -1208,10 +1271,14 @@ class Read(google.protobuf.message.Message):
                 b"_format",
                 "_schema",
                 b"_schema",
+                "_source_name",
+                b"_source_name",
                 "format",
                 b"format",
                 "schema",
                 b"schema",
+                "source_name",
+                b"source_name",
             ],
         ) -> builtins.bool: ...
         def ClearField(
@@ -1221,6 +1288,8 @@ class Read(google.protobuf.message.Message):
                 b"_format",
                 "_schema",
                 b"_schema",
+                "_source_name",
+                b"_source_name",
                 "format",
                 b"format",
                 "options",
@@ -1231,6 +1300,8 @@ class Read(google.protobuf.message.Message):
                 b"predicates",
                 "schema",
                 b"schema",
+                "source_name",
+                b"source_name",
             ],
         ) -> None: ...
         @typing.overload
@@ -1241,6 +1312,10 @@ class Read(google.protobuf.message.Message):
         def WhichOneof(
             self, oneof_group: typing_extensions.Literal["_schema", b"_schema"]
         ) -> typing_extensions.Literal["schema"] | None: ...
+        @typing.overload
+        def WhichOneof(
+            self, oneof_group: typing_extensions.Literal["_source_name", b"_source_name"]
+        ) -> typing_extensions.Literal["source_name"] | None: ...
 
     NAMED_TABLE_FIELD_NUMBER: builtins.int
     DATA_SOURCE_FIELD_NUMBER: builtins.int
@@ -1282,6 +1357,68 @@ class Read(google.protobuf.message.Message):
     ) -> typing_extensions.Literal["named_table", "data_source"] | None: ...
 
 global___Read = Read
+
+class RelationChanges(google.protobuf.message.Message):
+    """Reads Change Data Capture (CDC) changes for a named table.
+
+    This corresponds to the `DataFrameReader.changes()` or `DataStreamReader.changes()` API.
+    CDC-specific options (startingVersion, endingVersion, startingTimestamp, endingTimestamp,
+    deduplicationMode, computeUpdates, etc.) are passed in the options map.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    class OptionsEntry(google.protobuf.message.Message):
+        DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+        KEY_FIELD_NUMBER: builtins.int
+        VALUE_FIELD_NUMBER: builtins.int
+        key: builtins.str
+        value: builtins.str
+        def __init__(
+            self,
+            *,
+            key: builtins.str = ...,
+            value: builtins.str = ...,
+        ) -> None: ...
+        def ClearField(
+            self, field_name: typing_extensions.Literal["key", b"key", "value", b"value"]
+        ) -> None: ...
+
+    UNPARSED_IDENTIFIER_FIELD_NUMBER: builtins.int
+    OPTIONS_FIELD_NUMBER: builtins.int
+    IS_STREAMING_FIELD_NUMBER: builtins.int
+    unparsed_identifier: builtins.str
+    """(Required) Unparsed identifier for the table."""
+    @property
+    def options(self) -> google.protobuf.internal.containers.ScalarMap[builtins.str, builtins.str]:
+        """Options for the CDC query. The map key is case insensitive.
+        Supported keys include: startingVersion, endingVersion, startingTimestamp,
+        endingTimestamp, deduplicationMode, computeUpdates, startingBoundInclusive,
+        endingBoundInclusive.
+        """
+    is_streaming: builtins.bool
+    """(Optional) Indicates if this is a streaming CDC read."""
+    def __init__(
+        self,
+        *,
+        unparsed_identifier: builtins.str = ...,
+        options: collections.abc.Mapping[builtins.str, builtins.str] | None = ...,
+        is_streaming: builtins.bool = ...,
+    ) -> None: ...
+    def ClearField(
+        self,
+        field_name: typing_extensions.Literal[
+            "is_streaming",
+            b"is_streaming",
+            "options",
+            b"options",
+            "unparsed_identifier",
+            b"unparsed_identifier",
+        ],
+    ) -> None: ...
+
+global___RelationChanges = RelationChanges
 
 class Project(google.protobuf.message.Message):
     """Projection of a bag of expressions for a given input relation.
@@ -2163,7 +2300,7 @@ class CachedRemoteRelation(google.protobuf.message.Message):
 
     RELATION_ID_FIELD_NUMBER: builtins.int
     relation_id: builtins.str
-    """(Required) ID of the remote related (assigned by the service)."""
+    """(Required) ID of the remote relation in the current session."""
     def __init__(
         self,
         *,
@@ -3370,6 +3507,138 @@ class Hint(google.protobuf.message.Message):
 
 global___Hint = Hint
 
+class BinBy(google.protobuf.message.Message):
+    """Splits timestamp ranges across fixed bins and scales selected FLOAT or DOUBLE columns."""
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    INPUT_FIELD_NUMBER: builtins.int
+    RANGE_START_FIELD_NUMBER: builtins.int
+    RANGE_END_FIELD_NUMBER: builtins.int
+    BIN_WIDTH_FIELD_NUMBER: builtins.int
+    ALIGN_TO_FIELD_NUMBER: builtins.int
+    DISTRIBUTE_UNIFORM_FIELD_NUMBER: builtins.int
+    BIN_START_NAME_FIELD_NUMBER: builtins.int
+    BIN_END_NAME_FIELD_NUMBER: builtins.int
+    BIN_DISTRIBUTE_RATIO_NAME_FIELD_NUMBER: builtins.int
+    @property
+    def input(self) -> global___Relation:
+        """(Required) The input relation."""
+    @property
+    def range_start(self) -> pyspark.sql.connect.proto.expressions_pb2.Expression:
+        """(Required) Inclusive range start timestamp."""
+    @property
+    def range_end(self) -> pyspark.sql.connect.proto.expressions_pb2.Expression:
+        """(Required) Exclusive range end, with the same timestamp type as range_start."""
+    @property
+    def bin_width(self) -> pyspark.sql.connect.proto.expressions_pb2.Expression:
+        """(Required) A positive, constant day-time interval expression."""
+    @property
+    def align_to(self) -> pyspark.sql.connect.proto.expressions_pb2.Expression:
+        """(Optional) A constant origin with the same timestamp type as the range columns."""
+    @property
+    def distribute_uniform(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[
+        pyspark.sql.connect.proto.expressions_pb2.Expression
+    ]:
+        """(Required) At least one FLOAT or DOUBLE column to scale."""
+    bin_start_name: builtins.str
+    """(Optional) Name for the appended bin-start column. Defaults to bin_start."""
+    bin_end_name: builtins.str
+    """(Optional) Name for the appended bin-end column. Defaults to bin_end."""
+    bin_distribute_ratio_name: builtins.str
+    """(Optional) Name for the appended overlap-ratio column. Defaults to bin_distribute_ratio."""
+    def __init__(
+        self,
+        *,
+        input: global___Relation | None = ...,
+        range_start: pyspark.sql.connect.proto.expressions_pb2.Expression | None = ...,
+        range_end: pyspark.sql.connect.proto.expressions_pb2.Expression | None = ...,
+        bin_width: pyspark.sql.connect.proto.expressions_pb2.Expression | None = ...,
+        align_to: pyspark.sql.connect.proto.expressions_pb2.Expression | None = ...,
+        distribute_uniform: collections.abc.Iterable[
+            pyspark.sql.connect.proto.expressions_pb2.Expression
+        ]
+        | None = ...,
+        bin_start_name: builtins.str | None = ...,
+        bin_end_name: builtins.str | None = ...,
+        bin_distribute_ratio_name: builtins.str | None = ...,
+    ) -> None: ...
+    def HasField(
+        self,
+        field_name: typing_extensions.Literal[
+            "_bin_distribute_ratio_name",
+            b"_bin_distribute_ratio_name",
+            "_bin_end_name",
+            b"_bin_end_name",
+            "_bin_start_name",
+            b"_bin_start_name",
+            "align_to",
+            b"align_to",
+            "bin_distribute_ratio_name",
+            b"bin_distribute_ratio_name",
+            "bin_end_name",
+            b"bin_end_name",
+            "bin_start_name",
+            b"bin_start_name",
+            "bin_width",
+            b"bin_width",
+            "input",
+            b"input",
+            "range_end",
+            b"range_end",
+            "range_start",
+            b"range_start",
+        ],
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing_extensions.Literal[
+            "_bin_distribute_ratio_name",
+            b"_bin_distribute_ratio_name",
+            "_bin_end_name",
+            b"_bin_end_name",
+            "_bin_start_name",
+            b"_bin_start_name",
+            "align_to",
+            b"align_to",
+            "bin_distribute_ratio_name",
+            b"bin_distribute_ratio_name",
+            "bin_end_name",
+            b"bin_end_name",
+            "bin_start_name",
+            b"bin_start_name",
+            "bin_width",
+            b"bin_width",
+            "distribute_uniform",
+            b"distribute_uniform",
+            "input",
+            b"input",
+            "range_end",
+            b"range_end",
+            "range_start",
+            b"range_start",
+        ],
+    ) -> None: ...
+    @typing.overload
+    def WhichOneof(
+        self,
+        oneof_group: typing_extensions.Literal[
+            "_bin_distribute_ratio_name", b"_bin_distribute_ratio_name"
+        ],
+    ) -> typing_extensions.Literal["bin_distribute_ratio_name"] | None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing_extensions.Literal["_bin_end_name", b"_bin_end_name"]
+    ) -> typing_extensions.Literal["bin_end_name"] | None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing_extensions.Literal["_bin_start_name", b"_bin_start_name"]
+    ) -> typing_extensions.Literal["bin_start_name"] | None: ...
+
+global___BinBy = BinBy
+
 class Unpivot(google.protobuf.message.Message):
     """Unpivot a DataFrame from wide format to long format, optionally leaving identifier columns set."""
 
@@ -4325,11 +4594,13 @@ class Parse(google.protobuf.message.Message):
         PARSE_FORMAT_UNSPECIFIED: Parse._ParseFormat.ValueType  # 0
         PARSE_FORMAT_CSV: Parse._ParseFormat.ValueType  # 1
         PARSE_FORMAT_JSON: Parse._ParseFormat.ValueType  # 2
+        PARSE_FORMAT_XML: Parse._ParseFormat.ValueType  # 3
 
     class ParseFormat(_ParseFormat, metaclass=_ParseFormatEnumTypeWrapper): ...
     PARSE_FORMAT_UNSPECIFIED: Parse.ParseFormat.ValueType  # 0
     PARSE_FORMAT_CSV: Parse.ParseFormat.ValueType  # 1
     PARSE_FORMAT_JSON: Parse.ParseFormat.ValueType  # 2
+    PARSE_FORMAT_XML: Parse.ParseFormat.ValueType  # 3
 
     class OptionsEntry(google.protobuf.message.Message):
         DESCRIPTOR: google.protobuf.descriptor.Descriptor
@@ -4362,7 +4633,7 @@ class Parse(google.protobuf.message.Message):
         """(Optional) DataType representing the schema. If not set, Spark will infer the schema."""
     @property
     def options(self) -> google.protobuf.internal.containers.ScalarMap[builtins.str, builtins.str]:
-        """Options for the csv/json parser. The map key is case insensitive."""
+        """Options for the csv/json/xml parser. The map key is case insensitive."""
     def __init__(
         self,
         *,
@@ -4564,3 +4835,111 @@ class LateralJoin(google.protobuf.message.Message):
     ) -> None: ...
 
 global___LateralJoin = LateralJoin
+
+class NearestByJoin(google.protobuf.message.Message):
+    """Relation of type [[NearestByJoin]].
+
+    For each row on the left side, returns up to `num_results` rows from the right side ranked
+    by `ranking_expression`.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    LEFT_FIELD_NUMBER: builtins.int
+    RIGHT_FIELD_NUMBER: builtins.int
+    RANKING_EXPRESSION_FIELD_NUMBER: builtins.int
+    NUM_RESULTS_FIELD_NUMBER: builtins.int
+    JOIN_TYPE_FIELD_NUMBER: builtins.int
+    MODE_FIELD_NUMBER: builtins.int
+    DIRECTION_FIELD_NUMBER: builtins.int
+    @property
+    def left(self) -> global___Relation:
+        """(Required) Left (query) input relation."""
+    @property
+    def right(self) -> global___Relation:
+        """(Required) Right (base) input relation."""
+    @property
+    def ranking_expression(self) -> pyspark.sql.connect.proto.expressions_pb2.Expression:
+        """(Required) Scalar expression used to rank candidate rows on the right side."""
+    num_results: builtins.int
+    """(Required) Maximum number of matches per left row. Must be between 1 and 100000."""
+    join_type: builtins.str
+    """The following three fields use `string` (not typed enums) for parity with `AsOfJoin`,
+    which models analogous fields the same way. Validation happens server-side at planning time.
+
+    (Required) The join type. Must be one of: "inner", "leftouter".
+    """
+    mode: builtins.str
+    """(Required) Search algorithm contract. Must be one of: "approx", "exact"."""
+    direction: builtins.str
+    """(Required) Ranking direction. Must be one of: "distance", "similarity"."""
+    def __init__(
+        self,
+        *,
+        left: global___Relation | None = ...,
+        right: global___Relation | None = ...,
+        ranking_expression: pyspark.sql.connect.proto.expressions_pb2.Expression | None = ...,
+        num_results: builtins.int = ...,
+        join_type: builtins.str = ...,
+        mode: builtins.str = ...,
+        direction: builtins.str = ...,
+    ) -> None: ...
+    def HasField(
+        self,
+        field_name: typing_extensions.Literal[
+            "left", b"left", "ranking_expression", b"ranking_expression", "right", b"right"
+        ],
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing_extensions.Literal[
+            "direction",
+            b"direction",
+            "join_type",
+            b"join_type",
+            "left",
+            b"left",
+            "mode",
+            b"mode",
+            "num_results",
+            b"num_results",
+            "ranking_expression",
+            b"ranking_expression",
+            "right",
+            b"right",
+        ],
+    ) -> None: ...
+
+global___NearestByJoin = NearestByJoin
+
+class Zip(google.protobuf.message.Message):
+    """Relation of type [[Zip]].
+
+    Combines the columns of two DataFrames side-by-side. Both DataFrames must produce the same
+    canonicalized plan after stripping outer Project chains.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    LEFT_FIELD_NUMBER: builtins.int
+    RIGHT_FIELD_NUMBER: builtins.int
+    @property
+    def left(self) -> global___Relation:
+        """(Required) Left input relation."""
+    @property
+    def right(self) -> global___Relation:
+        """(Required) Right input relation."""
+    def __init__(
+        self,
+        *,
+        left: global___Relation | None = ...,
+        right: global___Relation | None = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing_extensions.Literal["left", b"left", "right", b"right"]
+    ) -> builtins.bool: ...
+    def ClearField(
+        self, field_name: typing_extensions.Literal["left", b"left", "right", b"right"]
+    ) -> None: ...
+
+global___Zip = Zip

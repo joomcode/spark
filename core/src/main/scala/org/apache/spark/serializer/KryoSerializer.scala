@@ -47,7 +47,7 @@ import org.apache.spark.internal.io.FileCommitProtocol._
 import org.apache.spark.network.util.ByteUnit
 import org.apache.spark.scheduler.{CompressedMapStatus, HighlyCompressedMapStatus}
 import org.apache.spark.storage._
-import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.unsafe.types.{TimestampNanosVal, UTF8String}
 import org.apache.spark.util.{BoundedPriorityQueue, ByteBufferInputStream, NextIterator, SerializableConfiguration, SerializableJobConf, Utils}
 import org.apache.spark.util.collection.{BitSet, CompactBuffer}
 import org.apache.spark.util.io.ChunkedByteBuffer
@@ -236,6 +236,9 @@ class KryoSerializer(conf: SparkConf)
     kryo.register(classOf[ArrayBuffer[Any]])
     kryo.register(classOf[Array[Array[Byte]]])
     kryo.register(classOf[UTF8String])
+    // Nanosecond-timestamp min/max bounds inside cached-batch statistics rows
+    // (TimestampNanosColumnStats and the Arrow cache's vector-side stats).
+    kryo.register(classOf[TimestampNanosVal])
 
     // We can't load those class directly in order to avoid unnecessary jar dependencies.
     // We load them safely, ignore it if the class not found.
@@ -552,7 +555,8 @@ private[serializer] object KryoSerializer {
     classOf[SparkConf],
     classOf[TaskCommitMessage],
     classOf[SerializedLambda],
-    classOf[BitSet]
+    classOf[BitSet],
+    classOf[java.util.HashMap[_, _]]
   )
 
   private val toRegisterSerializer = Map[Class[_], KryoClassSerializer[_]](
@@ -598,9 +602,13 @@ private[serializer] object KryoSerializer {
       "org.apache.spark.sql.types.StructType",
       "[Lorg.apache.spark.sql.types.StructType;",
       "org.apache.spark.sql.types.DateType$",
+      "org.apache.spark.sql.types.Decimal",
+      "[Lorg.apache.spark.sql.types.Decimal;",
       "org.apache.spark.sql.types.DecimalType",
       "org.apache.spark.sql.types.Decimal$DecimalAsIfIntegral$",
       "org.apache.spark.sql.types.Decimal$DecimalIsFractional$",
+      "java.math.BigDecimal",
+      "java.math.BigInteger",
       "org.apache.spark.sql.execution.command.PartitionStatistics",
       "org.apache.spark.sql.execution.datasources.BasicWriteTaskStats",
       "org.apache.spark.sql.execution.datasources.ExecutedWriteSummary",
@@ -610,12 +618,18 @@ private[serializer] object KryoSerializer {
       "org.apache.spark.sql.execution.joins.LongHashedRelation",
       "org.apache.spark.sql.execution.joins.LongToUnsafeRowMap",
       "org.apache.spark.sql.execution.joins.UnsafeHashedRelation",
+      "org.apache.spark.sql.execution.joins.IntervalIndex",
+      "org.apache.spark.sql.execution.joins.PointIndex",
+      "org.apache.spark.sql.execution.joins.LongIntervalIndex",
+      "org.apache.spark.sql.execution.joins.LongPointIndex",
       "org.apache.spark.sql.columnar.CachedBatch",
       "org.apache.spark.sql.columnar.SimpleMetricsCachedBatch",
       "org.apache.spark.sql.execution.columnar.DefaultCachedBatch",
       "org.apache.spark.sql.columnar.CachedBatchSerializer",
       "org.apache.spark.sql.columnar.SimpleMetricsCachedBatchSerializer",
       "org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer",
+      "org.apache.spark.sql.execution.columnar.ArrowCachedBatch",
+      "org.apache.spark.sql.execution.columnar.ArrowCachedBatchSerializer",
 
       "org.apache.spark.ml.attribute.Attribute",
       "org.apache.spark.ml.attribute.AttributeGroup",
@@ -634,6 +648,11 @@ private[serializer] object KryoSerializer {
       "org.apache.spark.ml.linalg.SparseVector",
       "org.apache.spark.ml.linalg.Vector",
       "org.apache.spark.ml.stat.distribution.MultivariateGaussian",
+      "[Lorg.apache.spark.ml.tree.Node;",
+      "org.apache.spark.ml.tree.InternalNode",
+      "org.apache.spark.ml.tree.LeafNode",
+      "org.apache.spark.ml.tree.ContinuousSplit",
+      "org.apache.spark.ml.tree.CategoricalSplit",
       "org.apache.spark.ml.tree.impl.TreePoint",
       "org.apache.spark.mllib.clustering.VectorWithNorm",
       "org.apache.spark.mllib.linalg.DenseMatrix",
@@ -643,7 +662,9 @@ private[serializer] object KryoSerializer {
       "org.apache.spark.mllib.linalg.SparseVector",
       "org.apache.spark.mllib.linalg.Vector",
       "org.apache.spark.mllib.regression.LabeledPoint",
-      "org.apache.spark.mllib.stat.distribution.MultivariateGaussian"
+      "org.apache.spark.mllib.stat.distribution.MultivariateGaussian",
+      "org.apache.spark.mllib.tree.impurity.GiniCalculator",
+      "org.apache.spark.mllib.tree.impurity.EntropyCalculator"
     ).flatMap { name =>
       try {
         Some[Class[_]](Utils.classForName(name))

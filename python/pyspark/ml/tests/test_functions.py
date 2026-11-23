@@ -14,21 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import os
 import unittest
 
 import numpy as np
 
-from pyspark.loose_version import LooseVersion
+from pyspark.ml.functions import array_to_vector, predict_batch_udf, vector_to_array
 from pyspark.ml.linalg import DenseVector
-from pyspark.ml.functions import array_to_vector, vector_to_array, predict_batch_udf
-from pyspark.sql.functions import array, struct, col
-from pyspark.sql.types import ArrayType, DoubleType, IntegerType, StructType, StructField, FloatType
-from pyspark.testing.sqlutils import (
+from pyspark.sql.functions import array, col, struct
+from pyspark.sql.types import ArrayType, DoubleType, FloatType, IntegerType, StructField, StructType
+from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import (
     have_pandas,
     have_pyarrow,
     pandas_requirement_message,
     pyarrow_requirement_message,
-    ReusedSQLTestCase,
 )
 
 
@@ -67,6 +67,11 @@ class ArrayVectorConversionTests(ArrayVectorConversionTestsMixin, ReusedSQLTestC
 
 
 class PredictBatchUDFTestsMixin:
+    @classmethod
+    def master(cls):
+        # test_caching requires all the workload to be executed on the same worker
+        return os.environ.get("SPARK_CONNECT_TESTING_REMOTE", "local[1]")
+
     def setUp(self):
         import pandas as pd
 
@@ -225,9 +230,9 @@ class PredictBatchUDFTestsMixin:
         batch_sizes = preds["preds"].to_numpy()
         self.assertTrue(all(batch_sizes <= batch_size))
 
-    # TODO(SPARK-49793): enable the test below
     @unittest.skipIf(
-        LooseVersion(np.__version__) >= LooseVersion("2"), "Caching does not work with numpy 2"
+        os.environ.get("SPARK_CONNECT_TESTING_REMOTE"),
+        "We can not guarantee that there is only one worker in Spark Connect tests",
     )
     def test_caching(self):
         def make_predict_fn():
@@ -241,7 +246,8 @@ class PredictBatchUDFTestsMixin:
 
         identity = predict_batch_udf(make_predict_fn, return_type=DoubleType(), batch_size=5)
 
-        # results should be the same
+        # Notice that we can't rely on a consistent partition to worker assignment, so we need to
+        # run all the workload on the same worker to ensure the same results.
         df1 = self.df.withColumn("preds", identity(struct("a"))).toPandas()
         df2 = self.df.withColumn("preds", identity(struct("a"))).toPandas()
         self.assertTrue(df1.equals(df2))
@@ -271,6 +277,13 @@ class PredictBatchUDFTestsMixin:
 
         with self.assertRaisesRegex(Exception, "Multiple input columns found, but model expected"):
             preds = self.df.withColumn("preds", sum_cols(*columns)).toPandas()
+
+        # single scalar column with non-trivial tensor_input_shape => ERROR
+        sum_cols = predict_batch_udf(
+            array_sum_fn, return_type=DoubleType(), batch_size=5, input_tensor_shapes=[[2]]
+        )
+        with self.assertRaisesRegex(Exception, "Invalid input_tensor_shape for scalar column"):
+            self.df.withColumn("preds", sum_cols("a")).toPandas()
 
         # multiple scalar columns, multiple inputs, no input_tensor_shapes => list of numpy arrays
         def list_sum_fn():
@@ -341,6 +354,13 @@ class PredictBatchUDFTestsMixin:
         preds = self.df_tensor1.withColumn("preds", sum_cols(struct(*columns1))).toPandas()
         self.assertTrue(np.array_equal(np.sum(self.data, axis=1), preds["preds"].to_numpy()))
 
+        # tensor column with wrong tensor_input_shape => ERROR
+        sum_cols = predict_batch_udf(
+            array_sum_fn, return_type=DoubleType(), batch_size=5, input_tensor_shapes=[[2]]
+        )
+        with self.assertRaisesRegex(Exception, "Input data does not match expected shape."):
+            self.df_tensor1.withColumn("preds", sum_cols(struct(*columns1))).toPandas()
+
         # tensor column with multiple tensor_input_shapes => ERROR
         sum_cols = predict_batch_udf(
             array_sum_fn,
@@ -373,6 +393,33 @@ class PredictBatchUDFTestsMixin:
                 preds["preds"].to_numpy(),
             )
         )
+
+        # multiple tensor columns with fewer tensor_input_shapes than columns => ERROR
+        sum_cols = predict_batch_udf(
+            multi_sum_fn, return_type=DoubleType(), batch_size=5, input_tensor_shapes=[[4]]
+        )
+        with self.assertRaisesRegex(Exception, "input_tensor_shapes must match columns"):
+            self.df_tensor2.withColumn("preds", sum_cols("t1", "t2")).toPandas()
+
+        # multiple tensor columns with wrong tensor_input_shapes => ERROR
+        sum_cols = predict_batch_udf(
+            multi_sum_fn, return_type=DoubleType(), batch_size=5, input_tensor_shapes=[[2], [3]]
+        )
+        with self.assertRaisesRegex(Exception, "Input data does not match expected shape."):
+            self.df_tensor2.withColumn("preds", sum_cols("t1", "t2")).toPandas()
+
+        # multiple tensor columns, single input => ERROR
+        def array_sum_fn():
+            def predict(inputs):
+                return np.sum(inputs, axis=1)
+
+            return predict
+
+        sum_cols = predict_batch_udf(
+            array_sum_fn, return_type=DoubleType(), batch_size=5, input_tensor_shapes=[[4], [3]]
+        )
+        with self.assertRaisesRegex(Exception, "Multiple input columns found, but model expected"):
+            self.df_tensor2.withColumn("preds", sum_cols("t1", "t2")).toPandas()
 
     def test_mixed_input_shapes(self):
         def mixed_sum_fn():
@@ -573,12 +620,6 @@ class PredictBatchUDFTests(PredictBatchUDFTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.test_functions import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

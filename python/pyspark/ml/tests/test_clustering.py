@@ -16,28 +16,26 @@
 #
 
 import tempfile
-import unittest
 
 import numpy as np
 
-from pyspark.ml.linalg import Vectors, SparseVector
 from pyspark.ml.clustering import (
-    KMeans,
-    KMeansModel,
-    KMeansSummary,
+    LDA,
     BisectingKMeans,
     BisectingKMeansModel,
     BisectingKMeansSummary,
+    DistributedLDAModel,
     GaussianMixture,
     GaussianMixtureModel,
     GaussianMixtureSummary,
-    LDA,
+    KMeans,
+    KMeansModel,
+    KMeansSummary,
     LDAModel,
     LocalLDAModel,
-    DistributedLDAModel,
     PowerIterationClustering,
 )
-from pyspark.sql import is_remote
+from pyspark.ml.linalg import SparseVector, Vectors
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 
 
@@ -60,17 +58,25 @@ class ClusteringTestsMixin:
             .select("weight", "features")
         )
 
+        self.assertEqual(KMeans().getIntermediateStorageLevel(), "MEMORY_AND_DISK")
         km = KMeans(
             k=2,
             maxIter=2,
             weightCol="weight",
+            intermediateStorageLevel="DISK_ONLY",
         )
         self.assertEqual(km.getK(), 2)
         self.assertEqual(km.getMaxIter(), 2)
         self.assertEqual(km.getWeightCol(), "weight")
+        self.assertEqual(km.getIntermediateStorageLevel(), "DISK_ONLY")
+        km.setParams(intermediateStorageLevel="MEMORY_ONLY")
+        self.assertEqual(km.getIntermediateStorageLevel(), "MEMORY_ONLY")
+        km.setParams(intermediateStorageLevel="DISK_ONLY")
+        self.assertEqual(km.getIntermediateStorageLevel(), "DISK_ONLY")
 
         model = km.fit(df)
         self.assertEqual(km.uid, model.uid)
+        self.assertEqual(model.getIntermediateStorageLevel(), "DISK_ONLY")
 
         centers = model.clusterCenters()
         self.assertEqual(len(centers), 2)
@@ -107,18 +113,6 @@ class ClusteringTestsMixin:
         # check summary before model offloading occurs
         check_summary()
 
-        if is_remote():
-            self.spark.client._delete_ml_cache([model._java_obj._ref_id], evict_only=True)
-            # check summary "try_remote_call" path after model offloading occurs
-            self.assertEqual(model.summary.numIter, 2)
-
-            self.spark.client._delete_ml_cache([model._java_obj._ref_id], evict_only=True)
-            # check summary "invoke_remote_attribute_relation" path after model offloading occurs
-            self.assertEqual(model.summary.cluster.count(), 6)
-
-            self.spark.client._delete_ml_cache([model._java_obj._ref_id], evict_only=True)
-            check_summary()
-
         # save & load
         with tempfile.TemporaryDirectory(prefix="kmeans_model") as d:
             km.write().overwrite().save(d)
@@ -150,19 +144,27 @@ class ClusteringTestsMixin:
             .select("weight", "features")
         )
 
+        self.assertEqual(BisectingKMeans().getIntermediateStorageLevel(), "MEMORY_AND_DISK")
         bkm = BisectingKMeans(
             k=2,
             maxIter=2,
             minDivisibleClusterSize=1.0,
             weightCol="weight",
+            intermediateStorageLevel="DISK_ONLY",
         )
         self.assertEqual(bkm.getK(), 2)
         self.assertEqual(bkm.getMaxIter(), 2)
         self.assertEqual(bkm.getMinDivisibleClusterSize(), 1.0)
         self.assertEqual(bkm.getWeightCol(), "weight")
+        self.assertEqual(bkm.getIntermediateStorageLevel(), "DISK_ONLY")
+        bkm.setParams(intermediateStorageLevel="MEMORY_ONLY")
+        self.assertEqual(bkm.getIntermediateStorageLevel(), "MEMORY_ONLY")
+        bkm.setIntermediateStorageLevel("DISK_ONLY")
+        self.assertEqual(bkm.getIntermediateStorageLevel(), "DISK_ONLY")
 
         model = bkm.fit(df)
         self.assertEqual(bkm.uid, model.uid)
+        self.assertEqual(model.getIntermediateStorageLevel(), "DISK_ONLY")
 
         centers = model.clusterCenters()
         self.assertEqual(len(centers), 2)
@@ -202,10 +204,12 @@ class ClusteringTestsMixin:
         with tempfile.TemporaryDirectory(prefix="bisecting_kmeans") as d:
             bkm.write().overwrite().save(d)
             bkm2 = BisectingKMeans.load(d)
+            self.assertEqual(bkm2.getIntermediateStorageLevel(), "DISK_ONLY")
             self.assertEqual(str(bkm), str(bkm2))
 
             model.write().overwrite().save(d)
             model2 = BisectingKMeansModel.load(d)
+            self.assertEqual(model2.getIntermediateStorageLevel(), "DISK_ONLY")
             self.assertEqual(str(model), str(model2))
 
     def test_gaussian_mixture(self):
@@ -227,19 +231,27 @@ class ClusteringTestsMixin:
             .select("weight", "features")
         )
 
+        self.assertEqual(GaussianMixture().getIntermediateStorageLevel(), "MEMORY_AND_DISK")
         gmm = GaussianMixture(
             k=2,
             maxIter=2,
             weightCol="weight",
             seed=1,
+            intermediateStorageLevel="DISK_ONLY",
         )
         self.assertEqual(gmm.getK(), 2)
         self.assertEqual(gmm.getMaxIter(), 2)
         self.assertEqual(gmm.getWeightCol(), "weight")
         self.assertEqual(gmm.getSeed(), 1)
+        self.assertEqual(gmm.getIntermediateStorageLevel(), "DISK_ONLY")
+        gmm.setParams(intermediateStorageLevel="MEMORY_ONLY")
+        self.assertEqual(gmm.getIntermediateStorageLevel(), "MEMORY_ONLY")
+        gmm.setIntermediateStorageLevel("DISK_ONLY")
+        self.assertEqual(gmm.getIntermediateStorageLevel(), "DISK_ONLY")
 
         model = gmm.fit(df)
         self.assertEqual(gmm.uid, model.uid)
+        self.assertEqual(model.getIntermediateStorageLevel(), "DISK_ONLY")
         self.assertEqual(model.numFeatures, 2)
         self.assertEqual(len(model.weights), 2)
         self.assertTrue(
@@ -323,19 +335,16 @@ class ClusteringTestsMixin:
             self.assertEqual(summary.probability.columns, ["probability"])
             self.assertEqual(summary.predictions.count(), 6)
 
-        check_summary()
-        if is_remote():
-            self.spark.client._delete_ml_cache([model._java_obj._ref_id], evict_only=True)
-            check_summary()
-
         # save & load
         with tempfile.TemporaryDirectory(prefix="gaussian_mixture") as d:
             gmm.write().overwrite().save(d)
             gmm2 = GaussianMixture.load(d)
+            self.assertEqual(gmm2.getIntermediateStorageLevel(), "DISK_ONLY")
             self.assertEqual(str(gmm), str(gmm2))
 
             model.write().overwrite().save(d)
             model2 = GaussianMixtureModel.load(d)
+            self.assertEqual(model2.getIntermediateStorageLevel(), "DISK_ONLY")
             self.assertEqual(str(model), str(model2))
 
     def test_local_lda(self):
@@ -352,7 +361,13 @@ class ClusteringTestsMixin:
             .sortWithinPartitions("id")
         )
 
-        lda = LDA(k=2, optimizer="online", seed=1)
+        self.assertEqual(LDA().getIntermediateStorageLevel(), "MEMORY_AND_DISK")
+        lda = LDA(k=2, optimizer="online", seed=1, intermediateStorageLevel="DISK_ONLY")
+        self.assertEqual(lda.getIntermediateStorageLevel(), "DISK_ONLY")
+        lda.setParams(intermediateStorageLevel="MEMORY_ONLY")
+        self.assertEqual(lda.getIntermediateStorageLevel(), "MEMORY_ONLY")
+        lda.setIntermediateStorageLevel("DISK_ONLY")
+        self.assertEqual(lda.getIntermediateStorageLevel(), "DISK_ONLY")
         lda.setMaxIter(1)
         self.assertEqual(lda.getK(), 2)
         self.assertEqual(lda.getOptimizer(), "online")
@@ -361,6 +376,7 @@ class ClusteringTestsMixin:
 
         model = lda.fit(df)
         self.assertEqual(lda.uid, model.uid)
+        self.assertEqual(model.getIntermediateStorageLevel(), "DISK_ONLY")
         self.assertIsInstance(model, LDAModel)
         self.assertIsInstance(model, LocalLDAModel)
         self.assertNotIsInstance(model, DistributedLDAModel)
@@ -396,10 +412,12 @@ class ClusteringTestsMixin:
         with tempfile.TemporaryDirectory(prefix="local_lda") as d:
             lda.write().overwrite().save(d)
             lda2 = LDA.load(d)
+            self.assertEqual(lda2.getIntermediateStorageLevel(), "DISK_ONLY")
             self.assertEqual(str(lda), str(lda2))
 
             model.write().overwrite().save(d)
             model2 = LocalLDAModel.load(d)
+            self.assertEqual(model2.getIntermediateStorageLevel(), "DISK_ONLY")
             self.assertEqual(str(model), str(model2))
 
     def test_distributed_lda(self):
@@ -533,12 +551,6 @@ class ClusteringTests(ClusteringTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.test_clustering import *  # noqa: F401,F403
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

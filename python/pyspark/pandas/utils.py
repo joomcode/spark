@@ -19,47 +19,49 @@ Commonly used utils in pandas-on-Spark.
 """
 
 import functools
-from contextlib import contextmanager
 import json
 import os
 import threading
+import warnings
+from contextlib import contextmanager
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
     Iterator,
     List,
+    Literal,
     Optional,
     Tuple,
     Union,
-    TYPE_CHECKING,
     cast,
     no_type_check,
     overload,
 )
-import warnings
 
 import pandas as pd
-from pandas.api.types import is_list_like  # type: ignore[attr-defined]
+from pandas.api.types import is_list_like
 
-from pyspark.sql import functions as F, Column, DataFrame as PySparkDataFrame, SparkSession
-from pyspark.sql.types import DoubleType
-from pyspark.sql.utils import is_remote
+from pyspark import pandas as ps
 from pyspark.errors import PySparkTypeError, UnsupportedOperationException
-from pyspark import pandas as ps  # noqa: F401
 from pyspark.pandas._typing import (
     Axis,
+    DataFrameOrSeries,
     Label,
     Name,
-    DataFrameOrSeries,
 )
 from pyspark.pandas.typedef.typehints import as_spark_type
-
+from pyspark.sql import Column, SparkSession
+from pyspark.sql import DataFrame as PySparkDataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType
+from pyspark.sql.utils import is_remote
 
 if TYPE_CHECKING:
-    from pyspark.pandas.indexes.base import Index
     from pyspark.pandas.base import IndexOpsMixin
     from pyspark.pandas.frame import DataFrame
+    from pyspark.pandas.indexes.base import Index
     from pyspark.pandas.internal import InternalFrame
     from pyspark.pandas.series import Series
 
@@ -133,28 +135,28 @@ def combine_frames(
     from pyspark.pandas.config import get_option
     from pyspark.pandas.frame import DataFrame
     from pyspark.pandas.internal import (
-        InternalField,
-        InternalFrame,
         HIDDEN_COLUMNS,
         NATURAL_ORDER_COLUMN_NAME,
         SPARK_INDEX_NAME_FORMAT,
+        InternalField,
+        InternalFrame,
     )
     from pyspark.pandas.series import Series
 
     if all(isinstance(arg, Series) for arg in args):
-        assert all(
-            same_anchor(arg, args[0]) for arg in args
-        ), "Currently only one different DataFrame (from given Series) is supported"
+        assert all(same_anchor(arg, args[0]) for arg in args), (
+            "Currently only one different DataFrame (from given Series) is supported"
+        )
         assert not same_anchor(this, args[0]), "We don't need to combine. All series is in this."
         that = args[0]._psdf[list(args)]
     elif len(args) == 1 and isinstance(args[0], DataFrame):
         assert isinstance(args[0], DataFrame)
-        assert not same_anchor(
-            this, args[0]
-        ), "We don't need to combine. `this` and `that` are same."
+        assert not same_anchor(this, args[0]), (
+            "We don't need to combine. `this` and `that` are same."
+        )
         that = args[0]
     else:
-        raise AssertionError("args should be single DataFrame or " "single/multiple Series")
+        raise AssertionError("args should be single DataFrame or single/multiple Series")
 
     if get_option("compute.ops_on_diff_frames"):
 
@@ -325,7 +327,7 @@ def align_diff_frames(
         ["DataFrame", List[Label], List[Label]], Iterator[Tuple["Series", Label]]
     ],
     this: "DataFrame",
-    that: "DataFrame",
+    that: "DataFrameOrSeries",
     fillna: bool = True,
     how: str = "full",
     preserve_order_column: bool = False,
@@ -745,14 +747,14 @@ def is_name_like_value(
         return True
 
 
-def validate_axis(axis: Optional[Axis] = 0, none_axis: int = 0) -> int:
+def validate_axis(axis: Optional[Axis] = 0, none_axis: Literal[0, 1] = 0) -> Literal[0, 1]:
     """Check the given axis is valid."""
     # convert to numeric axis
     axis = cast(Dict[Optional[Axis], int], {None: none_axis, "index": 0, "columns": 1}).get(
         axis, axis
     )
     if axis in (none_axis, 0, 1):
-        return cast(int, axis)
+        return axis  # type: ignore[return-value]
     else:
         raise ValueError("No axis named {0}".format(axis))
 
@@ -761,8 +763,9 @@ def validate_bool_kwarg(value: Any, arg_name: str) -> Optional[bool]:
     """Ensures that argument passed in arg_name is of type bool."""
     if not (isinstance(value, bool) or value is None):
         raise TypeError(
-            'For argument "{}" expected type bool, received '
-            "type {}.".format(arg_name, type(value).__name__)
+            'For argument "{}" expected type bool, received type {}.'.format(
+                arg_name, type(value).__name__
+            )
         )
     return value
 
@@ -778,10 +781,10 @@ def validate_how(how: str) -> str:
     if how == "outer":
         # 'outer' in pandas equals 'full' in Spark
         how = "full"
-    if how not in ("inner", "left", "right", "full"):
+    if how not in ("inner", "left", "right", "full", "cross"):
         raise ValueError(
-            "The 'how' parameter has to be amongst the following values: ",
-            "['inner', 'left', 'right', 'outer']",
+            "The 'how' parameter has to be amongst the following values: "
+            "['inner', 'left', 'right', 'outer', 'cross']"
         )
     return how
 
@@ -815,13 +818,11 @@ def validate_mode(mode: str) -> str:
 
 
 @overload
-def verify_temp_column_name(df: PySparkDataFrame, column_name_or_label: str) -> str:
-    ...
+def verify_temp_column_name(df: PySparkDataFrame, column_name_or_label: str) -> str: ...
 
 
 @overload
-def verify_temp_column_name(df: "DataFrame", column_name_or_label: Name) -> Label:
-    ...
+def verify_temp_column_name(df: "DataFrame", column_name_or_label: Name) -> Label: ...
 
 
 def verify_temp_column_name(
@@ -909,26 +910,26 @@ def verify_temp_column_name(
         ), "The temporary column name should be empty or start and end with `__`: {}".format(
             column_name_or_label
         )
-        assert all(
-            column_name_or_label != label for label in df._internal.column_labels
-        ), "The given column name `{}` already exists in the pandas-on-Spark DataFrame: {}".format(
-            name_like_string(column_name_or_label), df.columns
+        assert all(column_name_or_label != label for label in df._internal.column_labels), (
+            "The given column name `{}` already exists in the pandas-on-Spark DataFrame: {}".format(
+                name_like_string(column_name_or_label), df.columns
+            )
         )
         df = df._internal.resolved_copy.spark_frame
     else:
         assert isinstance(column_name_or_label, str), type(column_name_or_label)
-        assert column_name_or_label.startswith("__") and column_name_or_label.endswith(
-            "__"
-        ), "The temporary column name should start and end with `__`: {}".format(
-            column_name_or_label
+        assert column_name_or_label.startswith("__") and column_name_or_label.endswith("__"), (
+            "The temporary column name should start and end with `__`: {}".format(
+                column_name_or_label
+            )
         )
         column_name = column_name_or_label
 
     assert isinstance(df, PySparkDataFrame), type(df)
-    assert (
-        column_name not in df.columns
-    ), "The given column name `{}` already exists in the Spark DataFrame: {}".format(
-        column_name, df.columns
+    assert column_name not in df.columns, (
+        "The given column name `{}` already exists in the Spark DataFrame: {}".format(
+            column_name, df.columns
+        )
     )
 
     return column_name_or_label
@@ -956,13 +957,21 @@ def spark_column_equals(left: Column, right: Column) -> bool:
 
         if not isinstance(left, ConnectColumn):
             raise PySparkTypeError(
-                errorClass="NOT_COLUMN",
-                messageParameters={"arg_name": "left", "arg_type": type(left).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "expected_type": "Column",
+                    "arg_name": "left",
+                    "arg_type": type(left).__name__,
+                },
             )
         if not isinstance(right, ConnectColumn):
             raise PySparkTypeError(
-                errorClass="NOT_COLUMN",
-                messageParameters={"arg_name": "right", "arg_type": type(right).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "expected_type": "Column",
+                    "arg_name": "right",
+                    "arg_type": type(right).__name__,
+                },
             )
         return repr(left).replace("`", "") == repr(right).replace("`", "")
     else:
@@ -970,13 +979,21 @@ def spark_column_equals(left: Column, right: Column) -> bool:
 
         if not isinstance(left, ClassicColumn):
             raise PySparkTypeError(
-                errorClass="NOT_COLUMN",
-                messageParameters={"arg_name": "left", "arg_type": type(left).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "expected_type": "Column",
+                    "arg_name": "left",
+                    "arg_type": type(left).__name__,
+                },
             )
         if not isinstance(right, ClassicColumn):
             raise PySparkTypeError(
-                errorClass="NOT_COLUMN",
-                messageParameters={"arg_name": "right", "arg_type": type(right).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "expected_type": "Column",
+                    "arg_name": "right",
+                    "arg_type": type(right).__name__,
+                },
             )
         return left._jc.equals(right._jc)
 
@@ -1027,6 +1044,104 @@ def compare_allow_null(
     ],
 ) -> Column:
     return left.isNull() | right.isNull() | comp(left, right)
+
+
+def _floor_divide_floating(c1: Column, c2: Column) -> Column:
+    """Return floor(c1 / c2) for finite non-zero double operands, derived from the remainder.
+
+    Flooring the quotient is wrong when the division rounds up across an integer: 1.0 / 0.1
+    rounds to exactly 10.0, so its floor is 10 where NumPy, pandas and Python return 9. A
+    remainder is exact, so NumPy's npy_divmod derives the quotient from it, as this does.
+    """
+    remainder = F.try_mod(c1, c2)
+    # The remainder carries the dividend's sign, so this is the truncating quotient.
+    truncated = (c1 - remainder) / c2
+    # Truncating and flooring differ by one on opposite signs with a remainder left over.
+    quotient = F.when(
+        (remainder != 0) & ((remainder < 0) != (c2 < 0)), truncated - F.lit(1.0)
+    ).otherwise(truncated)
+    # The quotient is whole in exact arithmetic, but the division can leave it a few bits off, so
+    # round it back. F.floor cannot do this: its bigint result raises on an infinity in ANSI mode
+    # and saturates otherwise.
+    floor = quotient - F.pmod(quotient, F.lit(1.0))
+    return (
+        # An infinite quotient is its own floor, and has to be returned before the line above
+        # is used, since pmod of an infinity is nan and leaves `floor` nan.
+        F.when(quotient.isin(float("inf"), float("-inf")), quotient)
+        # Flooring goes one too low when the division landed just under the whole number.
+        .when(quotient - floor > F.lit(0.5), floor + F.lit(1.0))
+        .otherwise(floor)
+    )
+
+
+def _floor_divide_integral(c1: Column, c2: Column) -> Column:
+    """Return floor(c1 / c2) for integral operands, keeping the quotient in integer space.
+
+    Casting an operand above 2**53 to double drops its low bits, turning 9007199254740993 into
+    9007199254740992, and Spark's `/` always divides as double. The long casts are no-ops for
+    the integral types the caller admits; they are there because `div` rejects a double even in
+    a branch the guard turns off.
+    """
+    c1_long = c1.cast("long")
+    c2_long = c2.cast("long")
+    # `div` is integer division, truncating toward zero, so it needs the same flooring
+    # correction as the floating helper. Integer arithmetic cannot round, so nothing more.
+    truncated = F.call_function("div", c1_long, c2_long)
+    remainder = F.try_mod(c1_long, c2_long)
+    return F.when(
+        # Match NumPy 1.24+ for the one quotient a long cannot hold; `div` would raise.
+        (c1_long == F.lit(-(2**63))) & (c2_long == F.lit(-1)),
+        F.lit(float(-(2**63))),
+    ).otherwise(
+        F.when((remainder != 0) & ((remainder < 0) != (c2_long < 0)), truncated - F.lit(1))
+        .otherwise(truncated)
+        .cast("double")
+    )
+
+
+def _floor_divide_func(c1: Column, c2: Column) -> Column:
+    c1_double = c1.cast("double")
+    c2_double = c2.cast("double")
+    integral_types = ["tinyint", "smallint", "int", "bigint"]
+    floating_result = _floor_divide_floating(c1_double, c2_double)
+
+    return (
+        # Null, nan and a zero divisor are handled the same way for every operand type.
+        F.when(c1.isNull() | F.isnan(c1), c1_double)
+        .when(c2.isNull() | F.isnan(c2), c2_double)
+        # pandas upcasts a zero divisor instead of raising. A negative zero divisor negates the
+        # result, and no comparison can see that sign, so the string form is used. A nullable Int64
+        # returns 0 instead, but arrives as bigint like a default int64, whose answer this follows.
+        .when(
+            c2_double == 0,
+            F.when(c1_double == 0, F.lit(float("nan")))
+            .when((c1_double < 0) != (c2_double.cast("string") == "-0.0"), F.lit(float("-inf")))
+            .otherwise(F.lit(float("inf"))),
+        )
+        # Integral operands divide as integers, so operands above 2**53 keep their low bits.
+        .when(
+            F.typeof(c1).isin(integral_types) & F.typeof(c2).isin(integral_types),
+            _floor_divide_integral(c1, c2),
+        )
+        # Only floating operands can be infinite or a negative zero, handled before the division.
+        .when(
+            F.typeof(c1).isin("float", "double") | F.typeof(c2).isin("float", "double"),
+            # An infinite dividend has no remainder, so NumPy's quotient is nan for any divisor.
+            F.when(c1_double.isin(float("-inf"), float("inf")), F.lit(float("nan")))
+            # An infinite divisor gives a quotient between -1 and 1, so the floor is 0 or -1.
+            .when(
+                c2_double.isin(float("-inf"), float("inf")),
+                F.when(c1_double == 0, c1_double / c2_double)
+                .when((c1_double < 0) != (c2_double < 0), F.lit(-1.0))
+                .otherwise(F.lit(0.0)),
+            )
+            # Dividing a zero dividend keeps its sign, so -0.0 // 3.0 is -0.0.
+            .when(c1_double == 0, c1_double / c2_double)
+            .otherwise(floating_result),
+        )
+        # A decimal cannot be matched by name: typeof reports its precision, as in decimal(10,2).
+        .otherwise(floating_result)
+    )
 
 
 def log_advice(message: str) -> None:
@@ -1138,11 +1253,11 @@ def ansi_mode_context(spark: SparkSession) -> Iterator[None]:
 def is_ansi_mode_enabled(spark: SparkSession) -> bool:
     def _is_ansi_mode_enabled() -> bool:
         if is_remote():
-            from pyspark.sql.connect.session import SparkSession as ConnectSession
             from pyspark.pandas.config import _key_format, _options_dict
+            from pyspark.sql.connect.session import SparkSession as ConnectSession
 
             client = cast(ConnectSession, spark).client
-            (ansi_mode_support, ansi_enabled) = client.get_config_with_defaults(
+            ansi_mode_support, ansi_enabled = client.get_config_with_defaults(
                 (
                     _key_format("compute.ansi_mode_support"),
                     json.dumps(_options_dict["compute.ansi_mode_support"].default),
@@ -1171,11 +1286,12 @@ def is_ansi_mode_enabled(spark: SparkSession) -> bool:
 
 
 def _test() -> None:
-    import os
     import doctest
+    import os
     import sys
-    from pyspark.sql import SparkSession
+
     import pyspark.pandas.utils
+    from pyspark.sql import SparkSession
 
     os.chdir(os.environ["SPARK_HOME"])
 
@@ -1185,7 +1301,7 @@ def _test() -> None:
     spark = (
         SparkSession.builder.master("local[4]").appName("pyspark.pandas.utils tests").getOrCreate()
     )
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.utils,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

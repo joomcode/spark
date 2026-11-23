@@ -19,6 +19,7 @@ package org.apache.spark.sql.catalyst.analysis.resolver
 
 import java.util.ArrayDeque
 
+import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.analysis.{AnalysisContext, UnresolvedRelation}
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, View}
 import org.apache.spark.sql.connector.catalog.CatalogManager
@@ -30,27 +31,25 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap
  * The [[ViewResolver]] resolves view plans that were already reconstructed by [[SessionCatalog]]
  * from the view text and view metadata (schema, configs).
  */
-class ViewResolver(resolver: Resolver, catalogManager: CatalogManager)
-    extends TreeNodeResolver[View, View] {
+class ViewResolver(
+    resolver: Resolver,
+    catalogManager: CatalogManager,
+    tracker: Option[QueryPlanningTracker] = None)
+    extends TreeNodeResolver[View, View]
+    with ResolverMetricTracker
+    {
   private val cteRegistry = resolver.getCteRegistry
   private val sourceUnresolvedRelationStack = new ArrayDeque[UnresolvedRelation]
   private val viewResolutionContextStack = new ArrayDeque[ViewResolutionContext]
 
-  def getCatalogAndNamespace: Option[Seq[String]] =
-    if (viewResolutionContextStack.isEmpty) {
-      None
-    } else {
-      viewResolutionContextStack.peek().catalogAndNamespace
-    }
-
   /**
-   * Get [[View]]'s default collation if explicitly set.
+   * Get current [[ViewResolutionContext]], if we are resolving a view, or None otherwise.
    */
-  def getDefaultCollation: Option[String] =
+  def getViewResolutionContext: Option[ViewResolutionContext] =
     if (viewResolutionContextStack.isEmpty) {
       None
     } else {
-      viewResolutionContextStack.peek().collation
+      Some(viewResolutionContextStack.peek())
     }
 
   /**
@@ -86,19 +85,20 @@ class ViewResolver(resolver: Resolver, catalogManager: CatalogManager)
    *   - Replace the necessary configurations in [[SQLConf]] with those that were stored with the
    *     view.
    *   - Resolve the view plan using parent [[Resolver]].
-   *   - Create a new [[CatalogTable]] description for the resolved view based on the original
-   *     [[UnresolvedRelation.options]], original [[CatalogTable]] description and used
-   *     [[ViewResolutionContext]].
-   *   - Return the resolved [[View]] with the resolved child and a new [[CatalogTable]]
-   *     description.
+   *   - Sets the views child as analyzed in order to avoid recursing into it using rewrite rules.
+   *   - Return the resolved [[View]] with the resolved child and the original
+   *     [[UnresolvedRelation.options]].
    */
   override def resolve(unresolvedView: View): View = {
-    checkResolverGuard(unresolvedView)
-
     val (resolvedChild, usedViewResolutionContext) = withViewResolutionContext(unresolvedView) {
       SQLConf.withExistingConf(
-        View.effectiveSQLConf(unresolvedView.desc.viewSQLConfigs, unresolvedView.isTempView)
+        View.effectiveSQLConf(
+          configs = unresolvedView.desc.viewSQLConfigs,
+          isTempView = unresolvedView.isTempView,
+          createSparkVersion = unresolvedView.desc.createVersion)
       ) {
+        checkResolverGuard(unresolvedView)
+
         cteRegistry.pushScope(isRoot = true, isOpaque = true)
 
         try {
@@ -108,6 +108,9 @@ class ViewResolver(resolver: Resolver, catalogManager: CatalogManager)
         }
       }
     }
+
+    resolvedChild.setAnalyzed()
+
     val options = if (sourceUnresolvedRelationStack.isEmpty()) {
       CaseInsensitiveStringMap.empty()
     } else {
@@ -125,8 +128,6 @@ class ViewResolver(resolver: Resolver, catalogManager: CatalogManager)
   private def withViewResolutionContext(unresolvedView: View)(
       body: => LogicalPlan): (LogicalPlan, ViewResolutionContext) = {
     AnalysisContext.withAnalysisContext(unresolvedView.desc) {
-      val currentAnalysisContext = AnalysisContext.get
-
       val prevContext = if (viewResolutionContextStack.isEmpty()) {
         ViewResolutionContext(
           nestedViewDepth = 0,
@@ -138,6 +139,8 @@ class ViewResolver(resolver: Resolver, catalogManager: CatalogManager)
 
       val viewResolutionContext = prevContext.copy(
         nestedViewDepth = prevContext.nestedViewDepth + 1,
+        referredTempVariableNames = unresolvedView.desc.viewReferredTempVariableNames,
+        collation = unresolvedView.desc.collation,
         catalogAndNamespace = Some(unresolvedView.desc.viewCatalogAndNamespace)
       )
       viewResolutionContext.validate(unresolvedView)
@@ -150,11 +153,12 @@ class ViewResolver(resolver: Resolver, catalogManager: CatalogManager)
       }
     }
   }
-
   private def checkResolverGuard(unresolvedView: View): Unit = {
-    val resolverGuard = new ResolverGuard(catalogManager)
-    if (!resolverGuard(unresolvedView)) {
-      throw new ExplicitlyUnsupportedResolverFeature("View body is not supported")
+    val resolverGuard = new ResolverGuard(catalogManager, tracker = tracker)
+    resolverGuard(unresolvedView).planUnsupportedReason match {
+      case Some(reason) =>
+        throw new ExplicitlyUnsupportedResolverFeature(s"View body is not supported: $reason")
+      case None =>
     }
   }
 }
@@ -165,19 +169,21 @@ class ViewResolver(resolver: Resolver, catalogManager: CatalogManager)
  *
  * @param nestedViewDepth Current nested view depth. Cannot exceed the `maxNestedViewDepth`.
  * @param maxNestedViewDepth Maximum allowed nested view depth. Configured in the upper context
+ * @param referredTempVariableNames All the temporary variables referred in the view.
  *   based on [[SQLConf.MAX_NESTED_VIEW_DEPTH]].
  * @param collation View's default collation if explicitly set.
- * @param catalogAndNamespace Catalog and camespace under which the [[View]] was created.
+ * @param catalogAndNamespace Catalog and namespace under which the [[View]] was created.
  */
 case class ViewResolutionContext(
     nestedViewDepth: Int,
     maxNestedViewDepth: Int,
+    referredTempVariableNames: Seq[Seq[String]] = Seq.empty,
     collation: Option[String] = None,
     catalogAndNamespace: Option[Seq[String]] = None) {
   def validate(unresolvedView: View): Unit = {
     if (nestedViewDepth > maxNestedViewDepth) {
       throw QueryCompilationErrors.viewDepthExceedsMaxResolutionDepthError(
-        unresolvedView.desc.identifier,
+        unresolvedView.desc.fullIdent,
         maxNestedViewDepth,
         unresolvedView
       )

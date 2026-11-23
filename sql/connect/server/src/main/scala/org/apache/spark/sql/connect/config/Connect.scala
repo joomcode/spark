@@ -20,9 +20,9 @@ import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 import org.apache.spark.SparkEnv
+import org.apache.spark.internal.config.ConfigBindingPolicy
 import org.apache.spark.network.util.ByteUnit
 import org.apache.spark.sql.connect.common.config.ConnectCommon
-import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.buildConf
 
 object Connect {
@@ -54,7 +54,9 @@ object Connect {
     buildStaticConf("spark.connect.grpc.interceptor.classes")
       .doc(
         "Comma separated list of class names that must " +
-          "implement the io.grpc.ServerInterceptor interface.")
+          "implement the io.grpc.ServerInterceptor interface. When authentication is enabled " +
+          "these interceptors run after it, so they only see calls that have already been " +
+          "authenticated and cannot supply the Authorization header themselves.")
       .version("3.4.0")
       .stringConf
       .createOptional
@@ -86,6 +88,49 @@ object Connect {
       .version("3.5.0")
       .intConf
       .createWithDefault(ConnectCommon.CONNECT_GRPC_MARSHALLER_RECURSION_LIMIT)
+
+  val CONNECT_GRPC_KEEPALIVE_ENABLED =
+    buildStaticConf("spark.connect.grpc.keepAlive.enabled")
+      .doc(
+        "Whether the server sends gRPC/HTTP2 keepalive PINGs to detect and terminate " +
+          "silently-dead client connections (see spark.connect.grpc.keepAlive.time / " +
+          ".timeout). Enabled by default; can be turned off as an escape hatch, e.g. if it " +
+          "interacts badly with a particular network path, or a server environment is prone " +
+          "to stalls (long GC pauses, etc.) long enough to trip false-positive disconnects. " +
+          "This only controls the server's own dead-client detection; the server's tolerance " +
+          "of client-initiated keepalive PINGs is " +
+          "independent and always in effect, so that a default-on client is never rejected " +
+          "with too_many_pings regardless of this setting.")
+      .version("4.3.0")
+      .booleanConf
+      .createWithDefault(ConnectCommon.CONNECT_GRPC_KEEPALIVE_ENABLED)
+
+  val CONNECT_GRPC_KEEPALIVE_TIME =
+    buildStaticConf("spark.connect.grpc.keepAlive.time")
+      .doc(
+        "Sets the time the server waits for the connection to be idle before sending a " +
+          "gRPC/HTTP2 keepalive PING, to detect and terminate a silently-dead connection " +
+          "(e.g. after a NAT gateway or load balancer drops an idle connection mapping " +
+          "without closing the socket). The server separately tolerates client-sent keepalive " +
+          "PINGs no more often than every 10s regardless of this setting. Combined with " +
+          "spark.connect.grpc.keepAlive.timeout, this bounds how long a connection can be idle " +
+          "before either side may declare it dead; a stall on either end (e.g. a long JVM GC " +
+          "pause) longer than that combined window can cause an otherwise-healthy connection " +
+          "to be dropped, so raise both values in environments prone to long GC pauses or " +
+          "other event-loop stalls.")
+      .version("4.3.0")
+      .timeConf(TimeUnit.SECONDS)
+      .createWithDefault(ConnectCommon.CONNECT_GRPC_KEEPALIVE_TIME_SECONDS)
+
+  val CONNECT_GRPC_KEEPALIVE_TIMEOUT =
+    buildStaticConf("spark.connect.grpc.keepAlive.timeout")
+      .doc(
+        "Sets how long the server waits for a keepalive PING ack before considering the " +
+          "connection dead. See spark.connect.grpc.keepAlive.time for the combined-window " +
+          "caveat about long GC pauses or other stalls.")
+      .version("4.3.0")
+      .timeConf(TimeUnit.SECONDS)
+      .createWithDefault(ConnectCommon.CONNECT_GRPC_KEEPALIVE_TIMEOUT_SECONDS)
 
   val CONNECT_SESSION_MANAGER_DEFAULT_SESSION_TIMEOUT =
     buildStaticConf("spark.connect.session.manager.defaultSessionTimeout")
@@ -218,6 +263,18 @@ object Connect {
       .toSequence
       .createWithDefault(Nil)
 
+  val CONNECT_EXTENSIONS_GET_STATUS_CLASSES =
+    buildStaticConf("spark.connect.extensions.getStatus.classes")
+      .doc("""
+             |Comma separated list of classes that implement the trait
+             |org.apache.spark.sql.connect.plugin.GetStatusPlugin to support custom
+             |GetStatus extensions in proto.
+             |""".stripMargin)
+      .version("4.1.0")
+      .stringConf
+      .toSequence
+      .createWithDefault(Nil)
+
   val CONNECT_ML_BACKEND_CLASSES =
     buildConf("spark.connect.ml.backend.classes")
       .doc("""
@@ -246,17 +303,6 @@ object Connect {
       .version("3.5.0")
       .intConf
       .createWithDefault(200)
-
-  val CONNECT_COPY_FROM_LOCAL_TO_FS_ALLOW_DEST_LOCAL =
-    buildStaticConf("spark.connect.copyFromLocalToFs.allowDestLocal")
-      .internal()
-      .doc(s"""
-             |(Deprecated since Spark 4.0, please set
-             |'${SQLConf.ARTIFACT_COPY_FROM_LOCAL_TO_FS_ALLOW_DEST_LOCAL.key}' instead.
-             |""".stripMargin)
-      .version("3.5.0")
-      .booleanConf
-      .createWithDefault(false)
 
   val CONNECT_UI_SESSION_LIMIT = buildStaticConf("spark.sql.connect.ui.retainedSessions")
     .doc("The number of client sessions kept in the Spark Connect UI history.")
@@ -297,6 +343,18 @@ object Connect {
       .version("4.0.0")
       .timeConf(TimeUnit.MILLISECONDS)
       .createWithDefaultString("2s")
+
+  val CONNECT_SERVER_SIDE_MAVEN_RESOLUTION_ENABLED =
+    buildConf(ConnectCommon.CONNECT_SERVER_SIDE_MAVEN_RESOLUTION_ENABLED)
+      .doc(
+        "When true, the Spark Connect JVM client resolves eligible Maven dependencies on the " +
+          "server when it advertises support. Dependencies that specify repositories are always " +
+          "resolved on the client. When false, the JVM client resolves all Maven dependencies " +
+          "locally. This is a client routing preference, not a server-side enforcement setting.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
 
   val CONNECT_SESSION_PLAN_CACHE_SIZE =
     buildStaticConf("spark.connect.session.planCache.maxSize")

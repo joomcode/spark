@@ -38,6 +38,9 @@ public interface SupportsRuntimeFiltering extends SupportsRuntimeV2Filtering {
    * <p>
    * Spark will call {@link #filter(Filter[])} if it can derive a runtime
    * predicate for any of the filter attributes.
+   * <p>
+   * Each reference must resolve against the scan relation output when Spark builds it. Attributes
+   * pruned out of {@link Scan#readSchema()} fail to resolve.
    */
   NamedReference[] filterAttributes();
 
@@ -47,12 +50,21 @@ public interface SupportsRuntimeFiltering extends SupportsRuntimeV2Filtering {
    * The provided expressions must be interpreted as a set of filters that are ANDed together.
    * Implementations may use the filters to prune initially planned {@link InputPartition}s.
    * <p>
+   * Spark currently tracks runtime-filter eligibility by root attribute. If
+   * {@link #filterAttributes()}
+   * returns a nested reference, this method may receive a filter on another nested field under
+   * the same root. Implementations must inspect each filter and use only filters they can apply.
+   * Nested paths are encoded in a V1 {@link Filter} as dot-separated names, with each path part
+   * quoted as needed, such as {@code parent.`child.with.dot`}. A top-level column whose name
+   * contains a dot remains quoted, such as {@code `parent.child`}.
+   * <p>
    * If the scan also implements {@link SupportsReportPartitioning}, it must preserve
    * the originally reported partitioning during runtime filtering. While applying runtime filters,
-   * the scan may detect that some {@link InputPartition}s have no matching data. It can omit
-   * such partitions entirely only if it does not report a specific partitioning. Otherwise,
-   * the scan can replace the initially planned {@link InputPartition}s that have no matching
-   * data with empty {@link InputPartition}s but must preserve the overall number of partitions.
+   * the scan may detect that some {@link InputPartition}s have no matching data, in which case
+   * it can either replace the initially planned {@link InputPartition}s that have no matching data
+   * with empty {@link InputPartition}s, or report only a subset of the original partition values
+   * (omitting those with no data) via {@link Batch#planInputPartitions()}. The scan must not report
+   * new partition values that were not present in the original partitioning.
    * <p>
    * Note that Spark will call {@link Scan#toBatch()} again after filtering the scan at runtime.
    *

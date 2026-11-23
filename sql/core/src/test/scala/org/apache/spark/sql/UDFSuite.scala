@@ -34,7 +34,7 @@ import org.apache.spark.sql.catalyst.expressions.{Literal, ScalaUDF}
 import org.apache.spark.sql.catalyst.expressions.Cast._
 import org.apache.spark.sql.catalyst.plans.logical.Project
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
-import org.apache.spark.sql.execution.{QueryExecution, SimpleMode}
+import org.apache.spark.sql.execution.{QueryExecution, SimpleMode, WholeStageCodegenExec}
 import org.apache.spark.sql.execution.aggregate.{ScalaAggregator, ScalaUDAF}
 import org.apache.spark.sql.execution.columnar.InMemoryRelation
 import org.apache.spark.sql.execution.command.{CreateDataSourceTableAsSelectCommand, ExplainCommand}
@@ -64,7 +64,7 @@ private case class KryoBufAggregator() extends Aggregator[Long, KryoEncodedBuf, 
   override def outputEncoder: Encoder[Long] = Encoders.scalaLong
 }
 
-class UDFSuite extends QueryTest with SharedSparkSession {
+class UDFSuite extends SharedSparkSession {
   import testImplicits._
 
   test("udf") {
@@ -169,6 +169,33 @@ class UDFSuite extends QueryTest with SharedSparkSession {
         start = 0,
         stop = 11)
     )
+  }
+
+  test("SPARK-62146: error reporting for named arguments - udf") {
+    val legacyUdaf = new UserDefinedAggregateFunction {
+      def inputSchema: StructType = new StructType().add("a", LongType)
+      def bufferSchema: StructType = new StructType().add("sum", LongType)
+      def dataType: DataType = LongType
+      def deterministic: Boolean = true
+      def initialize(buffer: MutableAggregationBuffer): Unit = {}
+      def update(buffer: MutableAggregationBuffer, input: Row): Unit = {}
+      def merge(buffer1: MutableAggregationBuffer, buffer2: Row): Unit = {}
+      def evaluate(buffer: Row): Any = buffer.getLong(0)
+    }
+    withUserDefinedFunction("f1" -> true, "f2" -> true, "f3" -> true, "f4" -> true) {
+      spark.udf.register("f1", (x: Long) => x + 1)
+      spark.udf.register("f2", udf((x: Long) => x + 1))
+      spark.udf.register("f3", udaf(KryoBufAggregator()))
+      spark.udf.register("f4", legacyUdaf)
+      Seq("f1", "f2", "f3", "f4").foreach { name =>
+        val call = s"$name(x => 1L)"
+        checkError(
+          exception = intercept[AnalysisException](sql(s"SELECT $call").collect()),
+          condition = "NAMED_PARAMETERS_NOT_SUPPORTED",
+          parameters = Map("functionName" -> toSQLId(name)),
+          context = ExpectedContext(fragment = call, start = 7, stop = 6 + call.length))
+      }
+    }
   }
 
   test("error reporting for undefined functions") {
@@ -359,11 +386,11 @@ class UDFSuite extends QueryTest with SharedSparkSession {
       sql("""
            | SELECT tmp.t.* FROM
            | (SELECT arrayDataFunc(data, nestedData) AS t FROM arrayData) tmp
-          """.stripMargin).toDF(), arrayData.toDF())
+          """.stripMargin).toDF(), arrayData)
     checkAnswer(
       sql("""
            | SELECT mapDataFunc(data) AS t FROM mapData
-          """.stripMargin).toDF(), mapData.toDF())
+          """.stripMargin).toDF(), mapData)
     checkAnswer(
       sql("""
            | SELECT tmp.t.* FROM
@@ -1252,6 +1279,21 @@ class UDFSuite extends QueryTest with SharedSparkSession {
         parameters = Map("dataType" -> s"\"${dt.sql}\"")
       )
     }
+    withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true") {
+      Seq(CharType(5), VarcharType(5)).foreach { dt =>
+        val f = udf(
+          new UDF0[String] {
+            override def call(): String = "a"
+          },
+          dt
+        )
+        val df = spark.range(1).select(f().as("c"))
+        assert(df.schema.head.dataType === dt)
+        assert(df.encoder.schema.head.dataType === dt)
+        val expected = if (dt.isInstanceOf[CharType]) "a    " else "a"
+        checkAnswer(df, Row(expected))
+      }
+    }
   }
 
   test("SPARK-47927: ScalaUDF null handling") {
@@ -1261,10 +1303,58 @@ class UDFSuite extends QueryTest with SharedSparkSession {
     checkAnswer(df, Seq(Row(2, 3), Row(null, null)))
   }
 
+  test("SPARK-61935: ScalaUDF null handling of a column made nullable by an outer join") {
+    val f = udf[Int, Int](_ + 1)
+    val ds1 = Seq(1, 2).toDS()
+    val ds2 = Seq(2).toDS()
+    // `ds2("value")` is resolved as non-nullable, and becomes nullable after resolution
+    checkAnswer(
+      ds1.join(ds2, ds1("value") === ds2("value"), "left_outer").select(f(ds2("value"))),
+      Row(null) :: Row(3) :: Nil)
+  }
+
+  test("SPARK-61935: grouping sets, CTE and generator over a ScalaUDF with a primitive input") {
+    withTempView("gs") {
+      withUserDefinedFunction("plus1" -> true) {
+        spark.udf.register("plus1", (x: Int) => x + 1)
+        Seq((1, None), (2, Some(201)), (3, None)).toDF("pk", "salary")
+          .createOrReplaceTempView("gs")
+
+        checkAnswer(
+          sql("SELECT plus1(salary) AS k, count(*) FROM gs " +
+            "GROUP BY GROUPING SETS ((plus1(salary)))"),
+          Row(null, 2) :: Row(202, 1) :: Nil)
+
+        // a CTE that is not inlined
+        checkAnswer(
+          sql(
+            """WITH c AS (SELECT pk, plus1(salary) AS k, rand() AS r FROM gs)
+              |SELECT a.pk, a.k, a.k IS NULL FROM c a JOIN c b ON a.pk = b.pk
+              |""".stripMargin),
+          Row(1, null, true) :: Row(2, 202, false) :: Row(3, null, true) :: Nil)
+
+        val df = sql("SELECT explode(array(plus1(a), plus1(b))) AS v " +
+          "FROM VALUES (1, 2), (NULL, 3) AS t(a, b)")
+        assert(df.schema("v").nullable)
+        checkAnswer(df, Row(2) :: Row(3) :: Row(null) :: Row(4) :: Nil)
+      }
+    }
+  }
+
   test("SPARK-52819: Support using Kryo to encode BUF in Aggregator") {
     val kryoBufUDAF = udaf(KryoBufAggregator())
     val input = Seq(1L, 2L, 3L).toDF("value")
     val result = input.select(kryoBufUDAF($"value").as("sum"))
     checkAnswer(result, Row(6L) :: Nil)
+  }
+
+  test("SPARK-60762: The types of a UDF are not in the generated code") {
+    spark.udf.register("rowSize", (r: Row) => r.size)
+    val df = sql("""SELECT rowSize(named_struct('fieldName"b', id)) AS r FROM range(2)""")
+    val code = df.queryExecution.executedPlan.collect {
+      case w: WholeStageCodegenExec => w.doCodeGen()._2.body
+    }
+    assert(code.nonEmpty && code.forall(!_.contains("fieldName")))
+    checkAnswer(df, Row(1) :: Row(1) :: Nil)
   }
 }

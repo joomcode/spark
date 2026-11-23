@@ -18,10 +18,15 @@ package org.apache.spark.sql.catalyst.types
 
 import org.apache.spark.sql.catalyst.analysis.Resolver
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Cast, Literal}
+import org.apache.spark.sql.catalyst.util.CollationFactory
 import org.apache.spark.sql.catalyst.util.TypeUtils.toSQLId
+import org.apache.spark.sql.connector.catalog.CatalogV2Util
+import org.apache.spark.sql.connector.catalog.Column
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf.StoreAssignmentPolicy
 import org.apache.spark.sql.internal.SQLConf.StoreAssignmentPolicy.{ANSI, STRICT}
+import org.apache.spark.sql.internal.connector.SchemaAlignmentConfig.AnsiStoreAssignmentCastCheck
+import org.apache.spark.sql.internal.connector.SchemaAlignmentConfig.AnsiStoreAssignmentCastCheck.{ANALYSIS, RUNTIME}
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.types.DecimalType.{forType, fromDecimal}
 
@@ -108,13 +113,15 @@ object DataTypeUtils {
       resolver: Resolver,
       context: String,
       storeAssignmentPolicy: StoreAssignmentPolicy.Value,
-      addError: String => Unit): Boolean = {
+      addError: String => Unit,
+      ansiStoreAssignmentCastCheck: AnsiStoreAssignmentCastCheck =
+        AnsiStoreAssignmentCastCheck.DEFAULT): Boolean = {
     (write, read) match {
       case (wArr: ArrayType, rArr: ArrayType) =>
         // run compatibility check first to produce all error messages
         val typesCompatible = canWrite(
           tableName, wArr.elementType, rArr.elementType, byName, resolver, context + ".element",
-          storeAssignmentPolicy, addError)
+          storeAssignmentPolicy, addError, ansiStoreAssignmentCastCheck)
 
         if (wArr.containsNull && !rArr.containsNull) {
           throw QueryCompilationErrors.incompatibleDataToTableNullableArrayElementsError(
@@ -131,10 +138,10 @@ object DataTypeUtils {
         // run compatibility check first to produce all error messages
         val keyCompatible = canWrite(
           tableName, wMap.keyType, rMap.keyType, byName, resolver, context + ".key",
-          storeAssignmentPolicy, addError)
+          storeAssignmentPolicy, addError, ansiStoreAssignmentCastCheck)
         val valueCompatible = canWrite(
           tableName, wMap.valueType, rMap.valueType, byName, resolver, context + ".value",
-          storeAssignmentPolicy, addError)
+          storeAssignmentPolicy, addError, ansiStoreAssignmentCastCheck)
 
         if (wMap.valueContainsNull && !rMap.valueContainsNull) {
           throw QueryCompilationErrors.incompatibleDataToTableNullableMapValuesError(
@@ -152,7 +159,7 @@ object DataTypeUtils {
             val fieldContext = s"$context.${rField.name}"
             val typesCompatible = canWrite(
               tableName, wField.dataType, rField.dataType, byName, resolver, fieldContext,
-              storeAssignmentPolicy, addError)
+              storeAssignmentPolicy, addError, ansiStoreAssignmentCastCheck)
 
             if (byName && !nameMatch) {
               throw QueryCompilationErrors.incompatibleDataToTableUnexpectedColumnNameError(
@@ -195,7 +202,8 @@ object DataTypeUtils {
 
       case (_: NullType, _) if storeAssignmentPolicy == ANSI => true
 
-      case (w: AtomicType, r: AtomicType) if storeAssignmentPolicy == ANSI =>
+      case (w: AtomicType, r: AtomicType)
+          if storeAssignmentPolicy == ANSI && ansiStoreAssignmentCastCheck == ANALYSIS =>
         if (!Cast.canANSIStoreAssign(w, r)) {
           throw QueryCompilationErrors.incompatibleDataToTableCannotSafelyCastError(
             tableName, context, w.catalogString, r.catalogString
@@ -210,13 +218,34 @@ object DataTypeUtils {
       // If write-side data type is a user-defined type, check with its underlying data type.
       case (w, r) if w.isInstanceOf[UserDefinedType[_]] && !r.isInstanceOf[UserDefinedType[_]] =>
         canWrite(tableName, w.asInstanceOf[UserDefinedType[_]].sqlType, r, byName, resolver,
-          context, storeAssignmentPolicy, addError)
+          context, storeAssignmentPolicy, addError, ansiStoreAssignmentCastCheck)
 
       // If read-side data type is a user-defined type, check with its underlying data type.
       case (w, r) if r.isInstanceOf[UserDefinedType[_]] && !w.isInstanceOf[UserDefinedType[_]] =>
         canWrite(tableName, w, r.asInstanceOf[UserDefinedType[_]].sqlType, byName, resolver,
-          context, storeAssignmentPolicy, addError)
+          context, storeAssignmentPolicy, addError, ansiStoreAssignmentCastCheck)
 
+      // RUNTIME defers to the inserted ANSI cast, which fails on malformed or overflowing
+      // values at runtime. Clearly invalid conversion are still rejected either in an earlier
+      // branch of this match clause, or in checkAnalysis.
+      case (w, r) if storeAssignmentPolicy == ANSI && ansiStoreAssignmentCastCheck == RUNTIME =>
+        (w, r) match {
+          // Some casts that pass checkAnalysis don't behave correctly at runtime. Keep rejecting
+          // them for now:
+          // - Long/decimal -> timestamp can silently overflow.
+          // - Variant -> complex types doesn't enforce nested field non-nullability.
+          case (LongType | _: DecimalType, TimestampType) |
+               (VariantType, _: StructType | _: ArrayType | _: MapType) =>
+            throw QueryCompilationErrors.incompatibleDataToTableCannotSafelyCastError(
+              tableName, context, w.catalogString, r.catalogString)
+          // - Building a variant from TIME or nanosecond timestamps isn't supported, whether the
+          //   value is top-level or nested in an array.
+          case (_, VariantType) if w.existsRecursively(
+              t => t.isInstanceOf[TimeType] || t.isInstanceOf[AnyTimestampNanoType]) =>
+            throw QueryCompilationErrors.incompatibleDataToTableCannotSafelyCastError(
+              tableName, context, w.catalogString, r.catalogString)
+          case _ => true
+        }
       case (w, r) =>
         throw QueryCompilationErrors.incompatibleDataToTableCannotSafelyCastError(
           tableName, context, w.catalogString, r.catalogString
@@ -237,6 +266,10 @@ object DataTypeUtils {
     schema.map(toAttribute)
   }
 
+  def toAttributes(columns: Array[Column]): Seq[AttributeReference] = {
+    toAttributes(CatalogV2Util.v2ColumnsToStructType(columns))
+  }
+
   def fromAttributes(attributes: Seq[Attribute]): StructType =
     StructType(attributes.map(a => StructField(a.name, a.dataType, a.nullable, a.metadata)))
 
@@ -251,36 +284,76 @@ object DataTypeUtils {
   }
 
   /**
-   * Extracts all struct field paths from a nested StructType.
+   * Returns true if the two StringTypes have the same base type, i.e., both are [[CharType]],
+   * both are [[VarcharType]], or both are plain [[StringType]].
    */
-  def extractAllFieldPaths(schema: StructType, basePath: Seq[String] = Seq.empty):
-  Seq[Seq[String]] = {
-    schema.flatMap { field =>
-      val fieldPath = basePath :+ field.name
-      field.dataType match {
-        case struct: StructType =>
-          fieldPath +: extractAllFieldPaths(struct, fieldPath)
-        case _ =>
-          Seq(fieldPath)
-      }
+  def areSameBaseType(s1: StringType, s2: StringType): Boolean = {
+    (s1.constraint, s2.constraint) match {
+      case (NoConstraint, NoConstraint) => true
+      case (FixedLength(_), FixedLength(_)) => true
+      case (MaxLength(_), MaxLength(_)) => true
+      case _ => false
     }
   }
 
   /**
-   * Extracts only leaf-level field paths from a nested StructType.
-   * Unlike extractAllFieldPaths, this method does not include intermediate struct paths.
+   * Replace STRING/CHAR/VARCHAR (including nested ones) without explicit collation with the new
+   * type with the given collation.
    */
-  def extractLeafFieldPaths(schema: StructType, basePath: Seq[String] = Seq.empty):
-  Seq[Seq[String]] = {
-    schema.flatMap { field =>
-      val fieldPath = basePath :+ field.name
-      field.dataType match {
-        case struct: StructType =>
-          extractLeafFieldPaths(struct, fieldPath)
-        case _ =>
-          Seq(fieldPath)
-      }
+  def replaceDefaultStringCharAndVarcharTypes(
+      dataType: DataType, collation: String): DataType = {
+    // Should replace STRING/CHAR(10)/VARCHAR(10) with the new type.
+    // Should not replace STRING COLLATE UTF8_BINARY/CHAR(10) COLLATE UTF8_BINARY/
+    // VARCHAR(10) COLLATE UTF8_BINARY, as that is explicit collation.
+    dataType.transformRecursively {
+      case currentType: CharType if isDefaultStringCharOrVarcharType(currentType) =>
+        CharType(currentType.length, collation)
+      case currentType: VarcharType if isDefaultStringCharOrVarcharType(currentType) =>
+        VarcharType(currentType.length, collation)
+      case currentType: StringType if isDefaultStringCharOrVarcharType(currentType) =>
+        StringType(collation)
+    }
+  }
+
+  /**
+   * Returns true if the given data type is STRING/CHAR/VARCHAR without explicit collation.
+   * Even `STRING COLLATE UTF8_BINARY` is considered as with explicit collation.
+   */
+  def isDefaultStringCharOrVarcharType(dataType: DataType): Boolean = {
+    dataType match {
+      case charType: CharType => charType.collation.isEmpty
+      case varcharType: VarcharType => varcharType.collation.isEmpty
+      case st: StringType => st.eq(StringType)
+      case _ => false
+    }
+  }
+
+  /**
+   * Returns true if the given data type contains any STRING/CHAR/VARCHAR with explicit collation
+   * (including explicit `UTF8_BINARY`), recursively checking nested types.
+   */
+  def hasNonDefaultStringCharOrVarcharType(dataType: DataType): Boolean = {
+    dataType.existsRecursively {
+      case st: StringType => !isDefaultStringCharOrVarcharType(st)
+      case _ => false
+    }
+  }
+
+  /**
+   * Recursively replaces all STRING, CHAR and VARCHAR types that do not have an explicit collation
+   * with the same type but with explicit `UTF8_BINARY` collation.
+   *
+   * Used for cases like `SHOW CREATE TABLE`, where we want to show the exact collation of the
+   * columns, because the default collation of the table may change the type of the column.
+   */
+  def replaceNonCollatedTypesWithExplicitUTF8Binary(dataType: DataType): DataType = {
+    dataType.transformRecursively {
+      case charType: CharType if isDefaultStringCharOrVarcharType(charType) =>
+        CharType(charType.length, CollationFactory.UTF8_BINARY_COLLATION_ID)
+      case varcharType: VarcharType if isDefaultStringCharOrVarcharType(varcharType) =>
+        VarcharType(varcharType.length, CollationFactory.UTF8_BINARY_COLLATION_ID)
+      case stringType: StringType if isDefaultStringCharOrVarcharType(stringType) =>
+        StringType(CollationFactory.UTF8_BINARY_COLLATION_ID)
     }
   }
 }
-

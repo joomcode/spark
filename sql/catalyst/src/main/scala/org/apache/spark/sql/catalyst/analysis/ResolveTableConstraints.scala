@@ -16,18 +16,26 @@
  */
 package org.apache.spark.sql.catalyst.analysis
 
-import scala.collection.mutable
-
-import org.apache.spark.sql.catalyst.expressions.{And, CheckInvariant, Expression, V2ExpressionUtils}
+import org.apache.spark.sql.catalyst.expressions.CheckInvariant
 import org.apache.spark.sql.catalyst.plans.logical.{Filter, LogicalPlan, V2WriteCommand, WriteDelta}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.COMMAND
 import org.apache.spark.sql.connector.catalog.CatalogManager
-import org.apache.spark.sql.connector.catalog.constraints.Check
 import org.apache.spark.sql.connector.write.RowLevelOperation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 
-class ResolveTableConstraints(val catalogManager: CatalogManager) extends Rule[LogicalPlan] {
+/**
+ * @param analyze Analyzes a plan under the active SQLConf. The check of a generated column and a
+ *                CHECK condition that a write reads from its text go through it, so that the
+ *                settings the stored text is read under cover its analysis without applying to the
+ *                query of the write.
+ */
+class ResolveTableConstraints(
+    val catalogManager: CatalogManager,
+    analyze: LogicalPlan => LogicalPlan) extends Rule[LogicalPlan] {
+
+  private val tableConstraintResolution = new TableConstraintResolution(
+    this.catalogManager, analyze, conf.sessionLocalTimeZone)
 
   override def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsWithPruning(
     _.containsPattern(COMMAND), ruleId) {
@@ -39,19 +47,8 @@ class ResolveTableConstraints(val catalogManager: CatalogManager) extends Rule[L
       if v2Write.table.resolved && v2Write.query.resolved &&
         !containsCheckInvariant(v2Write.query) && v2Write.outputResolved =>
       v2Write.table match {
-        case r: DataSourceV2Relation
-          if r.table.constraints != null && r.table.constraints.nonEmpty =>
-          // Check constraint is the only enforced constraint for DSV2 tables.
-          val checkInvariants = r.table.constraints.collect {
-            case c: Check =>
-              val unresolvedExpr = buildCatalystExpression(c)
-              val columnExtractors = mutable.Map[String, Expression]()
-              buildColumnExtractors(unresolvedExpr, columnExtractors)
-              CheckInvariant(unresolvedExpr, columnExtractors.toSeq, c.name, c.predicateSql)
-          }
-          // Combine the check invariants into a single expression using conjunctive AND.
-          checkInvariants.reduceOption(And).fold(v2Write)(
-            condition => v2Write.withNewQuery(Filter(condition, v2Write.query)))
+        case r: DataSourceV2Relation =>
+          tableConstraintResolution.resolveTableConstraints(v2Write, r)
         case _ =>
           v2Write
       }
@@ -63,27 +60,6 @@ class ResolveTableConstraints(val catalogManager: CatalogManager) extends Rule[L
         condition.exists(_.isInstanceOf[CheckInvariant])
 
       case _ => false
-    }
-  }
-
-  private def buildCatalystExpression(c: Check): Expression = {
-    Option(c.predicate())
-      .flatMap(V2ExpressionUtils.toCatalyst)
-      .getOrElse(catalogManager.v1SessionCatalog.parser.parseExpression(c.predicateSql()))
-  }
-
-  private def buildColumnExtractors(
-      expr: Expression,
-      columnExtractors: mutable.Map[String, Expression]): Unit = {
-    expr match {
-      case u: UnresolvedExtractValue =>
-        // When extracting a value from a Map or Array type, we display only the specific extracted
-        // value rather than the entire Map or Array structure for clarity and readability.
-        columnExtractors(u.sql) = u
-      case u: UnresolvedAttribute =>
-        columnExtractors(u.name) = u
-      case other =>
-        other.children.foreach(buildColumnExtractors(_, columnExtractors))
     }
   }
 }

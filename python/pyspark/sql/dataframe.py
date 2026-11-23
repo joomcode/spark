@@ -17,9 +17,10 @@
 
 # mypy: disable-error-code="empty-body"
 
-import sys
 import random
+import sys
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -30,29 +31,28 @@ from typing import (
     Tuple,
     Union,
     overload,
-    TYPE_CHECKING,
 )
 
 from pyspark import _NoValue
 from pyspark._globals import _NoValueType
-from pyspark.util import is_remote_only
-from pyspark.storagelevel import StorageLevel
 from pyspark.resource import ResourceProfile
 from pyspark.sql.column import Column
-from pyspark.sql.readwriter import DataFrameWriter, DataFrameWriterV2
 from pyspark.sql.merge import MergeIntoWriter
+from pyspark.sql.readwriter import DataFrameWriter, DataFrameWriterV2
 from pyspark.sql.streaming import DataStreamWriter
 from pyspark.sql.table_arg import TableArg
-from pyspark.sql.types import StructType, Row
+from pyspark.sql.types import Row, StructType
 from pyspark.sql.utils import dispatch_df_method
-
+from pyspark.storagelevel import StorageLevel
+from pyspark.util import is_remote_only
 
 if TYPE_CHECKING:
-    from py4j.java_gateway import JavaObject
     import pyarrow as pa
+    from py4j.java_gateway import JavaObject
+
+    from pyspark._typing import PrimitiveType
     from pyspark.core.context import SparkContext
     from pyspark.core.rdd import RDD
-    from pyspark._typing import PrimitiveType
     from pyspark.pandas.frame import DataFrame as PandasOnSparkDataFrame
     from pyspark.sql._typing import (
         ColumnOrName,
@@ -61,19 +61,90 @@ if TYPE_CHECKING:
         OptionalPrimitiveType,
     )
     from pyspark.sql.context import SQLContext
-    from pyspark.sql.session import SparkSession
     from pyspark.sql.group import GroupedData
+    from pyspark.sql.metrics import ExecutionInfo
     from pyspark.sql.observation import Observation
     from pyspark.sql.pandas._typing import (
-        PandasMapIterFunction,
         ArrowMapIterFunction,
+        PandasMapIterFunction,
+    )
+    from pyspark.sql.pandas._typing import (
         DataFrameLike as PandasDataFrameLike,
     )
     from pyspark.sql.plot import PySparkPlotAccessor
-    from pyspark.sql.metrics import ExecutionInfo
+    from pyspark.sql.session import SparkSession
 
 
 __all__ = ["DataFrame", "DataFrameNaFunctions", "DataFrameStatFunctions"]
+
+
+def _validate_approx_quantile_probabilities(probabilities: Any) -> List[float]:
+    """
+    Validate the ``probabilities`` argument of ``DataFrame.approxQuantile``, shared by the
+    classic and Connect implementations so both stay in sync. Returns it as a ``list`` of
+    ``float``, since classic passes it to a JVM method that expects ``Double`` elements.
+    """
+    from pyspark.errors import PySparkTypeError, PySparkValueError
+
+    if not isinstance(probabilities, (list, tuple)):
+        raise PySparkTypeError(
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "arg_name": "probabilities",
+                "expected_type": "list or tuple",
+                "arg_type": type(probabilities).__name__,
+            },
+        )
+    probabilities = list(probabilities)
+    for p in probabilities:
+        if isinstance(p, bool) or not isinstance(p, (float, int)):
+            raise PySparkTypeError(
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "arg_name": "probabilities",
+                    "expected_type": "list[float, int]",
+                    "arg_type": type(p).__name__,
+                },
+            )
+    for p in probabilities:
+        if not (0 <= p <= 1):
+            raise PySparkValueError(
+                errorClass="VALUE_OUT_OF_BOUNDS",
+                messageParameters={
+                    "arg_name": "probabilities",
+                    "lower_bound": "0",
+                    "upper_bound": "1",
+                    "actual": str(p),
+                },
+            )
+    return [float(p) for p in probabilities]
+
+
+def _validate_approx_quantile_relative_error(relativeError: Any) -> float:
+    """
+    Validate the ``relativeError`` argument of ``DataFrame.approxQuantile``, shared by the
+    classic and Connect implementations so both stay in sync. Returns it as a ``float``.
+    """
+    from pyspark.errors import PySparkTypeError, PySparkValueError
+
+    if isinstance(relativeError, bool) or not isinstance(relativeError, (float, int)):
+        raise PySparkTypeError(
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "float or int",
+                "arg_name": "relativeError",
+                "arg_type": type(relativeError).__name__,
+            },
+        )
+    if not relativeError >= 0:
+        raise PySparkValueError(
+            errorClass="NEGATIVE_VALUE",
+            messageParameters={
+                "arg_name": "relativeError",
+                "arg_value": str(relativeError),
+            },
+        )
+    return float(relativeError)
 
 
 class DataFrame:
@@ -148,7 +219,7 @@ class DataFrame:
     ) -> "DataFrame":
         from pyspark.sql.classic.dataframe import DataFrame
 
-        return DataFrame.__new__(DataFrame, jdf, sql_ctx)
+        return DataFrame(jdf, sql_ctx)
 
     @property
     def sparkSession(self) -> "SparkSession":
@@ -245,31 +316,35 @@ class DataFrame:
         """
         ...
 
-    if not is_remote_only():
+    @dispatch_df_method
+    def toJSON(self, use_unicode: bool = True) -> Union["RDD[str]", "DataFrame"]:
+        """Converts a :class:`DataFrame` into a :class:`RDD` of string or :class:`DataFrame`.
 
-        def toJSON(self, use_unicode: bool = True) -> "RDD[str]":
-            """Converts a :class:`DataFrame` into a :class:`RDD` of string.
+        Each row is turned into a JSON document as one element in the returned RDD
+        or DataFrame.
 
-            Each row is turned into a JSON document as one element in the returned RDD.
+        .. versionadded:: 1.3.0
 
-            .. versionadded:: 1.3.0
+        .. versionchanged:: 4.2.0
+            Supports Spark Connect.
 
-            Parameters
-            ----------
-            use_unicode : bool, optional, default True
-                Whether to convert to unicode or not.
+        Parameters
+        ----------
+        use_unicode : bool, optional, default True
+            Whether to convert to unicode or not. Note that this argument is disallowed
+            in Spark Connect mode.
 
-            Returns
-            -------
-            :class:`RDD`
+        Returns
+        -------
+        :class:`RDD` (in Classic mode) or :class:`DataFrame` (in connect mode)
 
-            Examples
-            --------
-            >>> df = spark.createDataFrame([(2, "Alice"), (5, "Bob")], schema=["age", "name"])
-            >>> df.toJSON().first()
-            '{"age":2,"name":"Alice"}'
-            """
-            ...
+        Examples
+        --------
+        >>> df = spark.createDataFrame([(2, "Alice"), (5, "Bob")], schema=["age", "name"])
+        >>> df.toJSON().first()  # doctest: +SKIP
+        '{"age":2,"name":"Alice"}'
+        """
+        ...
 
     @dispatch_df_method
     def registerTempTable(self, name: str) -> None:
@@ -779,6 +854,58 @@ class DataFrame:
         ...
 
     @dispatch_df_method
+    def zipWithIndex(self, indexColName: str = "index") -> "DataFrame":
+        """Returns a new :class:`DataFrame` by appending a column containing consecutive
+        0-based Long indices, similar to :meth:`RDD.zipWithIndex`.
+
+        The index column is appended as the last column of the resulting :class:`DataFrame`.
+
+        .. versionadded:: 4.2.0
+
+        Parameters
+        ----------
+        indexColName : str, default "index"
+            The name of the index column to append.
+
+        Returns
+        -------
+        :class:`DataFrame`
+            A new DataFrame with an appended index column.
+
+        Notes
+        -----
+        If a column with `indexColName` already exists in the schema, the resulting
+        :class:`DataFrame` will have duplicate column names. Selecting the duplicate column
+        by name will throw `AMBIGUOUS_REFERENCE`, and writing the :class:`DataFrame` will
+        throw `COLUMN_ALREADY_EXISTS`.
+
+        Examples
+        --------
+        >>> df = spark.createDataFrame(
+        ...     [("a", 1), ("b", 2), ("c", 3)], ["letter", "number"])
+        >>> df.zipWithIndex().show()
+        +------+------+-----+
+        |letter|number|index|
+        +------+------+-----+
+        |     a|     1|    0|
+        |     b|     2|    1|
+        |     c|     3|    2|
+        +------+------+-----+
+
+        Custom index column name:
+
+        >>> df.zipWithIndex("row_id").show()
+        +------+------+------+
+        |letter|number|row_id|
+        +------+------+------+
+        |     a|     1|     0|
+        |     b|     2|     1|
+        |     c|     3|     2|
+        +------+------+------+
+        """
+        ...
+
+    @dispatch_df_method
     def isLocal(self) -> bool:
         """Returns ``True`` if the :func:`collect` and :func:`take` methods can be run locally
         (without any Spark executors).
@@ -975,8 +1102,7 @@ class DataFrame:
         ...
 
     @dispatch_df_method
-    def __repr__(self) -> str:
-        ...
+    def __repr__(self) -> str: ...
 
     @dispatch_df_method
     def _repr_html_(self) -> Optional[str]:
@@ -1710,15 +1836,7 @@ class DataFrame:
         """
         return DataFrame(self._jdf.coalesce(numPartitions), self.sparkSession)
 
-    @overload
-    def repartition(self, numPartitions: int, *cols: "ColumnOrName") -> "DataFrame":
-        ...
-
-    @overload
-    def repartition(self, *cols: "ColumnOrName") -> "DataFrame":
-        ...
-
-    @dispatch_df_method  # type: ignore[misc]
+    @dispatch_df_method
     def repartition(
         self, numPartitions: Union[int, "ColumnOrName"], *cols: "ColumnOrName"
     ) -> "DataFrame":
@@ -1826,15 +1944,7 @@ class DataFrame:
         """
         ...
 
-    @overload
-    def repartitionByRange(self, numPartitions: int, *cols: "ColumnOrName") -> "DataFrame":
-        ...
-
-    @overload
-    def repartitionByRange(self, *cols: "ColumnOrName") -> "DataFrame":
-        ...
-
-    @dispatch_df_method  # type: ignore[misc]
+    @dispatch_df_method
     def repartitionByRange(
         self, numPartitions: Union[int, "ColumnOrName"], *cols: "ColumnOrName"
     ) -> "DataFrame":
@@ -2056,8 +2166,12 @@ class DataFrame:
         ...
 
     @overload
-    def sample(self, fraction: float, seed: Optional[int] = ...) -> "DataFrame":
-        ...
+    def sample(
+        self, *, withReplacement: Optional[bool] = None, fraction: float, seed: Optional[int] = ...
+    ) -> "DataFrame": ...
+
+    @overload
+    def sample(self, withReplacement: float, fraction: Optional[int] = ..., /) -> "DataFrame": ...
 
     @overload
     def sample(
@@ -2065,10 +2179,9 @@ class DataFrame:
         withReplacement: Optional[bool],
         fraction: float,
         seed: Optional[int] = ...,
-    ) -> "DataFrame":
-        ...
+    ) -> "DataFrame": ...
 
-    @dispatch_df_method  # type: ignore[misc]
+    @dispatch_df_method
     def sample(
         self,
         withReplacement: Optional[Union[float, bool]] = None,
@@ -2153,8 +2266,9 @@ class DataFrame:
         else:
             argtypes = [type(arg).__name__ for arg in [withReplacement, fraction, seed]]
             raise PySparkTypeError(
-                errorClass="NOT_BOOL_OR_FLOAT_OR_INT",
+                errorClass="NOT_EXPECTED_TYPE",
                 messageParameters={
+                    "expected_type": "bool, float or int",
                     "arg_name": "withReplacement (optional), "
                     + "fraction (required) and seed (optional)",
                     "arg_type": ", ".join(argtypes),
@@ -2545,6 +2659,49 @@ class DataFrame:
         ...
 
     @dispatch_df_method
+    def zip(self, other: "DataFrame") -> "DataFrame":
+        """Combines the columns of this :class:`DataFrame` with another :class:`DataFrame`
+        side-by-side, preserving row alignment between the two inputs.
+
+        Both DataFrames must produce the same canonicalized plan after stripping outer
+        ``Project`` chains. In practice this means they derive from a common source through
+        chains of projection-only operations (:meth:`select`, :meth:`withColumn`,
+        :meth:`withColumnRenamed`, etc.); the chains may differ between the two sides, but
+        anything below them, including any :meth:`filter`, :meth:`orderBy`, :meth:`join`,
+        or aggregation, must be identical on both sides so the two sides stay row-aligned.
+        Non-scalar Python UDFs (e.g., ``GROUPED_MAP``) are not allowed on either side. An
+        :class:`AnalysisException` is thrown when the two DataFrames cannot be aligned.
+
+        .. versionadded:: 4.3.0
+
+        Parameters
+        ----------
+        other : :class:`DataFrame`
+            The DataFrame to combine with, which must derive from the same source as this
+            DataFrame.
+
+        Returns
+        -------
+        :class:`DataFrame`
+            A new DataFrame containing the columns of this DataFrame followed by the columns
+            of `other`.
+
+        Examples
+        --------
+        >>> df = spark.createDataFrame([(1, 2, 3), (4, 5, 6)], ["a", "b", "c"])
+        >>> left = df.select("a")
+        >>> right = df.select("b")
+        >>> left.zip(right).show()
+        +---+---+
+        |  a|  b|
+        +---+---+
+        |  1|  2|
+        |  4|  5|
+        +---+---+
+        """
+        ...
+
+    @dispatch_df_method
     def join(
         self,
         other: "DataFrame",
@@ -2828,6 +2985,73 @@ class DataFrame:
         """
         ...
 
+    def nearestByJoin(
+        self,
+        other: "DataFrame",
+        rankingExpression: Column,
+        numResults: int,
+        mode: str,
+        direction: str,
+        *,
+        joinType: str = "inner",
+    ) -> "DataFrame":
+        """
+        Nearest-by top-K ranking join with another :class:`DataFrame`. For each row on the
+        left (query side), returns up to ``numResults`` rows from ``other`` (base side), ranked
+        by ``rankingExpression``.
+
+        The current implementation evaluates the full cross-product of left and right and
+        bounds memory per left row by ``numResults``. Index-backed approximate strategies
+        (transparent to ``approx`` mode) are planned for a future release; until then,
+        pre-filter ``other`` when it is large. Tie-breaking among rows with equal ranking
+        values is unspecified.
+
+        .. versionadded:: 4.2.0
+
+        Parameters
+        ----------
+        other : :class:`DataFrame`
+            Right (base side) of the join - the candidate pool searched for each row of this
+            DataFrame.
+        rankingExpression : :class:`Column`
+            Scalar expression used to rank candidate rows on the right side.
+        numResults : int
+            Maximum number of matches per query row. Must be between 1 and 100000.
+        mode : str
+            Search algorithm contract. Must be one of: ``approx``, ``exact``. ``approx`` allows
+            the optimizer to use indexed or other approximate strategies when available;
+            ``exact`` forces brute-force evaluation and requires the ranking expression to be
+            deterministic.
+        direction : str
+            ``"distance"`` (smallest value first) or ``"similarity"`` (largest value first).
+        joinType : str, keyword-only, optional
+            Default ``inner``. Must be one of: ``inner``, ``leftouter``.
+
+        Returns
+        -------
+        :class:`DataFrame`
+            Joined DataFrame.
+
+        Examples
+        --------
+        >>> from pyspark.sql import functions as sf
+        >>> users = spark.createDataFrame(
+        ...     [(1, 10.0), (2, 20.0), (3, 30.0)], ["user_id", "score"])
+        >>> products = spark.createDataFrame(
+        ...     [("A", 11.0), ("B", 22.0), ("C", 5.0)], ["product", "pscore"])
+        >>> users.nearestByJoin(
+        ...     products, -sf.abs(users.score - products.pscore), 1, "exact", "similarity"
+        ... ).select("user_id", "product").orderBy("user_id").show()
+        +-------+-------+
+        |user_id|product|
+        +-------+-------+
+        |      1|      A|
+        |      2|      B|
+        |      3|      B|
+        +-------+-------+
+        """
+        ...
+
     # TODO(SPARK-22947): Fix the DataFrame API.
     @dispatch_df_method
     def _joinAsOf(
@@ -2870,7 +3094,8 @@ class DataFrame:
             an asof tolerance within this range; must be compatible
             with the merge index.
         allowExactMatches : bool, optional
-            default ``True``.
+            default ``True``. If ``False``, a right row with an equal key is not matched.
+            The ``tolerance`` bound stays inclusive.
         direction : str, optional
             default ``backward``. Must be one of: ``backward``, ``forward``, and ``nearest``.
 
@@ -2918,7 +3143,7 @@ class DataFrame:
     @dispatch_df_method
     def sortWithinPartitions(
         self,
-        *cols: Union[int, str, Column, List[Union[int, str, Column]]],
+        *cols: Union[Sequence["ColumnOrNameOrOrdinal"], "ColumnOrNameOrOrdinal"],
         **kwargs: Any,
     ) -> "DataFrame":
         """Returns a new :class:`DataFrame` with each partition sorted by the specified column(s).
@@ -2982,7 +3207,7 @@ class DataFrame:
     @dispatch_df_method
     def sort(
         self,
-        *cols: Union[int, str, Column, List[Union[int, str, Column]]],
+        *cols: Union[Sequence["ColumnOrNameOrOrdinal"], "ColumnOrNameOrOrdinal"],
         **kwargs: Any,
     ) -> "DataFrame":
         """Returns a new :class:`DataFrame` sorted by the specified column(s).
@@ -3142,46 +3367,53 @@ class DataFrame:
     def _preapare_cols_for_sort(
         self,
         _to_col: Callable[[str], Column],
-        cols: Sequence[Union[int, str, Column, List[Union[int, str, Column]]]],
+        cols: Sequence[Union[Sequence["ColumnOrNameOrOrdinal"], "ColumnOrNameOrOrdinal"]],
         kwargs: Dict[str, Any],
     ) -> Sequence[Column]:
-        from pyspark.errors import PySparkTypeError, PySparkValueError, PySparkIndexError
+        from pyspark.errors import PySparkIndexError, PySparkTypeError, PySparkValueError
 
         if not cols:
             raise PySparkValueError(
                 errorClass="CANNOT_BE_EMPTY", messageParameters={"item": "cols"}
             )
 
-        if len(cols) == 1 and isinstance(cols[0], list):
-            cols = cols[0]
+        if (
+            len(cols) == 1
+            and not isinstance(cols[0], (int, str, Column))
+            and isinstance(cols[0], Sequence)
+        ):
+            cols = tuple(cols[0])
 
-        _cols: List[Column] = []
-        for c in cols:
+        def _get_col(
+            c: Union[Sequence["ColumnOrNameOrOrdinal"], "ColumnOrNameOrOrdinal"],
+        ) -> Column:
             if isinstance(c, int) and not isinstance(c, bool):
                 # ordinal is 1-based
                 if c > 0:
-                    _cols.append(self[c - 1])
+                    return self[c - 1]
                 # negative ordinal means sort by desc
                 elif c < 0:
-                    _cols.append(self[-c - 1].desc())
+                    return self[-c - 1].desc()
                 else:
                     raise PySparkIndexError(
                         errorClass="ZERO_INDEX",
                         messageParameters={},
                     )
             elif isinstance(c, Column):
-                _cols.append(c)
+                return c
             elif isinstance(c, str):
-                _cols.append(_to_col(c))
+                return _to_col(c)
             else:
                 raise PySparkTypeError(
-                    errorClass="NOT_COLUMN_OR_INT_OR_STR",
+                    errorClass="NOT_EXPECTED_TYPE",
                     messageParameters={
+                        "expected_type": "Column, int or str",
                         "arg_name": "col",
                         "arg_type": type(c).__name__,
                     },
                 )
 
+        _cols: List[Column] = [_get_col(c) for c in cols]
         ascending = kwargs.get("ascending", True)
         if isinstance(ascending, (bool, int)):
             if not ascending:
@@ -3190,8 +3422,12 @@ class DataFrame:
             _cols = [c if asc else c.desc() for asc, c in zip(ascending, _cols)]
         else:
             raise PySparkTypeError(
-                errorClass="NOT_COLUMN_OR_INT_OR_STR",
-                messageParameters={"arg_name": "ascending", "arg_type": type(ascending).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "expected_type": "bool, int or list",
+                    "arg_name": "ascending",
+                    "arg_type": type(ascending).__name__,
+                },
             )
         return _cols
 
@@ -3333,12 +3569,10 @@ class DataFrame:
         ...
 
     @overload
-    def head(self) -> Optional[Row]:
-        ...
+    def head(self) -> Optional[Row]: ...
 
     @overload
-    def head(self, n: int) -> List[Row]:
-        ...
+    def head(self, n: int) -> List[Row]: ...
 
     @dispatch_df_method
     def head(self, n: Optional[int] = None) -> Union[Optional[Row], List[Row]]:
@@ -3402,12 +3636,10 @@ class DataFrame:
         ...
 
     @overload
-    def __getitem__(self, item: Union[int, str]) -> Column:
-        ...
+    def __getitem__(self, item: Union[int, str]) -> Column: ...
 
     @overload
-    def __getitem__(self, item: Union[Column, List, Tuple]) -> "DataFrame":
-        ...
+    def __getitem__(self, item: Union[Column, List, Tuple]) -> "DataFrame": ...
 
     @dispatch_df_method
     def __getitem__(self, item: Union[int, str, Column, List, Tuple]) -> Union[Column, "DataFrame"]:
@@ -3561,15 +3793,13 @@ class DataFrame:
         ...
 
     @overload
-    def select(self, *cols: "ColumnOrName") -> "DataFrame":
-        ...
+    def select(self, *cols: "ColumnOrName") -> "DataFrame": ...
 
     @overload
-    def select(self, __cols: Union[List[Column], List[str]]) -> "DataFrame":
-        ...
+    def select(self, __cols: Sequence["ColumnOrName"]) -> "DataFrame": ...
 
-    @dispatch_df_method  # type: ignore[misc]
-    def select(self, *cols: "ColumnOrName") -> "DataFrame":
+    @dispatch_df_method
+    def select(self, *cols: Union[Sequence["ColumnOrName"], "ColumnOrName"]) -> "DataFrame":
         """Projects a set of expressions and returns a new :class:`DataFrame`.
 
         .. versionadded:: 1.3.0
@@ -3617,12 +3847,10 @@ class DataFrame:
         ...
 
     @overload
-    def selectExpr(self, *expr: str) -> "DataFrame":
-        ...
+    def selectExpr(self, *expr: str) -> "DataFrame": ...
 
     @overload
-    def selectExpr(self, *expr: List[str]) -> "DataFrame":
-        ...
+    def selectExpr(self, *expr: List[str]) -> "DataFrame": ...
 
     @dispatch_df_method
     def selectExpr(self, *expr: Union[str, List[str]]) -> "DataFrame":
@@ -3811,15 +4039,15 @@ class DataFrame:
         ...
 
     @overload
-    def groupBy(self, *cols: "ColumnOrNameOrOrdinal") -> "GroupedData":
-        ...
+    def groupBy(self, *cols: "ColumnOrNameOrOrdinal") -> "GroupedData": ...
 
     @overload
-    def groupBy(self, __cols: Union[List[Column], List[str], List[int]]) -> "GroupedData":
-        ...
+    def groupBy(self, __cols: Sequence["ColumnOrNameOrOrdinal"]) -> "GroupedData": ...
 
-    @dispatch_df_method  # type: ignore[misc]
-    def groupBy(self, *cols: "ColumnOrNameOrOrdinal") -> "GroupedData":
+    @dispatch_df_method
+    def groupBy(
+        self, *cols: Union[Sequence["ColumnOrNameOrOrdinal"], "ColumnOrNameOrOrdinal"]
+    ) -> "GroupedData":
         """
         Groups the :class:`DataFrame` by the specified columns so that aggregation
         can be performed on them.
@@ -3921,15 +4149,15 @@ class DataFrame:
         ...
 
     @overload
-    def rollup(self, *cols: "ColumnOrName") -> "GroupedData":
-        ...
+    def rollup(self, *cols: "ColumnOrNameOrOrdinal") -> "GroupedData": ...
 
     @overload
-    def rollup(self, __cols: Union[List[Column], List[str]]) -> "GroupedData":
-        ...
+    def rollup(self, __cols: Sequence["ColumnOrNameOrOrdinal"]) -> "GroupedData": ...
 
-    @dispatch_df_method  # type: ignore[misc]
-    def rollup(self, *cols: "ColumnOrNameOrOrdinal") -> "GroupedData":
+    @dispatch_df_method
+    def rollup(
+        self, *cols: Union[Sequence["ColumnOrNameOrOrdinal"], "ColumnOrNameOrOrdinal"]
+    ) -> "GroupedData":
         """
         Create a multi-dimensional rollup for the current :class:`DataFrame` using
         the specified columns, allowing for aggregation on them.
@@ -4004,15 +4232,15 @@ class DataFrame:
         ...
 
     @overload
-    def cube(self, *cols: "ColumnOrName") -> "GroupedData":
-        ...
+    def cube(self, *cols: "ColumnOrNameOrOrdinal") -> "GroupedData": ...
 
     @overload
-    def cube(self, __cols: Union[List[Column], List[str]]) -> "GroupedData":
-        ...
+    def cube(self, __cols: Sequence["ColumnOrNameOrOrdinal"]) -> "GroupedData": ...
 
-    @dispatch_df_method  # type: ignore[misc]
-    def cube(self, *cols: "ColumnOrName") -> "GroupedData":
+    @dispatch_df_method
+    def cube(
+        self, *cols: Union[Sequence["ColumnOrNameOrOrdinal"], "ColumnOrNameOrOrdinal"]
+    ) -> "GroupedData":
         """
         Create a multi-dimensional cube for the current :class:`DataFrame` using
         the specified columns, allowing aggregations to be performed on them.
@@ -4093,7 +4321,9 @@ class DataFrame:
 
     @dispatch_df_method
     def groupingSets(
-        self, groupingSets: Sequence[Sequence["ColumnOrName"]], *cols: "ColumnOrName"
+        self,
+        groupingSets: Sequence[Sequence["ColumnOrNameOrOrdinal"]],
+        *cols: "ColumnOrNameOrOrdinal",
     ) -> "GroupedData":
         """
         Create multi-dimensional aggregation for the current :class:`DataFrame` using the specified
@@ -4180,6 +4410,85 @@ class DataFrame:
         See Also
         --------
         DataFrame.rollup : Compute hierarchical summaries at multiple levels.
+        """
+        ...
+
+    @dispatch_df_method
+    def binBy(
+        self,
+        rangeStart: "ColumnOrName",
+        rangeEnd: "ColumnOrName",
+        binWidth: Column,
+        distributeUniform: Union[List["ColumnOrName"], Tuple["ColumnOrName", ...]],
+        *,
+        alignTo: Optional[Column] = None,
+        binStartName: Optional[str] = None,
+        binEndName: Optional[str] = None,
+        binDistributeRatioName: Optional[str] = None,
+    ) -> "DataFrame":
+        """Split timestamp ranges across fixed bins and proportionally scale selected columns.
+
+        .. versionadded:: 4.4.0
+
+        Supports Spark Connect.
+
+        Parameters
+        ----------
+        rangeStart : :class:`Column` or str
+            Top-level timestamp column for the inclusive range start.
+        rangeEnd : :class:`Column` or str
+            Top-level timestamp column for the exclusive range end.
+            Both range columns must have the same timestamp type.
+        binWidth : :class:`Column`
+            Positive, constant day-time interval expression,
+            for example ``sf.expr("INTERVAL 5 MINUTES")``.
+        distributeUniform : list or tuple
+            Nonempty collection of top-level FLOAT or DOUBLE columns to scale.
+            Each entry is a :class:`Column` or a column name.
+        alignTo : :class:`Column`, optional
+            Constant alignment origin with the same timestamp type as the range columns.
+            The default is 1970-01-01 00:00:00, in the session time zone for TIMESTAMP.
+        binStartName : str, optional
+            Name for the appended bin-start column. The default is ``bin_start``.
+        binEndName : str, optional
+            Name for the appended bin-end column. The default is ``bin_end``.
+        binDistributeRatioName : str, optional
+            Name for the appended overlap-ratio column.
+            The default is ``bin_distribute_ratio``.
+
+        Returns
+        -------
+        :class:`DataFrame`
+            Input columns with the selected values scaled, followed by the three bin columns.
+
+        Notes
+        -----
+        This API is experimental.
+
+        This operation requires ``spark.sql.binByRelationOperator.enabled`` to be true.
+        The range and distribution arguments must directly reference top-level columns.
+        Use :meth:`select` to project computed, cast, or nested values into columns first.
+
+        Each selected value must represent the change over its input range.
+        The ratio uses the real elapsed time that overlaps each bin.
+        TIMESTAMP bins use the session time zone for widths of at least one day.
+        TIMESTAMP_NTZ bins and sub-day widths use UTC arithmetic.
+
+        A zero-length range produces one row with a ratio of 1.0.
+        An inverted range raises an error.
+        A NULL range bound produces one row with NULL bin columns and NULL scaled values.
+
+        Examples
+        --------
+        >>> from pyspark.sql import functions as sf
+        >>> spark.conf.set("spark.sql.binByRelationOperator.enabled", "true")
+        >>> df = spark.sql("SELECT TIMESTAMP_NTZ '2024-01-01 00:00:00' AS start, "
+        ...                "TIMESTAMP_NTZ '2024-01-01 00:10:00' AS end, 100.0D AS value")
+        >>> df.binBy("start", "end", sf.expr("INTERVAL 5 MINUTES"), ["value"]).select(
+        ...     "value", "bin_distribute_ratio"
+        ... ).collect()
+        [Row(value=50.0, bin_distribute_ratio=0.5), Row(value=50.0, bin_distribute_ratio=0.5)]
+        >>> spark.conf.unset("spark.sql.binByRelationOperator.enabled")
         """
         ...
 
@@ -4759,14 +5068,6 @@ class DataFrame:
 
         .. versionadded:: 2.4.0
 
-        .. versionchanged:: 3.4.0
-            Supports Spark Connect.
-
-        Parameters
-        ----------
-        other : :class:`DataFrame`
-            Another :class:`DataFrame` that needs to be combined.
-
         Returns
         -------
         :class:`DataFrame`
@@ -5075,18 +5376,6 @@ class DataFrame:
         """
         ...
 
-    @overload
-    def fillna(
-        self,
-        value: "LiteralType",
-        subset: Optional[Union[str, Tuple[str, ...], List[str]]] = ...,
-    ) -> "DataFrame":
-        ...
-
-    @overload
-    def fillna(self, value: Dict[str, "LiteralType"]) -> "DataFrame":
-        ...
-
     @dispatch_df_method
     def fillna(
         self,
@@ -5185,8 +5474,7 @@ class DataFrame:
         to_replace: "LiteralType",
         value: "OptionalPrimitiveType",
         subset: Optional[List[str]] = ...,
-    ) -> "DataFrame":
-        ...
+    ) -> "DataFrame": ...
 
     @overload
     def replace(
@@ -5194,16 +5482,15 @@ class DataFrame:
         to_replace: List["LiteralType"],
         value: List["OptionalPrimitiveType"],
         subset: Optional[List[str]] = ...,
-    ) -> "DataFrame":
-        ...
+    ) -> "DataFrame": ...
 
     @overload
     def replace(
         self,
         to_replace: Dict["LiteralType", "OptionalPrimitiveType"],
+        *,
         subset: Optional[List[str]] = ...,
-    ) -> "DataFrame":
-        ...
+    ) -> "DataFrame": ...
 
     @overload
     def replace(
@@ -5211,10 +5498,9 @@ class DataFrame:
         to_replace: List["LiteralType"],
         value: "OptionalPrimitiveType",
         subset: Optional[List[str]] = ...,
-    ) -> "DataFrame":
-        ...
+    ) -> "DataFrame": ...
 
-    @dispatch_df_method  # type: ignore[misc]
+    @dispatch_df_method
     def replace(
         self,
         to_replace: Union[
@@ -5326,8 +5612,7 @@ class DataFrame:
         col: str,
         probabilities: Union[List[float], Tuple[float]],
         relativeError: float,
-    ) -> List[float]:
-        ...
+    ) -> List[float]: ...
 
     @overload
     def approxQuantile(
@@ -5335,8 +5620,7 @@ class DataFrame:
         col: Union[List[str], Tuple[str]],
         probabilities: Union[List[float], Tuple[float]],
         relativeError: float,
-    ) -> List[List[float]]:
-        ...
+    ) -> List[List[float]]: ...
 
     @dispatch_df_method
     def approxQuantile(
@@ -5867,15 +6151,7 @@ class DataFrame:
         """
         ...
 
-    @overload
-    def drop(self, cols: "ColumnOrName") -> "DataFrame":
-        ...
-
-    @overload
-    def drop(self, *cols: str) -> "DataFrame":
-        ...
-
-    @dispatch_df_method  # type: ignore[misc]
+    @dispatch_df_method
     def drop(self, *cols: "ColumnOrName") -> "DataFrame":
         """
         Returns a new :class:`DataFrame` without specified columns.
@@ -6230,15 +6506,15 @@ class DataFrame:
     # aliases as of Spark 3.0. Two methods below remain just
     # for legacy users currently.
     @overload
-    def groupby(self, *cols: "ColumnOrNameOrOrdinal") -> "GroupedData":
-        ...
+    def groupby(self, *cols: "ColumnOrNameOrOrdinal") -> "GroupedData": ...
 
     @overload
-    def groupby(self, __cols: Union[List[Column], List[str], List[int]]) -> "GroupedData":
-        ...
+    def groupby(self, __cols: Sequence["ColumnOrNameOrOrdinal"]) -> "GroupedData": ...
 
-    @dispatch_df_method  # type: ignore[misc]
-    def groupby(self, *cols: "ColumnOrNameOrOrdinal") -> "GroupedData":
+    @dispatch_df_method
+    def groupby(
+        self, *cols: Union[Sequence["ColumnOrNameOrOrdinal"], "ColumnOrNameOrOrdinal"]
+    ) -> "GroupedData":
         """
         :func:`groupby` is an alias for :func:`groupBy`.
 
@@ -6418,12 +6694,12 @@ class DataFrame:
             Use barrier mode execution, ensuring that all Python workers in the stage will be
             launched concurrently.
 
-            .. versionadded: 3.5.0
+            .. versionadded:: 3.5.0
 
         profile : :class:`pyspark.resource.ResourceProfile`. The optional ResourceProfile
             to be used for mapInPandas.
 
-            .. versionadded: 4.0.0
+            .. versionadded:: 4.0.0
 
 
         Examples
@@ -6520,12 +6796,12 @@ class DataFrame:
             Use barrier mode execution, ensuring that all Python workers in the stage will be
             launched concurrently.
 
-            .. versionadded: 3.5.0
+            .. versionadded:: 3.5.0
 
         profile : :class:`pyspark.resource.ResourceProfile`. The optional ResourceProfile
             to be used for mapInArrow.
 
-            .. versionadded: 4.0.0
+            .. versionadded:: 4.0.0
 
         Examples
         --------
@@ -6982,6 +7258,23 @@ class DataFrame:
         """
         ...
 
+    def __arrow_c_stream__(self, requested_schema: Optional[object] = None) -> object:
+        """
+        Export to a C PyCapsule stream object.
+
+        Parameters
+        ----------
+        requested_schema : PyCapsule, optional
+            The schema to attempt to use for the output stream. This is a best effort request,
+
+        Returns
+        -------
+        A C PyCapsule stream object.
+        """
+        from pyspark.sql.interchange import SparkArrowCStreamer
+
+        return SparkArrowCStreamer(self).__arrow_c_stream__(requested_schema)
+
 
 class DataFrameNaFunctions:
     """Functionality for working with missing data in :class:`DataFrame`.
@@ -7001,26 +7294,22 @@ class DataFrameNaFunctions:
         how: str = "any",
         thresh: Optional[int] = None,
         subset: Optional[Union[str, Tuple[str, ...], List[str]]] = None,
-    ) -> DataFrame:
-        ...
+    ) -> DataFrame: ...
 
     drop.__doc__ = DataFrame.dropna.__doc__
 
     @overload
-    def fill(self, value: "LiteralType", subset: Optional[List[str]] = ...) -> DataFrame:
-        ...
+    def fill(self, value: "LiteralType", subset: Optional[List[str]] = ...) -> DataFrame: ...
 
     @overload
-    def fill(self, value: Dict[str, "LiteralType"]) -> DataFrame:
-        ...
+    def fill(self, value: Dict[str, "LiteralType"]) -> DataFrame: ...
 
     @dispatch_df_method
     def fill(
         self,
         value: Union["LiteralType", Dict[str, "LiteralType"]],
         subset: Optional[List[str]] = None,
-    ) -> DataFrame:
-        ...
+    ) -> DataFrame: ...
 
     fill.__doc__ = DataFrame.fillna.__doc__
 
@@ -7030,16 +7319,14 @@ class DataFrameNaFunctions:
         to_replace: List["LiteralType"],
         value: List["OptionalPrimitiveType"],
         subset: Optional[List[str]] = ...,
-    ) -> DataFrame:
-        ...
+    ) -> DataFrame: ...
 
     @overload
     def replace(
         self,
         to_replace: Dict["LiteralType", "OptionalPrimitiveType"],
         subset: Optional[List[str]] = ...,
-    ) -> DataFrame:
-        ...
+    ) -> DataFrame: ...
 
     @overload
     def replace(
@@ -7047,8 +7334,7 @@ class DataFrameNaFunctions:
         to_replace: List["LiteralType"],
         value: "OptionalPrimitiveType",
         subset: Optional[List[str]] = ...,
-    ) -> DataFrame:
-        ...
+    ) -> DataFrame: ...
 
     @dispatch_df_method  # type: ignore[misc]
     def replace(
@@ -7058,8 +7344,7 @@ class DataFrameNaFunctions:
             Union["OptionalPrimitiveType", List["OptionalPrimitiveType"], _NoValueType]
         ] = _NoValue,
         subset: Optional[List[str]] = None,
-    ) -> DataFrame:
-        ...
+    ) -> DataFrame: ...
 
     replace.__doc__ = DataFrame.replace.__doc__
 
@@ -7082,8 +7367,7 @@ class DataFrameStatFunctions:
         col: str,
         probabilities: Union[List[float], Tuple[float]],
         relativeError: float,
-    ) -> List[float]:
-        ...
+    ) -> List[float]: ...
 
     @overload
     def approxQuantile(
@@ -7091,8 +7375,7 @@ class DataFrameStatFunctions:
         col: Union[List[str], Tuple[str]],
         probabilities: Union[List[float], Tuple[float]],
         relativeError: float,
-    ) -> List[List[float]]:
-        ...
+    ) -> List[List[float]]: ...
 
     @dispatch_df_method
     def approxQuantile(
@@ -7100,39 +7383,33 @@ class DataFrameStatFunctions:
         col: Union[str, List[str], Tuple[str]],
         probabilities: Union[List[float], Tuple[float]],
         relativeError: float,
-    ) -> Union[List[float], List[List[float]]]:
-        ...
+    ) -> Union[List[float], List[List[float]]]: ...
 
     approxQuantile.__doc__ = DataFrame.approxQuantile.__doc__
 
     @dispatch_df_method
-    def corr(self, col1: str, col2: str, method: Optional[str] = None) -> float:
-        ...
+    def corr(self, col1: str, col2: str, method: Optional[str] = None) -> float: ...
 
     corr.__doc__ = DataFrame.corr.__doc__
 
     @dispatch_df_method
-    def cov(self, col1: str, col2: str) -> float:
-        ...
+    def cov(self, col1: str, col2: str) -> float: ...
 
     cov.__doc__ = DataFrame.cov.__doc__
 
     @dispatch_df_method
-    def crosstab(self, col1: str, col2: str) -> DataFrame:
-        ...
+    def crosstab(self, col1: str, col2: str) -> DataFrame: ...
 
     crosstab.__doc__ = DataFrame.crosstab.__doc__
 
     @dispatch_df_method
-    def freqItems(self, cols: List[str], support: Optional[float] = None) -> DataFrame:
-        ...
+    def freqItems(self, cols: List[str], support: Optional[float] = None) -> DataFrame: ...
 
     freqItems.__doc__ = DataFrame.freqItems.__doc__
 
     @dispatch_df_method
     def sampleBy(
         self, col: str, fractions: Dict[Any, float], seed: Optional[int] = None
-    ) -> DataFrame:
-        ...
+    ) -> DataFrame: ...
 
     sampleBy.__doc__ = DataFrame.sampleBy.__doc__

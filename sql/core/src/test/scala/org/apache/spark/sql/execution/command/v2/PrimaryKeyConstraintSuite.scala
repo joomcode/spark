@@ -18,7 +18,9 @@ package org.apache.spark.sql.execution.command.v2
 
 import org.apache.spark.sql.{AnalysisException, QueryTest}
 import org.apache.spark.sql.execution.command.DDLCommandTestUtils
+import org.apache.spark.tags.DataSourceV2Test
 
+@DataSourceV2Test
 class PrimaryKeyConstraintSuite extends QueryTest with CommandSuiteBase with DDLCommandTestUtils {
   override protected def command: String = "PRIMARY KEY CONSTRAINT"
 
@@ -68,6 +70,21 @@ class PrimaryKeyConstraintSuite extends QueryTest with CommandSuiteBase with DDL
         sql(s"CREATE TABLE $t (id bigint) $defaultUsing")
         sql(s"REPLACE TABLE $t (id bigint, data string, $constraintStr) $defaultUsing")
         val table = loadTable(nonPartitionCatalog, "ns", "tbl")
+        assert(table.constraints.length == 1)
+        val constraint = table.constraints.head
+        assert(constraint.name() == "pk1")
+        assert(constraint.toDDL == s"CONSTRAINT pk1 PRIMARY KEY (id) $expectedDDL")
+      }
+    }
+  }
+
+  test("Replace table with primary key constraint using atomic catalog") {
+    validConstraintCharacteristics.foreach { case (characteristic, expectedDDL) =>
+      withNamespaceAndTable("ns", "tbl", atomicCatalog) { t =>
+        val constraintStr = s"CONSTRAINT pk1 PRIMARY KEY (id) $characteristic"
+        sql(s"CREATE TABLE $t (id bigint) $defaultUsing")
+        sql(s"REPLACE TABLE $t (id bigint, data string, $constraintStr) $defaultUsing")
+        val table = loadTable(atomicCatalog, "ns", "tbl")
         assert(table.constraints.length == 1)
         val constraint = table.constraints.head
         assert(constraint.name() == "pk1")

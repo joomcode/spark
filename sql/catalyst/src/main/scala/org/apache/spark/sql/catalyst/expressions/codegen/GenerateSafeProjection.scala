@@ -17,13 +17,12 @@
 
 package org.apache.spark.sql.catalyst.expressions.codegen
 
-import scala.annotation.tailrec
-
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
 import org.apache.spark.sql.catalyst.expressions.aggregate.NoOp
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
+import org.apache.spark.sql.catalyst.types.ops.TypeOps
 import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, ArrayData, GenericArrayData, MapData}
 import org.apache.spark.sql.types._
 
@@ -136,8 +135,14 @@ object GenerateSafeProjection extends CodeGenerator[Seq[Expression], Projection]
     ExprCode(code, FalseLiteral, JavaCode.variable(output, classOf[MapData]))
   }
 
-  @tailrec
   private def convertToSafe(
+      ctx: CodegenContext,
+      input: ExprValue,
+      dataType: DataType): ExprCode =
+    TypeOps(dataType).flatMap(_.rowRepresentationType).map(convertToSafe(ctx, input, _))
+      .getOrElse(convertToSafeDefault(ctx, input, dataType))
+
+  private def convertToSafeDefault(
       ctx: CodegenContext,
       input: ExprValue,
       dataType: DataType): ExprCode = dataType match {
@@ -155,15 +160,24 @@ object GenerateSafeProjection extends CodeGenerator[Seq[Expression], Projection]
       case (e, i) =>
         val evaluationCode = e.genCode(ctx)
         val converter = convertToSafe(ctx, evaluationCode.value, e.dataType)
-        evaluationCode.code.toString +
+        val setValue =
+          s"""
+            ${converter.code}
+            ${CodeGenerator.setColumn("mutableRow", e.dataType, i, converter.value)};
+          """
+        val writeField = if (evaluationCode.isNull == FalseLiteral) {
+          // The expression is statically non-nullable, so the setNullAt branch is dead.
+          setValue
+        } else {
           s"""
             if (${evaluationCode.isNull}) {
               mutableRow.setNullAt($i);
             } else {
-              ${converter.code}
-              ${CodeGenerator.setColumn("mutableRow", e.dataType, i, converter.value)};
+              $setValue
             }
           """
+        }
+        evaluationCode.code.toString + writeField
     }
     val allExpressions = ctx.splitExpressionsWithCurrentInputs(expressionCodes)
 
@@ -188,8 +202,9 @@ object GenerateSafeProjection extends CodeGenerator[Seq[Expression], Projection]
           ${ctx.initPartition()}
         }
 
-        public java.lang.Object apply(java.lang.Object _i) {
-          InternalRow ${ctx.INPUT_ROW} = (InternalRow) _i;
+        ${CodeGenerator.function1ApplyBridge(ctx.INPUT_ROW)}
+
+        public InternalRow apply(InternalRow ${ctx.INPUT_ROW}) {
           $allExpressions
           return mutableRow;
         }

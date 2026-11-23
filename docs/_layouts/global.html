@@ -59,8 +59,8 @@
             <div class="navbar-brand"><a href="{{ rel_path_to_root }}index.html">
                 <img src="https://spark.apache.org/images/spark-logo-rev.svg" width="141" height="72"/></a><span class="version">{{site.SPARK_VERSION_SHORT}}</span>
             </div>
-            <button class="navbar-toggler" type="button" data-toggle="collapse"
-                    data-target="#navbarCollapse" aria-controls="navbarCollapse"
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse"
+                    data-bs-target="#navbarCollapse" aria-controls="navbarCollapse"
                     aria-expanded="false" aria-label="Toggle navigation">
                 <span class="navbar-toggler-icon"></span>
             </button>
@@ -69,12 +69,13 @@
                     <li class="nav-item"><a href="{{ rel_path_to_root }}index.html" class="nav-link">Overview</a></li>
 
                     <li class="nav-item dropdown">
-                        <a href="#" class="nav-link dropdown-toggle" id="navbarQuickStart" role="button" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">Programming Guides</a>
+                        <a href="#" class="nav-link dropdown-toggle" id="navbarQuickStart" role="button" data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="false">Programming Guides</a>
                         <div class="dropdown-menu" aria-labelledby="navbarQuickStart">
                             <a class="dropdown-item" href="{{ rel_path_to_root }}quick-start.html">Quick Start</a>
                             <a class="dropdown-item" href="{{ rel_path_to_root }}rdd-programming-guide.html">RDDs, Accumulators, Broadcasts Vars</a>
                             <a class="dropdown-item" href="{{ rel_path_to_root }}sql-programming-guide.html">SQL, DataFrames, and Datasets</a>
                             <a class="dropdown-item" href="{{ rel_path_to_root }}streaming/index.html">Structured Streaming</a>
+                            <a class="dropdown-item" href="{{ rel_path_to_root }}spark-connect-overview.html">Spark Connect</a>
                             <a class="dropdown-item" href="{{ rel_path_to_root }}streaming-programming-guide.html">Spark Streaming (DStreams)</a>
                             <a class="dropdown-item" href="{{ rel_path_to_root }}ml-guide.html">MLlib (Machine Learning)</a>
                             <a class="dropdown-item" href="{{ rel_path_to_root }}graphx-programming-guide.html">GraphX (Graph Processing)</a>
@@ -85,7 +86,7 @@
                     </li>
 
                     <li class="nav-item dropdown">
-                        <a href="#" class="nav-link dropdown-toggle" id="navbarAPIDocs" role="button" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">API Docs</a>
+                        <a href="#" class="nav-link dropdown-toggle" id="navbarAPIDocs" role="button" data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="false">API Docs</a>
                         <div class="dropdown-menu" aria-labelledby="navbarAPIDocs">
                             <a class="dropdown-item" href="{{ rel_path_to_root }}api/python/index.html">Python</a>
                             <a class="dropdown-item" href="{{ rel_path_to_root }}api/scala/org/apache/spark/index.html">Scala</a>
@@ -96,7 +97,7 @@
                     </li>
 
                     <li class="nav-item dropdown">
-                        <a href="#" class="nav-link dropdown-toggle" id="navbarDeploying" role="button" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">Deploying</a>
+                        <a href="#" class="nav-link dropdown-toggle" id="navbarDeploying" role="button" data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="false">Deploying</a>
                         <div class="dropdown-menu" aria-labelledby="navbarDeploying">
                             <a class="dropdown-item" href="{{ rel_path_to_root }}cluster-overview.html">Overview</a>
                             <a class="dropdown-item" href="{{ rel_path_to_root }}submitting-applications.html">Submitting Applications</a>
@@ -108,7 +109,7 @@
                     </li>
 
                     <li class="nav-item dropdown">
-                        <a href="#" class="nav-link dropdown-toggle" id="navbarMore" role="button" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">More</a>
+                        <a href="#" class="nav-link dropdown-toggle" id="navbarMore" role="button" data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="false">More</a>
                         <div class="dropdown-menu" aria-labelledby="navbarMore">
                             <a class="dropdown-item" href="{{ rel_path_to_root }}configuration.html">Configuration</a>
                             <a class="dropdown-item" href="{{ rel_path_to_root }}monitoring.html">Monitoring</a>
@@ -156,15 +157,17 @@
         {% endif %}
 
         <div class="container">
-            {% if page.url contains "/ml" or page.url contains "/sql" or page.url contains "/streaming/" or page.url contains "migration-guide.html" %}
+            {% if page.url contains "/ml" or page.url contains "/sql" or page.url contains "/streaming/" or page.url contains "migration-guide.html" or page.url contains "/spark-connect" %}
                 {% if page.url contains "migration-guide.html" %}
                     {% include nav-left-wrapper-migration.html nav-migration=site.data.menu-migration %}
                 {% elsif page.url contains "/ml" %}
                     {% include nav-left-wrapper-ml.html nav-mllib=site.data.menu-mllib nav-ml=site.data.menu-ml %}
                 {% elsif page.url contains "/streaming/" %}
                     {% include nav-left-wrapper-streaming.html nav-streaming=site.data.menu-streaming %}
-                {% else %}
+                {% elsif page.url contains "/sql" %}
                     {% include nav-left-wrapper-sql.html nav-sql=site.data.menu-sql %}
+                {% elsif page.url contains "/spark-connect" %}
+                    {% include nav-left-wrapper-spark-connect.html nav-spark-connect=site.data.menu-spark-connect %}
                 {% endif %}
                 <input id="nav-trigger" class="nav-trigger" checked type="checkbox">
                 <label for="nav-trigger"></label>
@@ -196,7 +199,18 @@
         <script src="{{ rel_path_to_root }}js/vendor/jquery.min.js"></script>
         <script src="{{ rel_path_to_root }}js/vendor/bootstrap.bundle.min.js"></script>
 
+        {% comment %}
+        Keep the version of AnchorJS used here in sync with what's used on the main website.
+        See: https://github.com/apache/spark-website/blob/asf-site/js/vendor/anchor.min.js
+        {% endcomment %}
         <script src="{{ rel_path_to_root }}js/vendor/anchor.min.js"></script>
+        <script>
+            // Display anchor links when hovering over headings.
+            // See: https://www.bryanbraun.com/anchorjs/
+            // Note: AnchorJS 4.0+ excludes h1 from the default selector, but many
+            // Spark doc pages use h1 for section headings, so we include it explicitly.
+            anchors.add('#content :is(h1, h2, h3, h4, h5, h6)');
+        </script>
         <script src="{{ rel_path_to_root}}js/main.js"></script>
 
         <script type="text/javascript" src="{{ rel_path_to_root }}js/vendor/docsearch.min.js"></script>

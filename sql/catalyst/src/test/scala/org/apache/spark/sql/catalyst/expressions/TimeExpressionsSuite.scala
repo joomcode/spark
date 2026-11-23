@@ -25,6 +25,7 @@ import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.{DataTypeMismatch,
 import org.apache.spark.sql.catalyst.expressions.Cast.{toSQLId, toSQLValue}
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils._
 import org.apache.spark.sql.catalyst.util.SparkDateTimeUtils.localTimeToNanos
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{DayTimeIntervalType, Decimal, DecimalType, IntegerType, LongType, StringType, TimeType}
 import org.apache.spark.sql.types.DayTimeIntervalType.{DAY, HOUR, SECOND}
 
@@ -59,6 +60,34 @@ class TimeExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       parameters = Map("input" -> "'100:50'", "format" -> "'mm:HH'"))
   }
 
+  test("SPARK-58296: to_time reports TimeType even when a foldable format is NULL") {
+    // A foldable format that evaluates to NULL must not change the output type: to_time
+    // still produces a TIME, matching the non-null and no-format branches. Before the fix
+    // the replacement fell back to the format argument's own type (STRING/NULL).
+    assert(new ToTime(Literal("00:00:00"), Literal.create(null, StringType)).dataType ===
+      TimeType())
+    assert(new ToTime(Literal("00:00:00"), Literal.create(null)).dataType === TimeType())
+    // The value is still NULL; assert type and value together for this exact case.
+    checkEvaluation(new ToTime(Literal("00:00:00"), Literal.create(null, StringType)), null)
+    // Sanity: the branches that were already correct.
+    assert(new ToTime(Literal("00:00:00")).dataType === TimeType())
+    assert(new ToTime(Literal("00:00:00"), Literal("HH:mm:ss")).dataType === TimeType())
+  }
+
+  test("SPARK-61575: to_time with a foldable format that fails to evaluate") {
+    // `ConstantFolding` leaves such a format in a conditional branch. Only a row that
+    // evaluates the format should fail.
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+      val str = BoundReference(0, StringType, nullable = true)
+      val expr = If(
+        IsNull(str),
+        Literal.create(null, TimeType()),
+        ToTime(str, Some(Cast(Divide(Literal(1.0), Literal(0.0)), StringType))))
+      checkEvaluation(expr, null, create_row(null))
+      checkExceptionInExpression[ArithmeticException](expr, create_row("10:00"), "DIVIDE_BY_ZERO")
+    }
+  }
+
   test("HourExpressionBuilder") {
     // Empty expressions list
     checkError(
@@ -82,7 +111,7 @@ class TimeExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     assert(builtExprForTime.checkInputDataTypes().isSuccess)
 
     // test TIME-typed child should build HoursOfTime for all allowed custom precision values
-    (TimeType.MIN_PRECISION to TimeType.MICROS_PRECISION).foreach { precision =>
+    (TimeType.MIN_PRECISION to TimeType.MAX_PRECISION).foreach { precision =>
       val timeExpr = Literal(localTime(12, 58, 59), TimeType(precision))
       val builtExpr = HourExpressionBuilder.build("hour", Seq(timeExpr))
 
@@ -151,7 +180,7 @@ class TimeExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     assert(builtExprForTime.checkInputDataTypes().isSuccess)
 
     // test TIME-typed child should build MinutesOfTime for all allowed custom precision values
-    (TimeType.MIN_PRECISION to TimeType.MICROS_PRECISION).foreach { precision =>
+    (TimeType.MIN_PRECISION to TimeType.MAX_PRECISION).foreach { precision =>
       val timeExpr = Literal(localTime(12, 58, 59), TimeType(precision))
       val builtExpr = MinuteExpressionBuilder.build("minute", Seq(timeExpr))
 
@@ -315,6 +344,14 @@ class TimeExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     assert(expr.dataType == TimeType(2))
     assert(expr.checkInputDataTypes() == TypeCheckSuccess)
 
+    // test nanosecond precisions 7, 8, 9 are valid
+    (TimeType.MICROS_PRECISION + 1 to TimeType.MAX_PRECISION).foreach { p =>
+      expr = CurrentTime(Literal(p))
+      assert(expr.precision == p, s"Precision should be $p")
+      assert(expr.dataType == TimeType(p))
+      assert(expr.checkInputDataTypes() == TypeCheckSuccess)
+    }
+
     // test out of range precision => checkInputDataTypes fails
     expr = CurrentTime(Literal(2 + 8))
     assert(expr.checkInputDataTypes() ==
@@ -322,7 +359,7 @@ class TimeExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
         errorSubClass = "VALUE_OUT_OF_RANGE",
         messageParameters = Map(
           "exprName" -> toSQLId("precision"),
-          "valueRange" -> s"[${TimeType.MIN_PRECISION}, ${TimeType.MICROS_PRECISION}]",
+          "valueRange" -> s"[${TimeType.MIN_PRECISION}, ${TimeType.MAX_PRECISION}]",
           "currentValue" -> toSQLValue(10, IntegerType)
         )
       )
@@ -352,9 +389,22 @@ class TimeExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       4 -> 15.9876,
       5 -> 15.98765,
       6 -> 15.987654).foreach { case (precision, expected) =>
-      checkEvaluation(
-        SecondsOfTimeWithFraction(Literal(localTime(13, 11, 15, 987654), TimeType(precision))),
-        BigDecimal(expected))
+      val expr = SecondsOfTimeWithFraction(
+        Literal(localTime(13, 11, 15, 987654), TimeType(precision)))
+      assert(expr.dataType == DecimalType(2 + precision, precision),
+        s"TIME($precision) SECOND should have DecimalType(${2 + precision}, $precision)")
+      checkEvaluation(expr, BigDecimal(expected))
+    }
+    // Precisions 7-9 require sub-microsecond nanos
+    Seq(
+      7 -> BigDecimal("15.9876543"),
+      8 -> BigDecimal("15.98765432"),
+      9 -> BigDecimal("15.987654321")).foreach { case (precision, expected) =>
+      val expr = SecondsOfTimeWithFraction(
+        Literal(localTime(13, 11, 15, 987654, 321), TimeType(precision)))
+      assert(expr.dataType == DecimalType(2 + precision, precision),
+        s"TIME($precision) SECOND should have DecimalType(${2 + precision}, $precision)")
+      checkEvaluation(expr, expected)
     }
     // Verify NULL handling
     checkEvaluation(

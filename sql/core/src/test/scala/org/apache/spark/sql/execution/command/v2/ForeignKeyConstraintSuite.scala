@@ -18,7 +18,9 @@ package org.apache.spark.sql.execution.command.v2
 
 import org.apache.spark.sql.{AnalysisException, QueryTest}
 import org.apache.spark.sql.execution.command.DDLCommandTestUtils
+import org.apache.spark.tags.DataSourceV2Test
 
+@DataSourceV2Test
 class ForeignKeyConstraintSuite extends QueryTest with CommandSuiteBase with DDLCommandTestUtils {
   override protected def command: String = "FOREIGN KEY CONSTRAINT"
 
@@ -81,6 +83,24 @@ class ForeignKeyConstraintSuite extends QueryTest with CommandSuiteBase with DDL
         assert(constraint.name() == "fk1")
         assert(constraint.toDDL == s"CONSTRAINT fk1 FOREIGN KEY (fk) " +
           s"REFERENCES non_part_test_catalog.ns.tbl_ref (id) $expectedDDL")
+      }
+    }
+  }
+
+  test("REPLACE table with foreign key constraint using atomic catalog") {
+    validConstraintCharacteristics.foreach { case (characteristic, expectedDDL) =>
+      withNamespaceAndTable("ns", "tbl", atomicCatalog) { t =>
+        sql(s"CREATE TABLE $t (id bigint) $defaultUsing")
+        sql(s"CREATE TABLE ${t}_ref (id bigint, data string) $defaultUsing")
+        val constraintStr = s"CONSTRAINT fk1 FOREIGN KEY (fk) " +
+          s"REFERENCES ${t}_ref(id) $characteristic"
+        sql(s"REPLACE TABLE $t (id bigint, fk bigint, data string, $constraintStr) $defaultUsing")
+        val table = loadTable(atomicCatalog, "ns", "tbl")
+        assert(table.constraints.length == 1)
+        val constraint = table.constraints.head
+        assert(constraint.name() == "fk1")
+        assert(constraint.toDDL == s"CONSTRAINT fk1 FOREIGN KEY (fk) " +
+          s"REFERENCES $atomicCatalog.ns.tbl_ref (id) $expectedDDL")
       }
     }
   }

@@ -293,6 +293,68 @@ abstract class FileStreamSinkSuite extends StreamTest {
     }
   }
 
+  test("SPARK-60563: Check INTERVAL and empty struct columns when starting a query") {
+    val df = MemoryStream[Int].toDF()
+    val intervalDf = df.selectExpr("value AS i", "make_interval(0, 0, 0, value) AS d")
+    val emptyStructDf = df.selectExpr("value AS i", "struct() AS s")
+
+    val ansiIntervalDf = df.selectExpr(
+      "value AS i", "make_ym_interval(0, value) AS ym", "make_dt_interval(0, 0, 0, value) AS dt")
+
+    def startQuery(data: DataFrame, format: String): StreamingQuery = {
+      data.writeStream
+        .option("checkpointLocation",
+          Utils.createTempDir(namePrefix = "stream.checkpoint").getCanonicalPath)
+        .format(format)
+        .start(Utils.createTempDir(namePrefix = "stream.output").getCanonicalPath)
+    }
+
+    def startTableQuery(data: DataFrame, table: String): StreamingQuery = {
+      data.writeStream
+        .option("checkpointLocation",
+          Utils.createTempDir(namePrefix = "stream.checkpoint").getCanonicalPath)
+        .format("json")
+        .toTable(table)
+    }
+
+    Seq("parquet" -> "Parquet", "orc" -> "ORC", "json" -> "JSON", "csv" -> "CSV").foreach {
+      case (format, formatName) =>
+        checkError(
+          exception = intercept[AnalysisException] {
+            startQuery(intervalDf, format)
+          },
+          condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
+          parameters = Map(
+            "columnName" -> "`d`", "columnType" -> "\"INTERVAL\"", "format" -> formatName))
+        checkError(
+          exception = intercept[AnalysisException] {
+            startQuery(emptyStructDf, format)
+          },
+          condition = "EMPTY_SCHEMA_NOT_SUPPORTED_FOR_DATASOURCE",
+          parameters = Map("format" -> formatName))
+        // Like batch writes, ANSI interval types are allowed.
+        startQuery(ansiIntervalDf, format).stop()
+    }
+
+    withSQLConf(SQLConf.ALLOW_EMPTY_SCHEMAS_FOR_WRITES.key -> "true") {
+      startQuery(emptyStructDf, "json").stop()
+    }
+
+    withTable("t") {
+      sql("CREATE TABLE t (i INT, s STRUCT<>) USING json")
+      // Like `DataFrameWriter.saveAsTable`, writing to a table does not check empty structs.
+      startTableQuery(emptyStructDf, "t").stop()
+      // However, it checks INTERVAL columns.
+      checkError(
+        exception = intercept[AnalysisException] {
+          startTableQuery(intervalDf, "t")
+        },
+        condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
+        parameters = Map(
+          "columnName" -> "`d`", "columnType" -> "\"INTERVAL\"", "format" -> "JSON"))
+    }
+  }
+
   test("parquet") {
     testFormat(None) // should not throw error as default format parquet when not specified
     testFormat(Some("parquet"))
@@ -697,6 +759,44 @@ abstract class FileStreamSinkSuite extends StreamTest {
     }
   }
 
+  test("SPARK-56414: per-write options take precedence over session config in streaming sink") {
+    val inputData = MemoryStream[java.sql.Timestamp]
+
+    val outputDir = Utils.createTempDir(namePrefix = "stream.output").getCanonicalPath
+    val checkpointDir = Utils.createTempDir(namePrefix = "stream.checkpoint").getCanonicalPath
+
+    // Session sets INT96, but the per-write option overrides to TIMESTAMP_MICROS.
+    withSQLConf(SQLConf.PARQUET_OUTPUT_TIMESTAMP_TYPE.key -> "INT96") {
+      var query: StreamingQuery = null
+      try {
+        query = inputData.toDF()
+          .toDF("ts")
+          .writeStream
+          .option("checkpointLocation", checkpointDir)
+          .option(SQLConf.PARQUET_OUTPUT_TIMESTAMP_TYPE.key, "TIMESTAMP_MICROS")
+          .format("parquet")
+          .start(outputDir)
+        inputData.addData(java.sql.Timestamp.valueOf("2024-01-01 12:00:00"))
+        query.processAllAvailable()
+      } finally {
+        if (query != null) query.stop()
+      }
+    }
+
+    // Read back and verify the timestamp column is INT64 (TIMESTAMP_MICROS), not INT96.
+    import org.apache.parquet.hadoop.ParquetFileReader
+    import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
+    val hadoopConf = spark.sessionState.newHadoopConf()
+    val parquetFiles = new java.io.File(outputDir).listFiles()
+      .filter(_.getName.endsWith(".parquet"))
+    assert(parquetFiles.nonEmpty, "Expected at least one parquet file")
+    val footer = ParquetFileReader.readFooter(hadoopConf,
+      new Path(parquetFiles.head.getAbsolutePath))
+    val tsField = footer.getFileMetaData.getSchema.getFields.asScala
+      .find(_.getName == "ts").get.asPrimitiveType()
+    assert(tsField.getPrimitiveTypeName === PrimitiveTypeName.INT64)
+  }
+
   test("SPARK-50854: Make path fully qualified before passing it to FileStreamSink") {
     val fileFormat = new ParquetFileFormat() // any valid FileFormat
     val partitionColumnNames = Seq.empty[String]
@@ -705,6 +805,41 @@ abstract class FileStreamSinkSuite extends StreamTest {
       new FileStreamSink(spark, "test.parquet", fileFormat, partitionColumnNames, options)
     }
     assert(exception.getMessage.contains("is not absolute path."))
+  }
+
+  test("SPARK-60520: Validate partition columns when starting a query") {
+    val df = MemoryStream[Int].toDF()
+    withTempDir { dir =>
+      def startQuery(data: DataFrame, partitionColumns: String*): StreamingQuery = {
+        data.writeStream
+          .option("checkpointLocation", new File(dir, "checkpoint").getCanonicalPath)
+          .format("parquet")
+          .partitionBy(partitionColumns: _*)
+          .start(new File(dir, "output").getCanonicalPath)
+      }
+
+      Seq(
+        "parse_json('1')" -> "\"VARIANT\"",
+        "array(1, 2)" -> "\"ARRAY<INT>\"",
+        "map(1, 2)" -> "\"MAP<INT, INT>\"",
+        "named_struct('a', 1)" -> "\"STRUCT<a: INT>\"",
+        "'a' COLLATE UTF8_LCASE" -> "\"STRING COLLATE UTF8_LCASE\"").foreach {
+        case (expr, dataType) =>
+          checkError(
+            exception = intercept[AnalysisException] {
+              startQuery(df.selectExpr("value AS i", s"$expr AS p"), "p")
+            },
+            condition = "INVALID_PARTITION_COLUMN_DATA_TYPE",
+            parameters = Map("type" -> dataType))
+      }
+
+      checkError(
+        exception = intercept[AnalysisException] {
+          startQuery(df.selectExpr("value AS i", "value AS p"), "p", "p")
+        },
+        condition = "COLUMN_ALREADY_EXISTS",
+        parameters = Map("columnName" -> "`p`"))
+    }
   }
 }
 

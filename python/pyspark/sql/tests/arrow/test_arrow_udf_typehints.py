@@ -16,21 +16,21 @@
 #
 import unittest
 from inspect import signature
-from typing import Union, Iterator, Tuple, get_type_hints
+from typing import Iterator, Tuple, Union, get_type_hints
 
-from pyspark.sql import functions as sf
-from pyspark.testing.utils import (
-    have_pandas,
-    pandas_requirement_message,
-    have_pyarrow,
-    pyarrow_requirement_message,
-    have_numpy,
-    numpy_requirement_message,
-)
-from pyspark.testing.sqlutils import ReusedSQLTestCase
-from pyspark.sql.pandas.typehints import infer_eval_type, infer_group_arrow_eval_type
-from pyspark.sql.pandas.functions import arrow_udf, ArrowUDFType
 from pyspark.sql import Row
+from pyspark.sql import functions as sf
+from pyspark.sql.pandas.functions import ArrowUDFType, arrow_udf
+from pyspark.sql.pandas.typehints import infer_eval_type, infer_group_arrow_eval_type
+from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import (
+    have_numpy,
+    have_pandas,
+    have_pyarrow,
+    numpy_requirement_message,
+    pandas_requirement_message,
+    pyarrow_requirement_message,
+)
 from pyspark.util import PythonEvalType
 
 if have_pyarrow:
@@ -452,7 +452,7 @@ class ArrowUDFTypeHintsTests(ReusedSQLTestCase):
 
         with self.assertRaisesRegex(
             Exception,
-            "Unsupported signature:.*pandas.core.series.Series.",
+            f"Unsupported signature:.*{pd.Series.__name__}.",
         ):
 
             @arrow_udf("long")
@@ -461,12 +461,6 @@ class ArrowUDFTypeHintsTests(ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.arrow.test_arrow_udf_typehints import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

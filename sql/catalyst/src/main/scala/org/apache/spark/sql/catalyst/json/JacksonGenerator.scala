@@ -159,6 +159,19 @@ class JacksonGenerator(
         timestampNTZFormatter.format(DateTimeUtils.microsToLocalDateTime(row.getLong(ordinal)))
       gen.writeString(timestampString)
 
+    case t: TimestampLTZNanosType =>
+      (row: SpecializedGetters, ordinal: Int) =>
+        val timestampString =
+          timestampFormatter.formatNanos(row.getTimestampLTZNanos(ordinal), t.precision)
+        gen.writeString(timestampString)
+
+    case t: TimestampNTZNanosType =>
+      (row: SpecializedGetters, ordinal: Int) =>
+        val timestampString =
+          timestampNTZFormatter.formatWithoutTimeZoneNanos(
+            row.getTimestampNTZNanos(ordinal), t.precision)
+        gen.writeString(timestampString)
+
     case DateType =>
       (row: SpecializedGetters, ordinal: Int) =>
         val dateString = dateFormatter.format(row.getInt(ordinal))
@@ -238,8 +251,14 @@ class JacksonGenerator(
 
   private def writeFields(
       row: InternalRow, schema: StructType, fieldWriters: Seq[ValueWriter]): Unit = {
-    var i = 0
-    while (i < row.numFields) {
+    val indices = if (options.sortKeys) {
+      schema.fieldNames.indices.sortBy(i => schema(i).name).toArray
+    } else {
+      null
+    }
+    var j = 0
+    while (j < row.numFields) {
+      val i = if (indices != null) indices(j) else j
       val field = schema(i)
       if (!row.isNullAt(i)) {
         gen.writeFieldName(field.name)
@@ -249,7 +268,7 @@ class JacksonGenerator(
         gen.writeFieldName(field.name)
         gen.writeNull()
       }
-      i += 1
+      j += 1
     }
   }
 
@@ -276,15 +295,21 @@ class JacksonGenerator(
       map: MapData, mapType: MapType, fieldWriter: ValueWriter): Unit = {
     val keyArray = map.keyArray()
     val valueArray = map.valueArray()
-    var i = 0
-    while (i < map.numElements()) {
+    val indices = if (options.sortKeys) {
+      (0 until map.numElements()).sortBy(i => keyArray.get(i, mapType.keyType).toString).toArray
+    } else {
+      null
+    }
+    var j = 0
+    while (j < map.numElements()) {
+      val i = if (indices != null) indices(j) else j
       gen.writeFieldName(keyArray.get(i, mapType.keyType).toString)
       if (!valueArray.isNullAt(i)) {
         fieldWriter.apply(valueArray, i)
       } else {
         gen.writeNull()
       }
-      i += 1
+      j += 1
     }
   }
 
@@ -333,4 +358,28 @@ class JacksonGenerator(
     // Note that JSON uses writer with UTF-8 charset. This string will be written out as UTF-8.
     gen.writeRaw(lineSeparator)
   }
+
+  // --- Incremental object construction --------------------------------------------------------
+  // The whole-container `write(...)` methods above each serialize one row/array/map in a single
+  // call. The SQL/JSON constructors (JSON_OBJECT) instead assemble an object member by member --
+  // dynamic field names, per-member raw splicing, mixed value types -- so they drive the generator
+  // directly through the primitives below, writing every member into one generator lifecycle
+  // rather than serializing each member separately and splicing the text.
+
+  def writeStartObject(): Unit = gen.writeStartObject()
+
+  def writeEndObject(): Unit = gen.writeEndObject()
+
+  def writeFieldName(name: String): Unit = gen.writeFieldName(name)
+
+  def writeNull(): Unit = gen.writeNull()
+
+  // Splice already-JSON text as one value. Uses `writeRawValue` (not `writeRaw`) so the generator
+  // still registers that a value was written and commas the following member correctly.
+  def writeRawValue(json: String): Unit = gen.writeRawValue(json)
+
+  // A writer that renders one value of `dataType` into this generator, reading it from a
+  // `SpecializedGetters` at the given ordinal (e.g. a one-field carrier row). Build it once per
+  // value type and reuse it across rows.
+  def makeValueWriter(dataType: DataType): (SpecializedGetters, Int) => Unit = makeWriter(dataType)
 }

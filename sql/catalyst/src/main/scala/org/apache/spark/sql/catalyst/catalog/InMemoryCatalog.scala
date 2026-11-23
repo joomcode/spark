@@ -29,6 +29,7 @@ import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.catalog.ExternalCatalogUtils._
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.util.StringUtils
+import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.connector.catalog.SupportsNamespaces.PROP_OWNER
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.types.StructType
@@ -238,7 +239,13 @@ class InMemoryCatalog(
       table: String,
       ignoreIfNotExists: Boolean,
       purge: Boolean): Unit = synchronized {
-    requireDbExists(db)
+    if (!databaseExists(db)) {
+      if (ignoreIfNotExists) {
+        return
+      } else {
+        throw new NoSuchTableException(Seq(CatalogManager.SESSION_CATALOG_NAME, db, table))
+      }
+    }
     if (tableExists(db, table)) {
       val tableMeta = getTable(db, table)
       if (tableMeta.tableType == CatalogTableType.MANAGED) {
@@ -271,7 +278,7 @@ class InMemoryCatalog(
       catalog(db).tables.remove(table)
     } else {
       if (!ignoreIfNotExists) {
-        throw new NoSuchTableException(db = db, table = table)
+        throw new NoSuchTableException(Seq(CatalogManager.SESSION_CATALOG_NAME, db, table))
       }
     }
   }
@@ -362,6 +369,7 @@ class InMemoryCatalog(
   }
 
   override def getTable(db: String, table: String): CatalogTable = synchronized {
+    requireDbExists(db)
     requireTableExists(db, table)
     catalog(db).tables(table).table
   }
@@ -386,7 +394,9 @@ class InMemoryCatalog(
 
   override def listViews(db: String, pattern: String): Seq[String] = synchronized {
     requireDbExists(db)
-    val views = catalog(db).tables.filter(_._2.table.tableType == CatalogTableType.VIEW).keySet
+    val views = catalog(db).tables.filter { case (_, t) =>
+      t.table.isViewLike
+    }.keySet
     StringUtils.filterPattern(views.toSeq.sorted, pattern)
   }
 
@@ -431,13 +441,15 @@ class InMemoryCatalog(
       ignoreIfExists: Boolean): Unit = synchronized {
     requireTableExists(db, table)
     val existingParts = catalog(db).tables(table).partitions
-    val parts = toCatalogPartitionSpec(newParts)
+    val allParts = toCatalogPartitionSpec(newParts)
     if (!ignoreIfExists) {
-      val dupSpecs = parts.collect { case p if existingParts.contains(p.spec) => p.spec }
+      val dupSpecs = allParts.collect { case p if existingParts.contains(p.spec) => p.spec }
       if (dupSpecs.nonEmpty) {
         throw new PartitionsAlreadyExistException(db = db, table = table, specs = dupSpecs)
       }
     }
+    // Keep existing partitions untouched, as the Hive metastore does with `ifNotExists`.
+    val parts = allParts.filterNot(p => existingParts.contains(p.spec))
 
     val tableMeta = getTable(db, table)
     val partitionColumnNames = tableMeta.partitionColumnNames

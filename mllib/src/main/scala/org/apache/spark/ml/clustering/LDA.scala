@@ -32,7 +32,8 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.ml.{Estimator, Model}
 import org.apache.spark.ml.linalg._
 import org.apache.spark.ml.param._
-import org.apache.spark.ml.param.shared.{HasCheckpointInterval, HasFeaturesCol, HasMaxIter, HasSeed}
+import org.apache.spark.ml.param.shared.{HasCheckpointInterval, HasFeaturesCol,
+  HasIntermediateStorageLevel, HasMaxIter, HasSeed}
 import org.apache.spark.ml.util._
 import org.apache.spark.ml.util.DatasetUtils._
 import org.apache.spark.ml.util.DefaultParamsReader.Metadata
@@ -54,7 +55,7 @@ import org.apache.spark.util.PeriodicCheckpointer
 import org.apache.spark.util.VersionUtils
 
 private[clustering] trait LDAParams extends Params with HasFeaturesCol with HasMaxIter
-  with HasSeed with HasCheckpointInterval {
+  with HasSeed with HasCheckpointInterval with HasIntermediateStorageLevel {
 
   /**
    * Param for the number of topics (clusters) to infer. Must be &gt; 1. Default: 10.
@@ -157,7 +158,7 @@ private[clustering] trait LDAParams extends Params with HasFeaturesCol with HasM
 
   /** Supported values for Param [[optimizer]]. */
   @Since("1.6.0")
-  final val supportedOptimizers: Array[String] = Array("online", "em")
+  final val supportedOptimizers: Array[String] = LDA.supportedOptimizers
 
   /**
    * Optimizer or inference algorithm used to estimate the LDA model.
@@ -180,7 +181,7 @@ private[clustering] trait LDAParams extends Params with HasFeaturesCol with HasM
   @Since("1.6.0")
   final val optimizer = new Param[String](this, "optimizer", "Optimizer or inference" +
     " algorithm used to estimate the LDA model. Supported: " + supportedOptimizers.mkString(", "),
-    (value: String) => supportedOptimizers.contains(value.toLowerCase(Locale.ROOT)))
+    (value: String) => LDA.supportedOptimizers.contains(value.toLowerCase(Locale.ROOT)))
 
   /** @group getParam */
   @Since("1.6.0")
@@ -355,7 +356,7 @@ private[clustering] trait LDAParams extends Params with HasFeaturesCol with HasM
       }
     }
     SchemaUtils.validateVectorCompatibleColumn(schema, getFeaturesCol)
-    SchemaUtils.appendColumn(schema, $(topicDistributionCol), new VectorUDT)
+    SchemaUtils.appendColumn(schema, $(topicDistributionCol), SQLDataTypes.VectorType)
   }
 
   private[clustering] def getOldOptimizer: OldLDAOptimizer =
@@ -640,6 +641,21 @@ class LocalLDAModel private[ml] (
   override def toString: String = {
     s"LocalLDAModel: uid=$uid, k=${$(k)}, numFeatures=$vocabSize"
   }
+
+  private[spark] override def estimatedSize: Long = {
+    var size = estimateMatadataSize
+    if (oldLocalModel != null) {
+      // topicsMatrix: Matrix
+      if (oldLocalModel.topicsMatrix != null) {
+        size += oldLocalModel.topicsMatrix.asML.getSizeInBytes
+      }
+      // docConcentration: Vector
+      if (oldLocalModel.docConcentration != null) {
+        size += oldLocalModel.docConcentration.asML.getSizeInBytes
+      }
+    }
+    size
+  }
 }
 
 @Since("1.6.0")
@@ -827,12 +843,15 @@ class DistributedLDAModel private[ml] (
   }
 
   private[spark] override def estimatedSize: Long = {
-    this.oldDistributedModel.toInternals.map {
+    var size = estimateMatadataSize
+    // oldDistributedModel: metadata, global topic totals, graph vertices, and graph edges.
+    oldDistributedModel.toInternals.foreach {
       case df: org.apache.spark.sql.classic.DataFrame =>
-        df.toArrowBatchRdd.map(_.length.toLong).reduce(_ + _)
+        size += df.toArrowBatchRdd.map(_.length.toLong).reduce(_ + _)
       case o => throw new UnsupportedOperationException(
         s"Unsupported dataframe type: ${o.getClass.getName}")
-    }.sum
+    }
+    size
   }
 }
 
@@ -997,6 +1016,15 @@ class LDA @Since("1.6.0") (
   @Since("2.0.0")
   def setKeepLastCheckpoint(value: Boolean): this.type = set(keepLastCheckpoint, value)
 
+  /**
+   * Sets the storage level for intermediate datasets when using the online optimizer.
+   * Default is "MEMORY_AND_DISK".
+   *
+   * @group expertSetParam
+   */
+  @Since("4.5.0")
+  def setIntermediateStorageLevel(value: String): this.type = set(intermediateStorageLevel, value)
+
   @Since("1.6.0")
   override def copy(extra: ParamMap): LDA = defaultCopy(extra)
 
@@ -1008,7 +1036,7 @@ class LDA @Since("1.6.0") (
     instr.logDataset(dataset)
     instr.logParams(this, featuresCol, topicDistributionCol, k, maxIter, subsamplingRate,
       checkpointInterval, keepLastCheckpoint, optimizeDocConcentration, topicConcentration,
-      learningDecay, optimizer, learningOffset, seed)
+      learningDecay, optimizer, learningOffset, seed, intermediateStorageLevel)
 
     val oldData = LDA.getOldDataset(dataset, $(featuresCol))
       .setName("training instances")
@@ -1020,7 +1048,7 @@ class LDA @Since("1.6.0") (
     val handlePersistence = dataset.storageLevel == StorageLevel.NONE &&
       getOptimizer.toLowerCase(Locale.ROOT) == "online"
     if (handlePersistence) {
-      oldData.persist(StorageLevel.MEMORY_AND_DISK)
+      oldData.persist(StorageLevel.fromString($(intermediateStorageLevel)))
     }
 
     val oldLDA = new OldLDA()
@@ -1055,6 +1083,8 @@ class LDA @Since("1.6.0") (
 
 @Since("2.0.0")
 object LDA extends MLReadable[LDA] {
+
+  private[clustering] val supportedOptimizers: Array[String] = Array("online", "em")
 
   /** Get dataset for spark.mllib LDA */
   private[clustering] def getOldDataset(

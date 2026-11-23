@@ -15,19 +15,18 @@
 # limitations under the License.
 #
 
-import unittest
 
 from pyspark.errors import PySparkTypeError, PySparkValueError
-from pyspark.testing.connectutils import should_test_connect
 from pyspark.sql.tests.connect.test_connect_basic import SparkConnectSQLTestCase
+from pyspark.testing.connectutils import should_test_connect
 
 if should_test_connect:
-    from pyspark.sql import functions as SF
-    from pyspark.sql.connect import functions as CF
     from pyspark.errors.exceptions.connect import (
         AnalysisException,
         SparkConnectException,
     )
+    from pyspark.sql import functions as SF
+    from pyspark.sql.connect import functions as CF
 
 
 class SparkConnectStatTests(SparkConnectSQLTestCase):
@@ -150,7 +149,7 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
             self.spark.read.table(self.tbl_name).filter("id > 3").randomSplit([1.0, 2.0, 3.0], 2)
         )
 
-        self.assertTrue(len(relations) == len(datasets))
+        self.assertEqual(len(relations), len(datasets))
         i = 0
         while i < len(relations):
             self.assert_eq(relations[i].toPandas(), datasets[i].toPandas())
@@ -195,8 +194,9 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_STR",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "str",
                 "arg_name": "col1",
                 "arg_type": "int",
             },
@@ -207,19 +207,21 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_STR",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "str",
                 "arg_name": "col2",
                 "arg_type": "int",
             },
         )
-        with self.assertRaises(ValueError) as context:
-            self.connect.read.table(self.tbl_name2).stat.corr("col1", "col3", "spearman"),
-            self.assertTrue(
-                "Currently only the calculation of the Pearson Correlation "
-                + "coefficient is supported."
-                in str(context.exception)
-            )
+        with self.assertRaises(PySparkValueError) as pe:
+            self.connect.read.table(self.tbl_name2).stat.corr("col1", "col3", "spearman")
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="VALUE_NOT_ALLOWED",
+            messageParameters={"arg_name": "method", "allowed_values": "['pearson']"},
+        )
 
     def test_stat_approx_quantile(self):
         # SPARK-41069: Test the stat.approxQuantile method
@@ -241,8 +243,9 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_LIST_OR_STR_OR_TUPLE",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "list, str or tuple",
                 "arg_name": "col",
                 "arg_type": "int",
             },
@@ -253,21 +256,27 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_LIST_OR_TUPLE",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "list or tuple",
                 "arg_name": "probabilities",
                 "arg_type": "float",
             },
         )
-        with self.assertRaises(PySparkTypeError) as pe:
+        with self.assertRaises(PySparkValueError) as pe:
             self.connect.read.table(self.tbl_name2).stat.approxQuantile(
                 ["col1", "col3"], [-0.1], 0.1
             )
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_LIST_OF_FLOAT_OR_INT",
-            messageParameters={"arg_name": "probabilities", "arg_type": "float"},
+            errorClass="VALUE_OUT_OF_BOUNDS",
+            messageParameters={
+                "arg_name": "probabilities",
+                "lower_bound": "0",
+                "upper_bound": "1",
+                "actual": "-0.1",
+            },
         )
         with self.assertRaises(PySparkTypeError) as pe:
             self.connect.read.table(self.tbl_name2).stat.approxQuantile(
@@ -276,8 +285,9 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_FLOAT_OR_INT",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "float or int",
                 "arg_name": "relativeError",
                 "arg_type": "str",
             },
@@ -316,8 +326,9 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_LIST_OR_TUPLE",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "list or tuple",
                 "arg_name": "cols",
                 "arg_type": "str",
             },
@@ -538,8 +549,9 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_BOOL_OR_FLOAT_OR_INT_OR_STR",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "bool, date, Decimal, float, int, None or str",
                 "arg_name": "value",
                 "arg_type": "bytes",
             },
@@ -801,13 +813,6 @@ class SparkConnectStatTests(SparkConnectSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.connect.test_connect_stat import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

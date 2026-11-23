@@ -23,7 +23,8 @@ import org.apache.spark.sql.catalyst.{FunctionIdentifier, InternalRow, TableIden
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode}
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
-import org.apache.spark.sql.catalyst.plans.logical.{LeafNode, LogicalPlan, SupportsSubquery, UnaryNode}
+import org.apache.spark.sql.catalyst.plans.logical.{DeduplicateKeySpec, LeafNode, LogicalPlan, SupportsSubquery, UnaryNode}
+import org.apache.spark.sql.catalyst.trees.CurrentOrigin
 import org.apache.spark.sql.catalyst.trees.TreePattern._
 import org.apache.spark.sql.catalyst.util._
 import org.apache.spark.sql.catalyst.util.TypeUtils.toSQLId
@@ -59,18 +60,31 @@ trait UnresolvedUnaryNode extends UnaryNode with UnresolvedNode
 /**
  * A logical plan placeholder that holds the identifier clause string expression. It will be
  * replaced by the actual logical plan with the evaluated identifier string.
+ *
+ * Extends `NamedRelation` so it can occupy a `NamedRelation`-typed slot (e.g.
+ * `OverwriteByExpression.table`) directly at parse time, instead of wrapping the whole command.
+ *
+ * Depending on the command shape, the parser uses this node either as the plan root or within the
+ * command's identifier slot. For INSERT, the slot is a child of `UnresolvedInsert` until the
+ * identifier expression has been evaluated.
  */
 case class PlanWithUnresolvedIdentifier(
     identifierExpr: Expression,
     children: Seq[LogicalPlan],
     planBuilder: (Seq[String], Seq[LogicalPlan]) => LogicalPlan)
-  extends UnresolvedNode {
+  extends UnresolvedNode with NamedRelation {
 
   def this(identifierExpr: Expression, planBuilder: Seq[String] => LogicalPlan) = {
     this(identifierExpr, Nil, (ident, _) => planBuilder(ident))
   }
 
   final override val nodePatterns: Seq[TreePattern] = Seq(PLAN_WITH_UNRESOLVED_IDENTIFIER)
+
+  // Placeholder name used by error paths that render `NamedRelation.name` for an unresolved
+  // table reference -- e.g. `SparkStrategies.extractTableNameForError` and the `r: NamedRelation`
+  // fallback in `QueryCompilationErrors`. Renders as the SQL text of the identifier expression
+  // (e.g. `IDENTIFIER(:p)` or `concat('a', 'b')`) so error messages remain informative.
+  override def name: String = identifierExpr.sql
 
   override protected def withNewChildrenInternal(
       newChildren: IndexedSeq[LogicalPlan]): LogicalPlan =
@@ -108,6 +122,29 @@ case class ExpressionWithUnresolvedIdentifier(
 }
 
 /**
+ * Holds the raw table identifier and lookup context for an unresolved INSERT target.
+ *
+ * This is deliberately not a [[NamedRelation]]: while it is a child of
+ * [[org.apache.spark.sql.catalyst.plans.logical.UnresolvedInsert]], it must not be interpreted as
+ * a readable relation or substituted with a same-named CTE. It is converted to an
+ * [[UnresolvedRelation]] when the enclosing INSERT is lowered to `InsertIntoStatement`.
+ */
+case class UnresolvedInsertTarget(
+    multipartIdentifier: Seq[String],
+    options: CaseInsensitiveStringMap,
+    writePrivileges: Set[TableWritePrivilege]) extends UnresolvedLeafNode {
+
+  /** Converts this target to an [[UnresolvedRelation]] that keeps its origin and tags. */
+  def toUnresolvedRelation: UnresolvedRelation = {
+    val relation = CurrentOrigin.withOrigin(origin) {
+      UnresolvedRelation(multipartIdentifier, options).requireWritePrivileges(writePrivileges)
+    }
+    relation.copyTagsFrom(this)
+    relation
+  }
+}
+
+/**
  * Holds the name of a relation that has yet to be looked up in a catalog.
  *
  * @param multipartIdentifier table name, the location of files or Kafka topic name, etc.
@@ -125,10 +162,12 @@ case class UnresolvedRelation(
 
   override def name: String = tableName
 
-  def requireWritePrivileges(privileges: Seq[TableWritePrivilege]): UnresolvedRelation = {
+  def requireWritePrivileges(privileges: Set[TableWritePrivilege]): UnresolvedRelation = {
     if (privileges.nonEmpty) {
       val newOptions = new java.util.HashMap[String, String]
-      newOptions.putAll(options)
+      // CaseInsensitiveStringMap's Map view exposes lowercase keys. Copy the original map to
+      // preserve user-provided key casing when adding the internal marker.
+      newOptions.putAll(options.asCaseSensitiveMap())
       newOptions.put(UnresolvedRelation.REQUIRED_WRITE_PRIVILEGES, privileges.mkString(","))
       copy(options = new CaseInsensitiveStringMap(newOptions))
     } else {
@@ -139,7 +178,8 @@ case class UnresolvedRelation(
   def clearWritePrivileges: UnresolvedRelation = {
     if (options.containsKey(UnresolvedRelation.REQUIRED_WRITE_PRIVILEGES)) {
       val newOptions = new java.util.HashMap[String, String]
-      newOptions.putAll(options)
+      // Preserve user-provided key casing while removing the internal marker as well.
+      newOptions.putAll(options.asCaseSensitiveMap())
       newOptions.remove(UnresolvedRelation.REQUIRED_WRITE_PRIVILEGES)
       copy(options = new CaseInsensitiveStringMap(newOptions))
     } else {
@@ -168,7 +208,10 @@ object UnresolvedRelation {
 
 /**
  * An inline table that has not been resolved yet. Once resolved, it is turned by the analyzer into
- * a [[org.apache.spark.sql.catalyst.plans.logical.LocalRelation]].
+ * a [[org.apache.spark.sql.catalyst.plans.logical.LocalRelation]], or into an
+ * [[org.apache.spark.sql.catalyst.plans.logical.Expand]] over a
+ * [[org.apache.spark.sql.catalyst.plans.logical.OneRowRelation]] if some of its expressions are
+ * evaluated when the query runs.
  *
  * @param names list of column names
  * @param rows expressions for the data
@@ -177,6 +220,8 @@ case class UnresolvedInlineTable(
     names: Seq[String],
     rows: Seq[Seq[Expression]])
   extends UnresolvedLeafNode {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(INLINE_TABLE_EVAL)
 
   lazy val expressionsResolved: Boolean = rows.forall(_.forall(_.resolved))
 }
@@ -363,15 +408,21 @@ case class UnresolvedGenerator(name: FunctionIdentifier, children: Seq[Expressio
  * Represents an unresolved function that is being invoked. The analyzer will resolve the function
  * arguments first, then look up the function by name and arguments, and return an expression that
  * can be evaluated to get the result of this function invocation.
+ *
+ * `boundOwner`, when set, is the SQL PATH candidate that direct-star preprocessing selected as this
+ * call's owner (a relative persistent-catalog candidate stays relative until later resolution
+ * qualifies it); later resolution binds to exactly it instead of re-walking the SQL PATH
+ * (see [[FunctionResolution.selectRoutedSqlJsonDirectStarOwner]]).
  */
 case class UnresolvedFunction(
     nameParts: Seq[String],
     arguments: Seq[Expression],
     isDistinct: Boolean,
     filter: Option[Expression] = None,
-    ignoreNulls: Boolean = false,
+    ignoreNulls: Option[Boolean] = None,
     orderingWithinGroup: Seq[SortOrder] = Seq.empty,
-    isInternal: Boolean = false)
+    isInternal: Boolean = false,
+    boundOwner: Option[Seq[String]] = None)
   extends Expression with Unevaluable {
   import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
 
@@ -609,12 +660,20 @@ trait UnresolvedStarBase extends Star with Unevaluable {
  *                     expressions removed by EXCEPT. If present, the length of this list must
  *                     be the same as the length of the EXCEPT list. This supports replacing
  *                     expressions instead of excluding them from the original SELECT list.
+ *                     With replacements, each EXCEPT name must resolve to a top-level column.
+ *
+ * @param appendMissingReplacements if true, an EXCEPT name that matches no expanded column is not
+ *                                  an error: its replacement is appended after the expanded
+ *                                  columns instead. Requires `replacements`.
  */
 case class UnresolvedStarExceptOrReplace(
     target: Option[Seq[String]],
     excepts: Seq[Seq[String]],
-    replacements: Option[Seq[NamedExpression]])
+    replacements: Option[Seq[NamedExpression]],
+    appendMissingReplacements: Boolean = false)
   extends LeafExpression with UnresolvedStarBase {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(UNRESOLVED_STAR_EXCEPT_OR_REPLACE)
 
   /**
    * We expand the * EXCEPT by the following three steps:
@@ -629,10 +688,41 @@ case class UnresolvedStarExceptOrReplace(
     // output, or in the case of struct expansion (e.g. target=`x` for SELECT x.*) it will give
     // a seq of NamedExpressions corresponding to struct fields.
     val expandedCols = super.expandStar(parameters)
+    val expandedAttributes = AttributeSeq(expandedCols.map(_.toAttribute))
+
+    // A name with a replacement that matches two copies of one column is ambiguous, as it is for
+    // two different columns with the name. `column` is the column that it resolves to, if any.
+    def failIfNameMatchesCopies(exceptParts: Seq[String], column: Option[Attribute]): Unit = {
+      val copies = columnCopies(exceptParts, column, expandedAttributes.attrs, parameters.resolver)
+      if (copies.size > 1) {
+        throw QueryCompilationErrors.ambiguousReferenceError(
+          UnresolvedAttribute(exceptParts).name, copies)
+      }
+    }
+
+    // With appendMissingReplacements, only the excepts that match a column replace it. The
+    // replacements of the other excepts are appended after the expanded columns.
+    val (presentExcepts, presentReplacements, appendedReplacements) =
+      if (appendMissingReplacements) {
+        val replacementList = replacements match {
+          case Some(list) if list.size == excepts.size => list
+          case _ => throw SparkException.internalError(
+            "Appending missing replacements requires one replacement per except")
+        }
+        val (present, missing) = excepts.zip(replacementList).partition { case (exceptParts, _) =>
+          val column = expandedAttributes.resolve(exceptParts, parameters.resolver)
+          // A name that matches only tagged copies of a column resolves to none of them.
+          if (column.isEmpty) failIfNameMatchesCopies(exceptParts, None)
+          column.isDefined
+        }
+        (present.map(_._1), Some(present.map(_._2)), missing.map(_._2))
+      } else {
+        (excepts, replacements, Nil)
+      }
 
     // resolve except list with respect to the expandedCols
-    val resolvedExcepts = excepts.map { exceptParts =>
-      AttributeSeq(expandedCols.map(_.toAttribute))
+    val resolvedExcepts = presentExcepts.map { exceptParts =>
+      expandedAttributes
         .resolve(exceptParts, parameters.resolver)
         .getOrElse {
           val orderedCandidates = StringUtils.orderSuggestedIdentifiersBySimilarity(
@@ -670,6 +760,36 @@ case class UnresolvedStarExceptOrReplace(
       case except: NamedExpression => except -> Seq.empty
     }
 
+    // group the except pairs by the column they refer to. NOTE: no groupMap until scala 2.13
+    def groupByColumn(excepts: Seq[(NamedExpression, Seq[String])])
+      : AttributeMap[Seq[Seq[String]]] =
+      AttributeMap(excepts.groupBy(_._1.toAttribute).transform((_, v) => v.map(_._2)))
+
+    def overlappingExceptsError(): AnalysisException = new AnalysisException(
+      errorClass = "EXCEPT_OVERLAPPING_COLUMNS",
+      messageParameters = Map("columns" -> presentExcepts.map(_.mkString(".")).mkString(", ")))
+
+    // Each replacement takes the place of the top-level column that its except names.
+    val replacementsByColumn: AttributeMap[NamedExpression] = presentReplacements match {
+      case Some(replacementList) =>
+        assert(exceptPairs.size == replacementList.size,
+          "The number of replacements must be the same as the number of excepts")
+        // Overlapping excepts fail as they do without replacements, before the checks below.
+        if (groupByColumn(exceptPairs).values.exists { nestedExcepts =>
+            nestedExcepts.size > 1 && nestedExcepts.exists(_.isEmpty) }) {
+          throw overlappingExceptsError()
+        }
+        if (exceptPairs.exists { case (_, nestedColumn) => nestedColumn.nonEmpty }) {
+          throw SparkException.internalError(
+            "An EXCEPT name with a replacement must resolve to a top-level column")
+        }
+        presentExcepts.zip(exceptPairs).foreach { case (exceptParts, (column, _)) =>
+          failIfNameMatchesCopies(exceptParts, Some(column.toAttribute))
+        }
+        AttributeMap(exceptPairs.map(_._1.toAttribute).zip(replacementList))
+      case None => AttributeMap.empty
+    }
+
     // Filter columns which correspond to ones listed in the except list and return a new list of
     // columns which exclude the columns in the except list. The 'filtering' manifests as either
     // dropping the column from the list of columns we return, or rewriting the projected column in
@@ -695,17 +815,7 @@ case class UnresolvedStarExceptOrReplace(
     //            remaining case.
     def filterColumns(columns: Seq[NamedExpression], excepts: Seq[(NamedExpression, Seq[String])])
       : Seq[NamedExpression] = {
-      // group the except pairs by the column they refer to. NOTE: no groupMap until scala 2.13
-      val groupedExcepts: AttributeMap[Seq[Seq[String]]] =
-        AttributeMap(excepts.groupBy(_._1.toAttribute).transform((_, v) => v.map(_._2)))
-      // If the 'replacements' list is populated to indicate we should replace excepted columns
-      // with new expressions, we must have the same number of replacements as excepts. Keep an
-      // index to track the current replacement.
-      replacements.foreach { r =>
-        assert(excepts.size == r.size,
-          "The number of replacements must be the same as the number of excepts")
-      }
-      var replacementIndex = 0
+      val groupedExcepts = groupByColumn(excepts)
       // map input columns while searching for the except entry corresponding to the current column
       columns.map(col => col -> groupedExcepts.get(col.toAttribute)).collect {
         // pass through columns that don't match anything in groupedExcepts
@@ -734,18 +844,34 @@ case class UnresolvedStarExceptOrReplace(
         // if there are multiple nestedExcepts but one is empty we must have overlapping except
         // columns. throw an error.
         case (_, Some(nestedExcepts)) if nestedExcepts.size > 1 =>
-          throw new AnalysisException(
-            errorClass = "EXCEPT_OVERLAPPING_COLUMNS",
-            messageParameters = Map(
-              "columns" -> this.excepts.map(_.mkString(".")).mkString(", ")))
+          throw overlappingExceptsError()
         // found a match and the 'replacements' list is populated - replace the column
-        case (_, Some(_)) if replacements.nonEmpty =>
-          replacementIndex += 1
-          replacements.get(replacementIndex - 1)
+        case (col, Some(_)) if presentReplacements.isDefined =>
+          replacementsByColumn.getOrElse(col.toAttribute, throw SparkException.internalError(
+            s"Missing the replacement for the excepted column ${col.name}"))
       }
     }
 
-    filterColumns(expandedCols, exceptPairs)
+    filterColumns(expandedCols, exceptPairs) ++ appendedReplacements
+  }
+
+  /**
+   * Returns the columns in `columns` that `exceptParts` names, counting each copy of a column.
+   * Name resolution finds one `column` for all the copies, and none when the name matches only
+   * tagged copies. A copy is either the same attribute, as in `SELECT x, x`, or a column that the
+   * name matches and that has the `__is_duplicate` tag, which name resolution skips when the name
+   * matches other columns. [[DeduplicateUnionChildOutput]] tags the second copy of a column that
+   * a UNION branch outputs twice, after giving it a new ExprId.
+   */
+  private def columnCopies(
+      exceptParts: Seq[String],
+      column: Option[Attribute],
+      columns: Seq[Attribute],
+      resolver: Resolver): Seq[Attribute] = {
+    columns.filter { c =>
+      column.exists(c.semanticEquals) || (c.metadata.contains("__is_duplicate") &&
+        AttributeSeq(Seq(c)).resolve(exceptParts, resolver).isDefined)
+    }
   }
 }
 
@@ -764,6 +890,8 @@ case class UnresolvedStarWithColumns(
      exprs: Seq[Expression],
      explicitMetadata: Option[Seq[Metadata]] = None)
   extends UnresolvedStarBase {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(UNRESOLVED_STAR_WITH_COLUMNS)
 
   override def target: Option[Seq[String]] = None
   override def children: Seq[Expression] = exprs
@@ -826,6 +954,8 @@ case class UnresolvedStarWithColumnsRenames(
     newNames: Seq[String])
   extends LeafExpression with UnresolvedStarBase {
 
+  final override val nodePatterns: Seq[TreePattern] = Seq(UNRESOLVED_STAR_WITH_COLUMNS_RENAMES)
+
   override def target: Option[Seq[String]] = None
 
   override def expandStar(parameters: ExpandStarParameters): Seq[NamedExpression] = {
@@ -862,7 +992,10 @@ case class UnresolvedStarWithColumnsRenames(
  *              is a list of identifiers that is the path of the expansion.
  */
 case class UnresolvedStar(target: Option[Seq[String]])
-  extends LeafExpression with UnresolvedStarBase
+  extends LeafExpression with UnresolvedStarBase {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(UNRESOLVED_STAR)
+}
 
 /**
  * Represents all of the input attributes to a given relational operator, for example in
@@ -873,6 +1006,9 @@ case class UnresolvedStar(target: Option[Seq[String]])
  */
 case class UnresolvedRegex(regexPattern: String, table: Option[String], caseSensitive: Boolean)
   extends LeafExpression with Star with Unevaluable {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(UNRESOLVED_REGEX)
+
   override def expandStar(parameters: ExpandStarParameters): Seq[NamedExpression] = {
     val pattern = if (caseSensitive) regexPattern else s"(?i)$regexPattern"
     table match {
@@ -933,6 +1069,7 @@ case class MultiAlias(child: Expression, names: Seq[String])
  */
 case class ResolvedStar(expressions: Seq[NamedExpression])
   extends LeafExpression with Star with Unevaluable {
+  final override val nodePatterns: Seq[TreePattern] = Seq(RESOLVED_STAR)
   override def newInstance(): NamedExpression = throw new UnresolvedException("newInstance")
   override def expandStar(parameters: ExpandStarParameters): Seq[NamedExpression] = expressions
   override def toString: String = expressions.mkString("ResolvedStar(", ", ", ")")
@@ -1114,9 +1251,14 @@ case class UnresolvedOrdinal(ordinal: Int)
  * @param ordinal ordinal starts from 1, instead of 0
  */
 case class UnresolvedPipeAggregateOrdinal(ordinal: Int)
-  extends LeafExpression with Unevaluable with NonSQLExpression {
-  override def dataType: DataType = throw new UnresolvedException("dataType")
+  extends LeafExpression with NamedExpression with Unevaluable with NonSQLExpression {
+  override def toAttribute: Attribute = throw new UnresolvedException("toAttribute")
+  override def qualifier: Seq[String] = throw new UnresolvedException("qualifier")
+  override def exprId: ExprId = throw new UnresolvedException("exprId")
   override def nullable: Boolean = throw new UnresolvedException("nullable")
+  override def dataType: DataType = throw new UnresolvedException("dataType")
+  override def name: String = throw new UnresolvedException("name")
+  override def newInstance(): NamedExpression = throw new UnresolvedException("newInstance")
   override lazy val resolved = false
 }
 
@@ -1131,6 +1273,49 @@ case class UnresolvedHaving(
   override protected def withNewChildInternal(newChild: LogicalPlan): UnresolvedHaving =
     copy(child = newChild)
   final override val nodePatterns: Seq[TreePattern] = Seq(UNRESOLVED_HAVING)
+}
+
+/**
+ * Represents an unresolved QUALIFY clause. It is resolved by the analyzer into a Filter
+ * placed after window functions have been materialized.
+ */
+case class UnresolvedQualify(condition: Expression, child: LogicalPlan) extends UnaryNode {
+  override lazy val resolved: Boolean = false
+  override def output: Seq[Attribute] = child.output
+  override protected def withNewChildInternal(newChild: LogicalPlan): UnresolvedQualify =
+    copy(child = newChild)
+  final override val nodePatterns: Seq[TreePattern] = Seq(UNRESOLVED_QUALIFY)
+}
+
+/**
+ * An unresolved logical plan for `dropDuplicates` / `dropDuplicatesWithinWatermark`. It holds the
+ * user-requested deduplication columns (by name, or "all columns") and is resolved by the
+ * `ResolveDeduplicate` analyzer rule into a [[Deduplicate]] / [[DeduplicateWithinWatermark]].
+ *
+ * Resolving the keys in the analyzer (rather than eagerly in the DataFrame API or the Spark Connect
+ * planner) lets both engines share one resolution with a stable key order. A stable order matters
+ * for streaming deduplication, whose state store binds keys by position: a different key order
+ * across restarts would break state-store key-schema compatibility. See SPARK-57489.
+ *
+ * @param keySpec which columns form the deduplication key (an explicit set, or all columns).
+ * @param withinWatermark when true, resolves to `DeduplicateWithinWatermark`.
+ * @param viaSparkClassic whether the deduplication was requested via Spark Classic
+ *   (`Dataset.dropDuplicates*`, true) or Spark Connect (`transformDeduplicate`, false). This only
+ *   matters on the legacy-fallback path, consulted ONLY when the deterministic key order is
+ *   disabled (an existing query restored from a checkpoint that predates this change): Spark
+ *   Classic reproduces its legacy resolution (`toSet`-based dedup, `Set` order) while Spark
+ *   Connect reproduces its own (no dedup, input order). Ignored on the deterministic path.
+ */
+case class UnresolvedDeduplicate(
+    keySpec: DeduplicateKeySpec,
+    withinWatermark: Boolean,
+    viaSparkClassic: Boolean,
+    child: LogicalPlan) extends UnaryNode {
+  override lazy val resolved: Boolean = false
+  override def output: Seq[Attribute] = child.output
+  override protected def withNewChildInternal(newChild: LogicalPlan): UnresolvedDeduplicate =
+    copy(child = newChild)
+  final override val nodePatterns: Seq[TreePattern] = Seq(UNRESOLVED_DEDUPLICATE)
 }
 
 /**

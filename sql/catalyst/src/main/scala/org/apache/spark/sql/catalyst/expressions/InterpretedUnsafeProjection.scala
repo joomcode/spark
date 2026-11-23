@@ -20,6 +20,7 @@ import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.codegen.{UnsafeArrayWriter, UnsafeRowWriter, UnsafeWriter}
 import org.apache.spark.sql.catalyst.types._
+import org.apache.spark.sql.catalyst.types.ops.TypeOps
 import org.apache.spark.sql.catalyst.util.ArrayData
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{UserDefinedType, _}
@@ -159,13 +160,17 @@ object InterpretedUnsafeProjection {
 
         case PhysicalCalendarIntervalType => (v, i) => writer.write(i, v.getInterval(i))
 
+        case PhysicalTimestampNTZNanosType => (v, i) =>
+          writer.write(i, v.getTimestampNTZNanos(i))
+
+        case PhysicalTimestampLTZNanosType => (v, i) =>
+          writer.write(i, v.getTimestampLTZNanos(i))
+
         case PhysicalBinaryType => (v, i) => writer.write(i, v.getBinary(i))
 
         case _: PhysicalStringType => (v, i) => writer.write(i, v.getUTF8String(i))
 
-        case _: PhysicalGeographyType => (v, i) => writer.write(i, v.getGeography(i))
-
-        case _: PhysicalGeometryType => (v, i) => writer.write(i, v.getGeometry(i))
+        case _: PhysicalBinaryViewType => (v, i) => writer.write(i, v.getBinaryView(i))
 
         case PhysicalVariantType => (v, i) => writer.write(i, v.getVariant(i))
 
@@ -256,6 +261,9 @@ object InterpretedUnsafeProjection {
       case CalendarIntervalType =>
         // We can't call setNullAt() for CalendarIntervalType, we call write directly.
         unsafeWriter
+      case _: AnyTimestampNanoType =>
+        // We can't call setNullAt() for nanos timestamp types, we call write directly.
+        unsafeWriter
       case BooleanType | ByteType =>
         (v, i) => {
           if (!v.isNullAt(i)) {
@@ -298,9 +306,12 @@ object InterpretedUnsafeProjection {
    * portion of the array object. Primitives take up to 8 bytes, depending on the size of the
    * underlying data type.
    */
-  @scala.annotation.tailrec
-  private def getElementSize(dataType: DataType): Int = dataType match {
+  private def getElementSize(dataType: DataType): Int =
+    TypeOps(dataType).map(_.getElementSize).getOrElse(getElementSizeDefault(dataType))
+
+  private def getElementSizeDefault(dataType: DataType): Int = dataType match {
     case NullType | _: StringType | BinaryType | CalendarIntervalType | VariantType |
+         _: AnyTimestampNanoType |
          _: DecimalType | _: StructType | _: ArrayType | _: MapType => 8
     case udt: UserDefinedType[_] =>
       getElementSize(udt.sqlType)

@@ -41,11 +41,8 @@ import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.core.LoggerContext
 import org.apache.logging.log4j.core.appender.ConsoleAppender
 import org.apache.logging.log4j.core.config.builder.api.ConfigurationBuilderFactory
-import org.eclipse.jetty.server.Handler
 import org.eclipse.jetty.server.Server
-import org.eclipse.jetty.server.handler.DefaultHandler
-import org.eclipse.jetty.server.handler.HandlerList
-import org.eclipse.jetty.server.handler.ResourceHandler
+import org.eclipse.jetty.server.handler.{ContextHandler, ContextHandlerCollection, DefaultHandler, ResourceHandler}
 import org.json4s.JsonAST.JValue
 import org.json4s.jackson.JsonMethods.{compact, render}
 
@@ -206,7 +203,7 @@ private[spark] object TestUtils extends SparkTestUtils {
 
   // SPARK-40053: This string needs to be updated when the
   // minimum python supported version changes.
-  val minimumPythonSupportedVersion: String = "3.7.0"
+  val minimumPythonSupportedVersion: String = "3.11.0"
 
   def isPythonVersionAvailable: Boolean = {
     val version = minimumPythonSupportedVersion.split('.').map(_.toInt)
@@ -333,9 +330,12 @@ private[spark] object TestUtils extends SparkTestUtils {
     // 0 as port means choosing randomly from the available ports
     val server = new Server(new InetSocketAddress(Utils.localCanonicalHostName(), 0))
     val resHandler = new ResourceHandler()
-    resHandler.setResourceBase(resBaseDir)
-    val handlers = new HandlerList()
-    handlers.setHandlers(Array[Handler](resHandler, new DefaultHandler()))
+    resHandler.setBaseResourceAsString(resBaseDir)
+    val resCxt = new ContextHandler
+    resCxt.setContextPath("/")
+    resCxt.setHandler(resHandler)
+    val handlers = new ContextHandlerCollection()
+    handlers.setHandlers(resCxt, new DefaultHandler())
     server.setHandler(handlers)
     server.start()
     try {
@@ -387,11 +387,7 @@ private[spark] object TestUtils extends SparkTestUtils {
   /**
    * Lists files recursively.
    */
-  def recursiveList(f: File): Array[File] = {
-    require(f.isDirectory)
-    val current = f.listFiles
-    current ++ current.filter(_.isDirectory).flatMap(recursiveList)
-  }
+  def recursiveList(f: File): Array[File] = Utils.recursiveList(f)
 
   /**
    * Returns the list of files at 'path' recursively. This skips files that are ignored normally

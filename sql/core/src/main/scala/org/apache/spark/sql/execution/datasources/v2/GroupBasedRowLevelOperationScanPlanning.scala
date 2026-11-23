@@ -17,16 +17,18 @@
 
 package org.apache.spark.sql.execution.datasources.v2
 
-import org.apache.spark.internal.{LogKeys}
+import org.apache.spark.internal.LogKeys
 import org.apache.spark.sql.catalyst.expressions.{And, AttributeReference, AttributeSet, Expression, ExpressionSet, PredicateHelper, SubqueryExpression}
 import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
 import org.apache.spark.sql.catalyst.planning.{GroupBasedRowLevelOperation, PhysicalOperation}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, LogicalPlan, ReplaceData}
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.trees.TreePattern.REPLACE_DATA
 import org.apache.spark.sql.connector.expressions.filter.{Predicate => V2Filter}
 import org.apache.spark.sql.connector.read.ScanBuilder
 import org.apache.spark.sql.connector.write.RowLevelOperation.Command.MERGE
 import org.apache.spark.sql.execution.datasources.DataSourceStrategy
+import org.apache.spark.sql.internal.connector.PartitionPredicateField
 import org.apache.spark.sql.sources.Filter
 
 /**
@@ -39,7 +41,8 @@ object GroupBasedRowLevelOperationScanPlanning extends Rule[LogicalPlan] with Pr
 
   import DataSourceV2Implicits._
 
-  override def apply(plan: LogicalPlan): LogicalPlan = plan transformDown {
+  override def apply(plan: LogicalPlan): LogicalPlan = plan.transformDownWithPruning(
+      _.containsPattern(REPLACE_DATA)) {
     // push down the filter from the command condition instead of the filter in the rewrite plan,
     // which is negated for data sources that only support replacing groups of data (e.g. files)
     case GroupBasedRowLevelOperation(rd: ReplaceData, cond, _, relation: DataSourceV2Relation) =>
@@ -47,9 +50,10 @@ object GroupBasedRowLevelOperationScanPlanning extends Rule[LogicalPlan] with Pr
 
       val table = relation.table.asRowLevelOperationTable
       val scanBuilder = table.newScanBuilder(relation.options)
+      val partitionPredicateFields = PushDownUtils.getPartitionPredicateSchema(relation)
 
       val (pushedFilters, evaluatedFilters, postScanFilters) =
-        pushFilters(cond, relation.output, scanBuilder)
+        pushFilters(cond, relation.output, scanBuilder, partitionPredicateFields)
 
       val pushedFiltersStr = if (pushedFilters.isLeft) {
         pushedFilters.swap
@@ -82,9 +86,12 @@ object GroupBasedRowLevelOperationScanPlanning extends Rule[LogicalPlan] with Pr
           j.copy(condition = Some(optimizeMergeJoinCondition(cond, evaluatedFilters)))
 
         // replace DataSourceV2Relation with DataSourceV2ScanRelation for the row operation table
-        // there may be multiple read relations for UPDATEs that are rewritten as UNION
+        // there may be multiple read relations for UPDATEs that are rewritten as UNION.
+        // The scan takes only filters and the read columns, so reading it again gives no other
+        // rows.
         case r: DataSourceV2Relation if r.table eq table =>
-          DataSourceV2ScanRelation(r, scan, PushDownUtils.toOutputAttrs(scan.readSchema(), r))
+          DataSourceV2ScanRelation(r, scan, PushDownUtils.toOutputAttrs(scan.readSchema(), r),
+            repeatableRead = true)
       }
   }
 
@@ -97,13 +104,14 @@ object GroupBasedRowLevelOperationScanPlanning extends Rule[LogicalPlan] with Pr
   private def pushFilters(
       cond: Expression,
       tableAttrs: Seq[AttributeReference],
-      scanBuilder: ScanBuilder)
+      scanBuilder: ScanBuilder,
+      partitionPredicateFields: Option[Seq[PartitionPredicateField]])
   : (Either[Seq[Filter], Seq[V2Filter]], Seq[Expression], Seq[Expression]) = {
 
     val (filtersWithSubquery, filtersWithoutSubquery) = findTableFilters(cond, tableAttrs)
 
     val (pushedFilters, postScanFiltersWithoutSubquery) =
-      PushDownUtils.pushFilters(scanBuilder, filtersWithoutSubquery)
+      PushDownUtils.pushFilters(scanBuilder, filtersWithoutSubquery, partitionPredicateFields)
 
     val postScanFilterSetWithoutSubquery = ExpressionSet(postScanFiltersWithoutSubquery)
     val evaluatedFilters = filtersWithoutSubquery.filterNot { filter =>

@@ -113,6 +113,7 @@ case class AddColumns(
   columnsToAdd.foreach { c =>
     TypeUtils.failWithIntervalType(c.dataType)
     TypeUtils.failUnsupportedDataType(c.dataType, conf)
+    TypeUtils.checkFileTypeHasQualifier(Seq(c.name -> c.dataType))
   }
 
   override lazy val resolved: Boolean = table.resolved && columnsToAdd.forall(_.resolved)
@@ -146,6 +147,7 @@ case class ReplaceColumns(
   columnsToAdd.foreach { c =>
     TypeUtils.failWithIntervalType(c.dataType)
     TypeUtils.failUnsupportedDataType(c.dataType, conf)
+    TypeUtils.checkFileTypeHasQualifier(Seq(c.name -> c.dataType))
   }
 
   override lazy val resolved: Boolean = table.resolved && columnsToAdd.forall(_.resolved)
@@ -218,6 +220,8 @@ case class RenameColumn(
  * @param newPosition new position of column if set
  * @param newDefaultExpression new default expression if set
  * @param dropDefault whether to drop the default expression
+ * @param dropComment whether to remove the existing comment (making it genuinely absent, as
+ *                    opposed to setting it to an empty string)
  */
 case class AlterColumnSpec(
     column: FieldName,
@@ -226,7 +230,8 @@ case class AlterColumnSpec(
     newComment: Option[String],
     newPosition: Option[FieldPosition],
     newDefaultExpression: Option[DefaultValueExpression],
-    dropDefault: Boolean = false) extends Expression with Unevaluable {
+    dropDefault: Boolean = false,
+    dropComment: Boolean = false) extends Expression with Unevaluable {
 
   override def children: Seq[Expression] = Seq(column) ++ newPosition.toSeq ++
     newDefaultExpression.toSeq
@@ -248,15 +253,31 @@ case class AlterColumnSpec(
     copy(column = newColumn, newPosition = newPos, newDefaultExpression = newDefault)
   }
 
-
+  /**
+   * Returns true if the default value's type has been coerced to match the column's dataType.
+   * When newDataType is None, we skip this check as the type will be resolved later.
+   */
+  def isDefaultValueTypeCoerced: Boolean = newDefaultExpression.forall { d =>
+    newDataType.forall(dt => ColumnDefinition.isDefaultValueTypeMatched(d.child.dataType, dt))
+  }
 }
 
 /**
  * The logical plan of the ALTER TABLE ... ALTER COLUMN command.
+ *
+ * `fromCommentOn` records whether this plan was produced by a `COMMENT ON ... COLUMN` statement
+ * (as opposed to `ALTER TABLE ... ALTER COLUMN`). Both syntaxes build the same plan, but the V1
+ * session-catalog routing only extends the multi-column / nested-field comment support to the
+ * `COMMENT ON` form, so it must be able to tell the two apart after resolution.
  */
 case class AlterColumns(
     table: LogicalPlan,
-    specs: Seq[AlterColumnSpec]) extends AlterTableCommand {
+    specs: Seq[AlterColumnSpec],
+    fromCommentOn: Boolean = false) extends AlterTableCommand {
+  specs.foreach { spec =>
+    spec.newDataType.foreach(dt => TypeUtils.checkFileTypeHasQualifier(Seq(spec.column.name -> dt)))
+  }
+
   override def changes: Seq[TableChange] = {
     specs.flatMap { spec =>
       val column = spec.column
@@ -268,8 +289,12 @@ case class AlterColumns(
       val nullabilityChange = spec.newNullability.map { nullable =>
         TableChange.updateColumnNullability(colName, nullable)
       }
-      val commentChange = spec.newComment.map { newComment =>
-        TableChange.updateColumnComment(colName, newComment)
+      val commentChange = if (spec.dropComment) {
+        Some(TableChange.updateColumnComment(colName, null: String))
+      } else {
+        spec.newComment.map { newComment =>
+          TableChange.updateColumnComment(colName, newComment)
+        }
       }
       val positionChange = spec.newPosition.map { newPosition =>
         require(newPosition.resolved,
@@ -293,6 +318,21 @@ case class AlterColumns(
 
   override protected def withNewChildInternal(newChild: LogicalPlan): LogicalPlan =
     copy(table = newChild)
+}
+
+object AlterColumns {
+  /**
+   * Returns the name of the first column that is altered more than once, either directly (the same
+   * column appears in multiple specs) or through a parent/descendant relationship (both a field and
+   * one of its nested fields are altered). Returns None when every column is altered at most once.
+   * Used to reject `ALTER COLUMN` / `COMMENT ON ... COLUMN` statements that change the same column
+   * twice, which is not supported.
+   */
+  def findRepeatedColumn(specs: Seq[AlterColumnSpec]): Option[Seq[String]] = {
+    val names = specs.map(_.column.name)
+    names.find(name => names.count(_ == name) > 1)
+      .orElse(names.find(name => names.exists(other => other != name && other.startsWith(name))))
+  }
 }
 
 /**
@@ -348,7 +388,22 @@ case class AddConstraint(
  */
 case class AddCheckConstraint(
     child: LogicalPlan,
-    checkConstraint: CheckConstraint) extends UnaryCommand {
+    checkConstraint: CheckConstraint,
+    analyzedQuery: Option[LogicalPlan] = None) extends UnaryCommand with KeepAnalyzedQuery {
+
+  // The optimizer replaces the filtered scan with an empty relation if no row can violate the
+  // check, so keep the analyzed child to find the table when planning. The constraint decides
+  // here, with its condition analyzed, whether to store a predicate. `NormalizePlan` also calls
+  // this, on parsed and optimized plans too, so the decision is made only once, on a resolved
+  // constraint.
+  override def storeAnalyzedQuery(): Command = {
+    val check = if (checkConstraint.resolved) {
+      checkConstraint.withPredicateDecision()
+    } else {
+      checkConstraint
+    }
+    copy(checkConstraint = check, analyzedQuery = Some(child))
+  }
 
   override protected def withNewChildInternal(newChild: LogicalPlan): LogicalPlan =
     copy(child = newChild)

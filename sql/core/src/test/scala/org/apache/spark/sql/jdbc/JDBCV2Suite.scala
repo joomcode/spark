@@ -19,33 +19,39 @@ package org.apache.spark.sql.jdbc
 
 import java.sql.{Connection, DriverManager}
 import java.util.{HexFormat, Properties}
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicInteger
 
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 import test.org.apache.spark.sql.connector.catalog.functions.JavaStrLen.JavaStrLenStaticMagic
 
 import org.apache.spark.{SparkConf, SparkException, SparkIllegalArgumentException}
-import org.apache.spark.sql.{AnalysisException, DataFrame, ExplainSuiteHelper, QueryTest, Row}
+import org.apache.spark.sql.{AnalysisException, DataFrame, ExplainSuiteHelper, Row}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.{CannotReplaceMissingTableException, IndexAlreadyExistsException, NoSuchIndexException}
+import org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, GlobalLimit, LocalLimit, Offset, Sort}
-import org.apache.spark.sql.connector.{IntegralAverage, StrLen}
+import org.apache.spark.sql.connector.{IntegralAverage, NondeterministicIntegralAverage, StrLen}
 import org.apache.spark.sql.connector.catalog.{Catalogs, Identifier, TableCatalog}
 import org.apache.spark.sql.connector.catalog.functions.{ScalarFunction, UnboundFunction}
 import org.apache.spark.sql.connector.catalog.index.SupportsIndex
 import org.apache.spark.sql.connector.expressions.Expression
 import org.apache.spark.sql.execution.{FormattedMode, RowDataSourceScanExec}
-import org.apache.spark.sql.execution.datasources.jdbc.{JDBCDatabaseMetadata, JDBCRDD}
+import org.apache.spark.sql.execution.datasources.jdbc.{JDBCDatabaseMetadata, JDBCOptions, JDBCRDD}
 import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2ScanRelation, V1ScanWrapper}
 import org.apache.spark.sql.execution.datasources.v2.jdbc.JDBCTableCatalog
 import org.apache.spark.sql.functions.{abs, acos, asin, atan, atan2, avg, ceil, coalesce, cos, cosh, cot, count, count_distinct, degrees, exp, floor, lit, log => logarithm, log10, not, pow, radians, round, signum, sin, sinh, sqrt, sum, tan, tanh, udf, when}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{DataType, IntegerType, StringType}
+import org.apache.spark.tags.DataSourceV2Test
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.Utils
 
-class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHelper {
+@DataSourceV2Test
+class JDBCV2Suite extends SharedSparkSession with ExplainSuiteHelper {
   import testImplicits._
 
   val tempDir = Utils.createTempDir()
@@ -214,6 +220,8 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
       batchStmt.addBatch("INSERT INTO \"test\".\"address\" VALUES ('abc%_def@gmail.com')")
       batchStmt.addBatch("INSERT INTO \"test\".\"address\" VALUES ('abc_%def@gmail.com')")
       batchStmt.addBatch("INSERT INTO \"test\".\"address\" VALUES ('abc_''%def@gmail.com')")
+      batchStmt.addBatch(
+        "INSERT INTO \"test\".\"address\" VALUES ('abc\\def@gmail.com')")
 
       batchStmt.addBatch("CREATE TABLE \"test\".\"employee_bonus\" " +
         "(name TEXT(32), salary NUMERIC(20, 2), bonus DOUBLE, factor DOUBLE)")
@@ -234,6 +242,12 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
       batchStmt.addBatch("INSERT INTO \"test\".\"strings_with_nulls\" VALUES ('a a a')")
       batchStmt.addBatch("INSERT INTO \"test\".\"strings_with_nulls\" VALUES (null)")
 
+      batchStmt.addBatch(
+        "CREATE TABLE \"test\".\"null_literal\" (s TEXT(32))")
+      batchStmt.addBatch("INSERT INTO \"test\".\"null_literal\" VALUES ('keep')")
+      batchStmt.addBatch("INSERT INTO \"test\".\"null_literal\" VALUES ('')")
+      batchStmt.addBatch("INSERT INTO \"test\".\"null_literal\" VALUES (null)")
+
       batchStmt.executeBatch()
 
       conn
@@ -245,6 +259,7 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
       stmt.executeUpdate()
     }
     h2Dialect.registerFunction("my_avg", IntegralAverage)
+    h2Dialect.registerFunction("my_nondeterministic_avg", NondeterministicIntegralAverage)
     h2Dialect.registerFunction("my_strlen", StrLen(CharLength))
     h2Dialect.registerFunction("my_strlen_magic", StrLen(CharLengthWithMagicMethod))
     h2Dialect.registerFunction(
@@ -255,6 +270,20 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
     h2Dialect.clearFunctions()
     Utils.deleteRecursively(tempDir)
     super.afterAll()
+  }
+
+  test("COALESCE with Boolean cast pushes down") {
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+      withTable("h2.test.boolean_cast_coalesce") {
+        sql("CREATE TABLE h2.test.boolean_cast_coalesce (c INT)")
+        sql("INSERT INTO h2.test.boolean_cast_coalesce VALUES (0), (1)")
+        val df = sql("SELECT c FROM h2.test.boolean_cast_coalesce " +
+          "WHERE COALESCE(NOT CAST(c AS BOOLEAN), false)")
+        checkFiltersRemoved(df)
+        checkPushedInfo(df, "PushedFilters: [COALESCE(NOT (CAST(c AS boolean)), FALSE)]")
+        checkAnswer(df, Seq(Row(0)))
+      }
+    }
   }
 
   test("simple scan") {
@@ -272,6 +301,33 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
     }
   }
 
+  test("SPARK-57243: IS [NOT] NULL over a composite operand is pushed down and runs on H2") {
+    val df1 = sql("SELECT name FROM h2.test.employee WHERE (salary = 10000) IS NOT NULL")
+    checkFiltersRemoved(df1)
+    checkPushedInfo(df1, "PushedFilters: [SALARY IS NOT NULL, (SALARY = 10000.00) IS NOT NULL]")
+    checkAnswer(df1, Seq(Row("amy"), Row("alex"), Row("cathy"), Row("david"), Row("jen")))
+
+    val df2 = sql("SELECT name FROM h2.test.employee WHERE (salary = 10000) IS NULL")
+    checkFiltersRemoved(df2)
+    checkPushedInfo(df2, "PushedFilters: [(SALARY = 10000.00) IS NULL]")
+    checkAnswer(df2, Seq.empty)
+  }
+
+  test("SPARK-57988: IS [NOT] NULL over an IN operand is pushed down and runs on H2") {
+    // Without the parentheses around the IN operand the pushed SQL would be
+    // `SALARY IN (...) IS NOT NULL`, which databases reject as a syntax error.
+    val df1 =
+      sql("SELECT name FROM h2.test.employee WHERE (salary IN (10000, 12000)) IS NOT NULL")
+    checkFiltersRemoved(df1)
+    checkPushedInfo(df1, "PushedFilters: [(SALARY IN (10000.00, 12000.00)) IS NOT NULL]")
+    checkAnswer(df1, Seq(Row("amy"), Row("alex"), Row("cathy"), Row("david"), Row("jen")))
+
+    val df2 = sql("SELECT name FROM h2.test.employee WHERE (salary IN (10000, 12000)) IS NULL")
+    checkFiltersRemoved(df2)
+    checkPushedInfo(df2, "PushedFilters: [(SALARY IN (10000.00, 12000.00)) IS NULL]")
+    checkAnswer(df2, Seq.empty)
+  }
+
   // TABLESAMPLE ({integer_expression | decimal_expression} PERCENT) and
   // TABLESAMPLE (BUCKET integer_expression OUT OF integer_expression)
   // are tested in JDBC dialect tests because TABLESAMPLE is not supported by all the DBMS
@@ -284,10 +340,12 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
     checkAnswer(df, Seq(Row("amy"), Row("alex"), Row("cathy")))
   }
 
+  private def scanOf(df: DataFrame): DataSourceV2ScanRelation =
+    df.queryExecution.optimizedPlan.collectFirst { case r: DataSourceV2ScanRelation => r }
+      .getOrElse(fail(s"no scan in:\n${df.queryExecution.optimizedPlan}"))
+
   private def checkSchemaNames(df: DataFrame, names: Seq[String]): Unit = {
-    val scan = df.queryExecution.optimizedPlan.collectFirst {
-      case s: DataSourceV2ScanRelation => s
-    }.get
+    val scan = scanOf(df)
     assert(scan.schema.names.sameElements(names))
   }
 
@@ -962,6 +1020,50 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
     checkAnswer(df2, Seq(Row(2, "david", 10000.00)))
   }
 
+  test("SPARK-61870: a scan with a pushed aggregate reads the same rows again") {
+    val agg = spark.read.table("h2.test.employee").groupBy("DEPT").sum("SALARY")
+    checkAggregateRemoved(agg)
+    val scan = scanOf(agg)
+    assert(scan.repeatableRead && !scan.onlyRowWisePushdowns)
+  }
+
+  test("SPARK-61870: a scan with a pushed aggregate function that is not deterministic does not " +
+    "read the same rows again") {
+    JdbcDialects.unregisterDialect(h2Dialect)
+    try {
+      JdbcDialects.registerDialect(testH2Dialect)
+      withTempPath { dir =>
+        val factPath = dir.getCanonicalPath
+        spark.range(10).selectExpr("id", "IF(id % 2 = 0, 'fred', 'mary') AS name")
+          .write.parquet(factPath)
+        // A JDBC scan reports no statistics, so a small default size lets it be a creation side.
+        withSQLConf(SQLConf.DEFAULT_SIZE_IN_BYTES.key -> "1000",
+            SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+            SQLConf.RUNTIME_BLOOM_FILTER_APPLICATION_SIDE_SCAN_SIZE_THRESHOLD.key -> "1",
+            SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "false") {
+          Seq("my_avg" -> true, "my_nondeterministic_avg" -> false).foreach {
+            case (f, repeatable) =>
+              val df = sql(s"SELECT name, h2.$f(id) AS v FROM h2.test.people GROUP BY name")
+              checkAggregateRemoved(df)
+              assert(scanOf(df).isRepeatableRead == repeatable, f)
+              // `v > 0` keeps every group but is a selective `Filter` above the scan, and the
+              // bloom filter's subquery would read the scan again.
+              val joined = df.where("v > 0").join(spark.read.parquet(factPath), "name")
+              val plan = joined.queryExecution.optimizedPlan
+              val hasBloomFilter = plan.exists(_.expressions.exists(_.exists {
+                case _: BloomFilterMightContain => true
+                case _ => false
+              }))
+              assert(hasBloomFilter == repeatable, s"$f:\n$plan")
+          }
+        }
+      }
+    } finally {
+      JdbcDialects.unregisterDialect(testH2Dialect)
+      JdbcDialects.registerDialect(h2Dialect)
+    }
+  }
+
   test("scan with aggregate push-down, top N push-down and offset push-down") {
     val df1 = spark.read
       .table("h2.test.employee")
@@ -982,6 +1084,8 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
     val topN1 = df1.limit(1)
     checkSortRemoved(topN1)
     checkLimitRemoved(topN1)
+    // A pushed top N lets the source pick other rows on a second read.
+    assert(!scanOf(topN1).isRepeatableRead)
     checkPushedInfo(topN1,
       "PushedAggregates: [SUM(SALARY)]",
       "PushedGroupByExpressions: [DEPT]",
@@ -1214,14 +1318,16 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
     checkPushedInfo(df10, "PushedFilters: [ID IS NOT NULL, ID > 1]")
     checkAnswer(df10, Row("mary", 2))
 
+    // RAND(1) is non-deterministic, so (SPARK-58207) it is not pushed down and stays as a
+    // post-scan filter. RAND(1) < bonus is trivially true for the matching row (bonus = 1300 >= 1).
     val df11 = sql(
       """
         |SELECT * FROM h2.test.employee
         |WHERE GREATEST(bonus, 1100) > 1200 AND RAND(1) < bonus
         |""".stripMargin)
-    checkFiltersRemoved(df11)
+    checkFiltersRemoved(df11, removed = false)
     checkPushedInfo(df11, "PushedFilters: " +
-      "[BONUS IS NOT NULL, (GREATEST(BONUS, 1100.0)) > 1200.0, RAND(1) < BONUS]")
+      "[BONUS IS NOT NULL, (GREATEST(BONUS, 1100.0)) > 1200.0]")
     checkAnswer(df11, Row(2, "david", 10000, 1300, true))
 
     val df12 = sql(
@@ -1413,6 +1519,25 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
     checkPushedInfo(df15,
       raw"PushedFilters: [EMAIL IS NOT NULL, EMAIL LIKE '%c\_''\%d%' ESCAPE '\']")
     checkAnswer(df15, Seq(Row("abc_'%def@gmail.com")))
+
+    // Backslash in the value must be escaped since '\' is the LIKE escape character
+    val df16 = spark.table("h2.test.address").filter($"email".startsWith("abc\\"))
+    checkFiltersRemoved(df16)
+    checkPushedInfo(df16,
+      raw"PushedFilters: [EMAIL IS NOT NULL, EMAIL LIKE 'abc\\%' ESCAPE '\']")
+    checkAnswer(df16, Seq(Row("abc\\def@gmail.com")))
+
+    val df17 = spark.table("h2.test.address").filter($"email".endsWith("\\def@gmail.com"))
+    checkFiltersRemoved(df17)
+    checkPushedInfo(df17,
+      raw"PushedFilters: [EMAIL IS NOT NULL, EMAIL LIKE '%\\def@gmail.com' ESCAPE '\']")
+    checkAnswer(df17, Seq(Row("abc\\def@gmail.com")))
+
+    val df18 = spark.table("h2.test.address").filter($"email".contains("c\\d"))
+    checkFiltersRemoved(df18)
+    checkPushedInfo(df18,
+      raw"PushedFilters: [EMAIL IS NOT NULL, EMAIL LIKE '%c\\d%' ESCAPE '\']")
+    checkAnswer(df18, Seq(Row("abc\\def@gmail.com")))
   }
 
   test("scan with filter push-down with ansi mode") {
@@ -1769,7 +1894,8 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
       Seq(Row("test", "address", false), Row("test", "people", false),
         Row("test", "empty_table", false), Row("test", "employee", false),
         Row("test", "item", false), Row("test", "dept", false),
-        Row("test", "person", false), Row("test", "view1", false), Row("test", "view2", false),
+        Row("test", "null_literal", false), Row("test", "person", false),
+        Row("test", "view1", false), Row("test", "view2", false),
         Row("test", "datetime", false), Row("test", "binary_tab", false),
         Row("test", "employee_bonus", false),
         Row("test", "strings_with_nulls", false)))
@@ -1839,6 +1965,23 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
 
       sql("SELECT 'bob' AS NAME, 4 AS ID").writeTo("h2.test.abc").overwrite(lit(true))
       checkAnswer(sql("SELECT name, id FROM h2.test.abc"), Row("bob", 4))
+    }
+  }
+
+  test("DataFrameWriterV2: truncate closes JDBC connections") {
+    JdbcDialects.unregisterDialect(h2Dialect)
+    try {
+      ConnectionTrackingH2Dialect.clearConnections()
+      JdbcDialects.registerDialect(ConnectionTrackingH2Dialect)
+      withTable("h2.test.abc") {
+        sql("CREATE TABLE h2.test.abc AS SELECT * FROM h2.test.people")
+        sql("SELECT 'bob' AS NAME, 4 AS ID").writeTo("h2.test.abc").overwrite(lit(true))
+        assert(ConnectionTrackingH2Dialect.hasTrackedConnections)
+        assert(ConnectionTrackingH2Dialect.allConnectionsClosed)
+      }
+    } finally {
+      JdbcDialects.unregisterDialect(ConnectionTrackingH2Dialect)
+      JdbcDialects.registerDialect(h2Dialect)
     }
   }
 
@@ -1925,6 +2068,141 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
       "rpad(name, 5, '*') = 'jen**'")
     checkPushedInfo(df10, "[NAME IS NOT NULL, (RPAD(NAME, 5, '*')) = 'jen**']")
     checkAnswer(df10, Seq(Row(6, "jen", 12000, 1200, true)))
+  }
+
+  test("SPARK-60479: CHAR equality is pushed down with read-side padding") {
+    val table = "h2.test.char_pad"
+    withTable(table) {
+      sql(s"CREATE TABLE $table (id INT, flag CHAR(5))")
+      // scalastyle:off nonascii
+      sql(s"INSERT INTO $table VALUES (1, 'Y'), (2, 'N'), (3, 'YES'), (4, NULL), (5, 'ä')")
+
+      val eq = sql(s"SELECT id FROM $table WHERE flag = 'Y'")
+      checkFiltersRemoved(eq)
+      checkPushedInfo(eq,
+        "PushedFilters: [flag IS NOT NULL, (CHAR_READ_SIDE_PADDING(flag, 5, ' ')) = 'Y    ']")
+      checkAnswer(eq, Seq(Row(1)))
+
+      val in = sql(s"SELECT id FROM $table WHERE flag IN ('Y', 'N')")
+      checkFiltersRemoved(in)
+      checkPushedInfo(in,
+        "PushedFilters: [CHAR_READ_SIDE_PADDING(flag, 5, ' ') IN ('Y    ', 'N    ')]")
+      checkAnswer(in, Seq(Row(1), Row(2)))
+
+      withSQLConf(SQLConf.OPTIMIZER_INSET_CONVERSION_THRESHOLD.key -> "2") {
+        val inSetQ = sql(s"SELECT id FROM $table WHERE flag IN ('Y', 'N', 'X')")
+        checkFiltersRemoved(inSetQ)
+        checkPushedInfo(inSetQ,
+          "CHAR_READ_SIDE_PADDING(flag, 5, ' ') IN",
+          "'Y    '",
+          "'N    '",
+          "'X    '")
+        checkAnswer(inSetQ, Seq(Row(1), Row(2)))
+      }
+
+      val isNull = sql(s"SELECT id FROM $table WHERE flag IS NULL")
+      checkFiltersRemoved(isNull)
+      checkPushedInfo(isNull, "PushedFilters: [flag IS NULL]")
+      checkAnswer(isNull, Seq(Row(4)))
+
+      val notIn = sql(s"SELECT id FROM $table WHERE flag NOT IN ('Y', 'N')")
+      checkFiltersRemoved(notIn)
+      checkPushedInfo(notIn,
+        "PushedFilters: [NOT (CHAR_READ_SIDE_PADDING(flag, 5, ' ') IN ('Y    ', 'N    '))]")
+      checkAnswer(notIn, Seq(Row(3), Row(5)))
+
+      val orPred = sql(s"SELECT id FROM $table WHERE flag = 'Y' OR flag = 'N'")
+      checkFiltersRemoved(orPred)
+      checkAnswer(orPred, Seq(Row(1), Row(2)))
+
+      val nseq = sql(s"SELECT id FROM $table WHERE flag <=> 'Y'")
+      checkFiltersRemoved(nseq)
+      checkPushedInfo(nseq,
+        "CHAR_READ_SIDE_PADDING(flag, 5, ' ')) = 'Y    '",
+        "IS NULL AND 'Y    ' IS NULL")
+      checkAnswer(nseq, Seq(Row(1)))
+
+      val notNseq = sql(s"SELECT id FROM $table WHERE NOT (flag <=> 'Y')")
+      checkFiltersRemoved(notNseq)
+      checkPushedInfo(notNseq,
+        "NOT ((((CHAR_READ_SIDE_PADDING(flag, 5, ' ')) IS NOT NULL",
+        "IS NULL AND 'Y    ' IS NULL")
+      checkAnswer(notNseq, Seq(Row(2), Row(3), Row(4), Row(5)))
+
+      val neq = sql(s"SELECT id FROM $table WHERE flag <> 'Y'")
+      checkFiltersRemoved(neq)
+      checkPushedInfo(neq,
+        "PushedFilters: [flag IS NOT NULL, " +
+          "NOT ((CHAR_READ_SIDE_PADDING(flag, 5, ' ')) = 'Y    ')]")
+      checkAnswer(neq, Seq(Row(2), Row(3), Row(5)))
+
+      val longLit = sql(s"SELECT id FROM $table WHERE flag = 'YYYYYY'")
+      checkFiltersRemoved(longLit, removed = false)
+      checkAnswer(longLit, Seq.empty)
+
+      val range = sql(s"SELECT id FROM $table WHERE flag > 'A'")
+      checkFiltersRemoved(range, removed = false)
+      checkAnswer(range, Seq(Row(1), Row(2), Row(3), Row(5)))
+
+      val likeFam = sql(s"SELECT id FROM $table WHERE flag LIKE 'Y%'")
+      checkFiltersRemoved(likeFam, removed = false)
+      checkAnswer(likeFam, Seq(Row(1), Row(3)))
+
+      val likeEq = sql(s"SELECT id FROM $table WHERE flag LIKE 'Y'")
+      checkFiltersRemoved(likeEq, removed = false)
+      checkAnswer(likeEq, Seq.empty)
+
+      val likeEnd = sql(s"SELECT id FROM $table WHERE flag LIKE '%Y'")
+      checkFiltersRemoved(likeEnd, removed = false)
+      checkAnswer(likeEnd, Seq.empty)
+
+      val vsCols = "h2.test.char_vs_vc"
+      withTable(vsCols) {
+        sql(s"CREATE TABLE $vsCols (flag CHAR(5), v VARCHAR(5))")
+        sql(s"INSERT INTO $vsCols VALUES ('Y', 'Y')")
+        val vsVarchar = sql(s"SELECT v FROM $vsCols WHERE flag = v")
+        checkFiltersRemoved(vsVarchar, removed = false)
+        checkAnswer(vsVarchar, Seq.empty)
+      }
+
+      val rpadNest = sql(s"SELECT id FROM $table WHERE rpad(flag, 10, 'x') = 'Y    xxxxx'")
+      checkFiltersRemoved(rpadNest, removed = false)
+      checkAnswer(rpadNest, Seq(Row(1)))
+
+      val cnt = sql(s"SELECT COUNT(flag) FROM $table")
+      checkAggregateRemoved(cnt, removed = false)
+      checkAnswer(cnt, Seq(Row(4)))
+
+      val caseSum = sql(
+        s"SELECT SUM(CASE WHEN flag = 'Y' THEN 1 ELSE 0 END) FROM $table")
+      checkAggregateRemoved(caseSum)
+      checkAnswer(caseSum, Seq(Row(1)))
+
+      val grp = sql(s"SELECT flag, COUNT(*) FROM $table GROUP BY flag")
+      checkAggregateRemoved(grp, removed = false)
+      checkAnswer(grp, Seq(
+        Row("Y    ", 1), Row("N    ", 1), Row("YES  ", 1), Row(null, 1), Row("ä    ", 1)))
+      // scalastyle:on nonascii
+
+      val topN = sql(s"SELECT id FROM $table WHERE flag IS NOT NULL ORDER BY flag LIMIT 1")
+      checkSortRemoved(topN, removed = false)
+      checkAnswer(topN, Seq(Row(2)))
+
+      withSQLConf(SQLConf.READ_SIDE_CHAR_PADDING.key -> "false") {
+        val padFalse = sql(s"SELECT id FROM $table WHERE flag = 'Y'")
+        checkFiltersRemoved(padFalse)
+        checkPushedInfo(padFalse,
+          "PushedFilters: [flag IS NOT NULL, (RPAD(flag, 5, ' ')) = 'Y    ']")
+        checkAnswer(padFalse, Seq(Row(1)))
+      }
+
+      withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true") {
+        val std = sql(s"SELECT id FROM $table WHERE flag = CAST('Y' AS CHAR(5))")
+        checkFiltersRemoved(std, removed = false)
+        checkPushedInfo(std, "PushedFilters: [flag IS NOT NULL]")
+        checkAnswer(std, Seq(Row(1)))
+      }
+    }
   }
 
   test("scan with aggregate push-down: MAX AVG with filter and group by") {
@@ -2465,7 +2743,7 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
     checkAggregateRemoved(df3)
     checkPushedInfo(df3,
       """
-        |PushedAggregates: [AVG(CASE WHEN BONUS IS NOT NULL THEN BONUS ELSE null END)],
+        |PushedAggregates: [AVG(CASE WHEN BONUS IS NOT NULL THEN BONUS ELSE NULL END)],
         |PushedFilters: [DEPT IS NOT NULL, DEPT > 0],
         |PushedGroupByExpressions: [DEPT],
         |""".stripMargin.replaceAll("\n", " "))
@@ -2481,7 +2759,7 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
     checkAggregateRemoved(df4)
     checkPushedInfo(df4,
       """
-        |PushedAggregates: [AVG(DISTINCT CASE WHEN BONUS IS NOT NULL THEN BONUS ELSE null END)],
+        |PushedAggregates: [AVG(DISTINCT CASE WHEN BONUS IS NOT NULL THEN BONUS ELSE NULL END)],
         |PushedFilters: [DEPT IS NOT NULL, DEPT > 0],
         |PushedGroupByExpressions: [DEPT],
         |""".stripMargin.replaceAll("\n", " "))
@@ -2949,7 +3227,7 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
         condition = "UNRESOLVED_ROUTINE",
         parameters = Map(
           "routineName" -> "`h2`.`test`.`my_avg2`",
-          "searchPath" -> "[`system`.`builtin`, `system`.`session`, `h2`.`default`]"),
+          "searchPath" -> "[`system`.`builtin`, `system`.`session`, `spark_catalog`.`default`]"),
         context = ExpectedContext(
           fragment = "h2.test.my_avg2(id)",
           start = 7,
@@ -2961,11 +3239,24 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
         condition = "UNRESOLVED_ROUTINE",
         parameters = Map(
           "routineName" -> "`h2`.`my_avg2`",
-          "searchPath" -> "[`system`.`builtin`, `system`.`session`, `h2`.`default`]"),
+          "searchPath" -> "[`system`.`builtin`, `system`.`session`, `spark_catalog`.`default`]"),
         context = ExpectedContext(
           fragment = "h2.my_avg2(id)",
           start = 7,
           stop = 20))
+      // Multi-part namespace should also result in UNRESOLVED_ROUTINE
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql("SELECT * FROM h2.test.people where h2.db_name.schema_name.function_name()")
+        },
+        condition = "UNRESOLVED_ROUTINE",
+        parameters = Map(
+          "routineName" -> "`h2`.`db_name`.`schema_name`.`function_name`",
+          "searchPath" -> "[`system`.`builtin`, `system`.`session`, `spark_catalog`.`default`]"),
+        context = ExpectedContext(
+          fragment = "h2.db_name.schema_name.function_name()",
+          start = 35,
+          stop = 72))
     } finally {
       JdbcDialects.unregisterDialect(testH2Dialect)
       JdbcDialects.registerDialect(h2Dialect)
@@ -3067,25 +3358,6 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
     assert(indexes3.isEmpty)
   }
 
-  test("IDENTIFIER_TOO_MANY_NAME_PARTS: " +
-    "jdbc function doesn't support identifiers consisting of more than 2 parts") {
-    JdbcDialects.unregisterDialect(h2Dialect)
-    try {
-      JdbcDialects.registerDialect(testH2Dialect)
-      checkError(
-        exception = intercept[AnalysisException] {
-          sql("SELECT * FROM h2.test.people where h2.db_name.schema_name.function_name()")
-        },
-        condition = "IDENTIFIER_TOO_MANY_NAME_PARTS",
-        sqlState = "42601",
-        parameters = Map("identifier" -> "`db_name`.`schema_name`.`function_name`", "limit" -> "2")
-      )
-    } finally {
-      JdbcDialects.unregisterDialect(testH2Dialect)
-      JdbcDialects.registerDialect(h2Dialect)
-    }
-  }
-
   test("Explain shows executed SQL query") {
     val df = sql("SELECT max(id) FROM h2.test.people WHERE id > 1")
     val explained = getNormalizedExplain(df, FormattedMode)
@@ -3129,5 +3401,71 @@ class JDBCV2Suite extends QueryTest with SharedSparkSession with ExplainSuiteHel
     )
 
     assertResult(expectedMetadata) { jdbcRdd.getDatabaseMetadata }
+  }
+
+  test("SPARK-60507: JDBC read opens one driver connection") {
+    val driverConnections = new AtomicInteger()
+    val countingDialect = new H2Dialect() {
+      override def createConnectionFactory(options: JDBCOptions): Int => Connection = {
+        val factory = super.createConnectionFactory(options)
+        partitionId => {
+          if (partitionId == -1) driverConnections.incrementAndGet()
+          factory(partitionId)
+        }
+      }
+    }
+    JdbcDialects.unregisterDialect(h2Dialect)
+    try {
+      JdbcDialects.registerDialect(countingDialect)
+      val reads = Seq[(String, () => Unit)](
+        "v1" -> { () =>
+          val df = spark.read.jdbc(url, "\"test\".\"people\"", new Properties())
+          df.count()
+          df.collect()
+        },
+        "v2" -> (() => sql("SELECT * FROM h2.test.people").collect()))
+      reads.foreach { case (name, read) =>
+        driverConnections.set(0)
+        read()
+        assert(driverConnections.get() == 1, s"$name read opened ${driverConnections.get()}")
+      }
+    } finally {
+      JdbcDialects.unregisterDialect(countingDialect)
+      JdbcDialects.registerDialect(h2Dialect)
+    }
+  }
+
+  test("SPARK-58782: null literal in aggregate should render as NULL not 'null'") {
+    val df = sql("SELECT NULLIF(s, '') AS g, COUNT(*) FROM h2.test.null_literal GROUP BY g")
+
+    checkAggregateRemoved(df)
+    checkPushedInfo(df,
+      "PushedAggregates: [COUNT(*)]",
+      "PushedGroupByExpressions: [CASE WHEN S = '' THEN NULL ELSE S END]")
+
+    // The '' row should collapse into the NULL group, not create a separate 'null' string group
+    checkAnswer(df, Seq(Row("keep", 1), Row(null, 2)))
+  }
+
+}
+
+private object ConnectionTrackingH2Dialect extends JdbcDialect {
+  private val connections = new ConcurrentLinkedQueue[Connection]()
+
+  def clearConnections(): Unit = connections.clear()
+
+  def hasTrackedConnections: Boolean = !connections.isEmpty
+
+  def allConnectionsClosed: Boolean = connections.asScala.forall(_.isClosed)
+
+  override def canHandle(url: String): Boolean = H2Dialect().canHandle(url)
+
+  override def createConnectionFactory(options: JDBCOptions): Int => Connection = {
+    val connectionFactory = H2Dialect().createConnectionFactory(options)
+    (partitionId: Int) => {
+      val connection = connectionFactory(partitionId)
+      connections.add(connection)
+      connection
+    }
   }
 }

@@ -19,22 +19,23 @@ package org.apache.spark.sql.internal
 import org.apache.spark.annotation.Unstable
 import org.apache.spark.sql.{DataSourceRegistration, ExperimentalMethods, SparkSessionExtensions, UDTFRegistration}
 import org.apache.spark.sql.artifact.ArtifactManager
-import org.apache.spark.sql.catalyst.analysis.{Analyzer, EvalSubqueriesForTimeTravel, FunctionRegistry, InvokeProcedures, ReplaceCharWithVarchar, ResolveDataSource, ResolveEventTimeWatermark, ResolveExecuteImmediate, ResolveMetricView, ResolveSessionCatalog, ResolveTranspose, TableFunctionRegistry}
+import org.apache.spark.sql.catalyst.analysis.{Analyzer, CheckExternalLookupJoin, EvalSubqueriesForTimeTravel, FunctionRegistry, InvokeProcedures, ReplaceCharWithVarchar, ResolveDataSource, ResolveEventTimeWatermark, ResolveExecuteImmediate, ResolveMetricView, ResolveSessionCatalog, ResolveSetCatalogCommand, ResolveTranspose, TableFunctionRegistry}
 import org.apache.spark.sql.catalyst.analysis.resolver.ResolverExtension
 import org.apache.spark.sql.catalyst.catalog.{FunctionExpressionBuilder, SessionCatalog}
-import org.apache.spark.sql.catalyst.expressions.{Expression, ExtractSemiStructuredFields}
+import org.apache.spark.sql.catalyst.expressions.{Expression, ExtractSemiStructuredFields, ParseSql}
+import org.apache.spark.sql.catalyst.normalizer.NormalizeCTEIds
 import org.apache.spark.sql.catalyst.optimizer.Optimizer
 import org.apache.spark.sql.catalyst.parser.ParserInterface
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.classic.{SparkSession, Strategy, StreamingCheckpointManager, StreamingQueryManager, UDFRegistration}
-import org.apache.spark.sql.connector.catalog.CatalogManager
+import org.apache.spark.sql.connector.catalog.DefaultCatalogManager
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.{ColumnarRule, CommandExecutionMode, QueryExecution, SparkOptimizer, SparkPlanner, SparkSqlParser}
 import org.apache.spark.sql.execution.adaptive.AdaptiveRulesHolder
 import org.apache.spark.sql.execution.aggregate.{ResolveEncodersInScalaAgg, ScalaUDAF}
 import org.apache.spark.sql.execution.analysis.DetectAmbiguousSelfJoin
-import org.apache.spark.sql.execution.command.CommandCheck
+import org.apache.spark.sql.execution.command.{CheckViewReferences, CommandCheck}
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.execution.datasources.v2.{TableCapabilityCheck, V2SessionCatalog}
 import org.apache.spark.sql.execution.streaming.runtime.ResolveWriteToStream
@@ -81,25 +82,10 @@ abstract class BaseSessionStateBuilder(
   /**
    * SQL-specific key-value configurations.
    *
-   * These either get cloned from a pre-existing instance or newly created. The conf is merged
-   * with its [[SparkConf]] only when there is no parent session.
+   * Uses the SQLConf from the SparkSession, which is initialized before sessionState
+   * to avoid recursive access during sessionState initialization.
    */
-  protected lazy val conf: SQLConf = {
-    parentState.map { s =>
-      val cloned = s.conf.clone()
-      if (session.sparkContext.conf.get(StaticSQLConf.SQL_LEGACY_SESSION_INIT_WITH_DEFAULTS)) {
-        SQLConf.mergeSparkConf(cloned, session.sparkContext.conf)
-      }
-      cloned
-    }.getOrElse {
-      val conf = new SQLConf
-      SQLConf.mergeSparkConf(conf, session.sharedState.conf)
-      // the later added configs to spark conf shall be respected too
-      SQLConf.mergeNonStaticSQLConfigs(conf, session.sparkContext.conf.getAll.toMap)
-      SQLConf.mergeNonStaticSQLConfigs(conf, session.initialSessionOptions)
-      conf
-    }
-  }
+  protected def conf: SQLConf = session.sqlConf
 
   /**
    * Internal catalog managing functions registered by the user.
@@ -108,7 +94,12 @@ abstract class BaseSessionStateBuilder(
    */
   protected lazy val functionRegistry: FunctionRegistry = {
     parentState.map(_.functionRegistry.clone())
-      .getOrElse(extensions.registerFunctions(FunctionRegistry.builtin.clone()))
+      .getOrElse {
+        val registry = FunctionRegistry.builtin.clone()
+        // sql/core-only builtins that need SparkSqlParser.
+        ParseSql.register(registry)
+        extensions.registerFunctions(registry)
+      }
   }
 
   /**
@@ -174,7 +165,11 @@ abstract class BaseSessionStateBuilder(
 
   protected lazy val v2SessionCatalog = new V2SessionCatalog(catalog)
 
-  protected lazy val catalogManager = new CatalogManager(v2SessionCatalog, catalog)
+  protected lazy val catalogManager = {
+    val cm = new DefaultCatalogManager(v2SessionCatalog, catalog)
+    parentState.foreach(ps => cm.copySessionPathFrom(ps.catalogManager))
+    cm
+  }
 
   protected lazy val sharedRelationCache = session.sharedState.relationCache
 
@@ -199,7 +194,7 @@ abstract class BaseSessionStateBuilder(
    *
    * Note: this depends on the `conf` and `catalog` fields.
    */
-  protected def analyzer: Analyzer = new Analyzer(catalogManager, sharedRelationCache) {
+  protected def analyzer: Analyzer = new Analyzer(catalogManager, sharedRelationCache, Some(conf)) {
     override val hintResolutionRules: Seq[Rule[LogicalPlan]] =
       customHintResolutionRules
 
@@ -250,6 +245,7 @@ abstract class BaseSessionStateBuilder(
         ResolveExecuteImmediate(session, this.catalogManager) +:
         ExtractSemiStructuredFields +:
         ResolveEventTimeWatermark +:
+        ResolveSetCatalogCommand +:
         customResolutionRules
 
     override val postHocResolutionRules: Seq[Rule[LogicalPlan]] =
@@ -267,7 +263,9 @@ abstract class BaseSessionStateBuilder(
         PreReadCheck +:
         HiveOnlyCheck +:
         TableCapabilityCheck +:
+        CheckExternalLookupJoin +:
         CommandCheck +:
+        CheckViewReferences +:
         ViewSyncSchemaToMetaStore +:
         customCheckRules
   }
@@ -338,6 +336,9 @@ abstract class BaseSessionStateBuilder(
 
       override def extendedOperatorOptimizationRules: Seq[Rule[LogicalPlan]] =
         super.extendedOperatorOptimizationRules ++ customOperatorOptimizationRules
+
+      override def preOperatorOptimizationRules: Seq[Rule[LogicalPlan]] =
+        super.preOperatorOptimizationRules ++ customPreOperatorOptimizationRules
     }
   }
 
@@ -349,6 +350,16 @@ abstract class BaseSessionStateBuilder(
    */
   protected def customOperatorOptimizationRules: Seq[Rule[LogicalPlan]] = {
     extensions.buildOptimizerRules(session)
+  }
+
+  /**
+   * Custom rules that run in a single pass before the main operator optimization batch.
+   * Prefer overriding this instead of creating your own Optimizer.
+   *
+   * Note that this may NOT depend on the `optimizer` function.
+   */
+  protected def customPreOperatorOptimizationRules: Seq[Rule[LogicalPlan]] = {
+    extensions.buildPreOperatorOptimizationRules(session)
   }
 
   /**
@@ -404,6 +415,7 @@ abstract class BaseSessionStateBuilder(
   }
 
   protected def planNormalizationRules: Seq[Rule[LogicalPlan]] = {
+    NormalizeCTEIds +:
     extensions.buildPlanNormalizationRules(session)
   }
 
@@ -413,7 +425,8 @@ abstract class BaseSessionStateBuilder(
   protected def createQueryExecution:
     (LogicalPlan, CommandExecutionMode.Value) => QueryExecution =
       (plan, mode) => new QueryExecution(session, plan, mode = mode,
-        shuffleCleanupMode = QueryExecution.determineShuffleCleanupMode(session.sessionState.conf))
+        shuffleCleanupModeOpt =
+          Some(QueryExecution.determineShuffleCleanupMode(session.sessionState.conf)))
 
   /**
    * Interface to start and stop streaming queries.
@@ -483,35 +496,6 @@ abstract class BaseSessionStateBuilder(
       adaptiveRulesHolder,
       planNormalizationRules,
       () => artifactManager)
-  }
-}
-
-/**
- * Helper class for using SessionStateBuilders during tests.
- */
-private[sql] trait WithTestConf { self: BaseSessionStateBuilder =>
-  def overrideConfs: Map[String, String]
-
-  override protected lazy val conf: SQLConf = {
-    val overrideConfigurations = overrideConfs
-    parentState.map { s =>
-      val cloned = s.conf.clone()
-      if (session.sparkContext.conf.get(StaticSQLConf.SQL_LEGACY_SESSION_INIT_WITH_DEFAULTS)) {
-        SQLConf.mergeSparkConf(conf, session.sparkContext.conf)
-      }
-      cloned
-    }.getOrElse {
-      val conf = new SQLConf {
-        clear()
-        override def clear(): Unit = {
-          super.clear()
-          // Make sure we start with the default test configs even after clear
-          overrideConfigurations.foreach { case (key, value) => setConfString(key, value) }
-        }
-      }
-      SQLConf.mergeSparkConf(conf, session.sparkContext.conf)
-      conf
-    }
   }
 }
 

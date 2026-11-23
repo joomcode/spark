@@ -16,13 +16,12 @@
 #
 
 import datetime
-import unittest
 
 import pandas as pd
 
 from pyspark import pandas as ps
-from pyspark.testing.pandasutils import PandasOnSparkTestCase
 from pyspark.pandas.tests.data_type_ops.testing_utils import OpsTestBase
+from pyspark.testing.pandasutils import PandasOnSparkTestCase
 
 
 class ReverseTestsMixin:
@@ -45,11 +44,12 @@ class ReverseTestsMixin:
         pdf, psdf = self.pdf, self.psdf
         for col in self.numeric_df_cols:
             pser, psser = pdf[col], psdf[col]
-            self.assert_eq(1 + pser, 1 + psser, check_exact=False)
+            ignore_null = self.ignore_null(col)
+            self.assert_eq(1 + pser, 1 + psser, check_exact=False, ignore_null=ignore_null)
             # self.assert_eq(0.1 + pser, 0.1 + psser)
             self.assertRaises(TypeError, lambda: "x" + psser)
-            self.assert_eq(True + pser, True + psser, check_exact=False)
-            self.assert_eq(False + pser, False + psser, check_exact=False)
+            self.assert_eq(True + pser, True + psser, check_exact=False, ignore_null=ignore_null)
+            self.assert_eq(False + pser, False + psser, check_exact=False, ignore_null=ignore_null)
             self.assertRaises(TypeError, lambda: datetime.date(1994, 1, 1) + psser)
             self.assertRaises(TypeError, lambda: datetime.datetime(1994, 1, 1) + psser)
 
@@ -57,11 +57,12 @@ class ReverseTestsMixin:
         pdf, psdf = self.pdf, self.psdf
         for col in self.numeric_df_cols:
             pser, psser = pdf[col], psdf[col]
-            self.assert_eq(1 - pser, 1 - psser, check_exact=False)
+            ignore_null = self.ignore_null(col)
+            self.assert_eq(1 - pser, 1 - psser, check_exact=False, ignore_null=ignore_null)
             # self.assert_eq(0.1 - pser, 0.1 - psser)
             self.assertRaises(TypeError, lambda: "x" - psser)
-            self.assert_eq(True - pser, True - psser, check_exact=False)
-            self.assert_eq(False - pser, False - psser, check_exact=False)
+            self.assert_eq(True - pser, True - psser, check_exact=False, ignore_null=ignore_null)
+            self.assert_eq(False - pser, False - psser, check_exact=False, ignore_null=ignore_null)
             self.assertRaises(TypeError, lambda: datetime.date(1994, 1, 1) - psser)
             self.assertRaises(TypeError, lambda: datetime.datetime(1994, 1, 1) - psser)
 
@@ -69,11 +70,12 @@ class ReverseTestsMixin:
         pdf, psdf = self.pdf, self.psdf
         for col in self.numeric_df_cols:
             pser, psser = pdf[col], psdf[col]
-            self.assert_eq(1 * pser, 1 * psser, check_exact=False)
+            ignore_null = self.ignore_null(col)
+            self.assert_eq(1 * pser, 1 * psser, check_exact=False, ignore_null=ignore_null)
             # self.assert_eq(0.1 * pser, 0.1 * psser)
             self.assertRaises(TypeError, lambda: "x" * psser)
-            self.assert_eq(True * pser, True * psser, check_exact=False)
-            self.assert_eq(False * pser, False * psser, check_exact=False)
+            self.assert_eq(True * pser, True * psser, check_exact=False, ignore_null=ignore_null)
+            self.assert_eq(False * pser, False * psser, check_exact=False, ignore_null=ignore_null)
             self.assertRaises(TypeError, lambda: datetime.date(1994, 1, 1) * psser)
             self.assertRaises(TypeError, lambda: datetime.datetime(1994, 1, 1) * psser)
 
@@ -101,6 +103,28 @@ class ReverseTestsMixin:
             self.assertRaises(TypeError, lambda: datetime.date(1994, 1, 1) // psser)
             self.assertRaises(TypeError, lambda: datetime.datetime(1994, 1, 1) // psser)
 
+        # A divisor that is not exactly representable: 1.0 / 0.1 rounds up to exactly 10.0,
+        # so flooring the quotient gives 10 where pandas returns 9.
+        pser = pd.Series([0.1, 0.3, 0.7])
+        psser = ps.from_pandas(pser)
+        self.assert_eq(1.0 // pser, 1.0 // psser)
+
+        # An integral operand above 2**53 loses its low bits when divided as double. pandas
+        # returns int64 here, which Spark's division cannot, so compare the values.
+        pser = pd.Series([2, -2])
+        psser = ps.from_pandas(pser)
+        self.assert_eq((9007199254740993 // pser).astype(float), 9007199254740993 // psser)
+
+        # A zero dividend and a zero divisor, which pandas reports as nan.
+        pser = pd.Series([0, 2])
+        psser = ps.from_pandas(pser)
+        self.assert_eq(0 // pser, 0 // psser)
+
+        # A quotient that overflows to an infinity, which is its own floor.
+        pser = pd.Series([1e-300, -1e-300])
+        psser = ps.from_pandas(pser)
+        self.assert_eq(1e300 // pser, 1e300 // psser)
+
     def test_rpow(self):
         pdf, psdf = self.pdf, self.psdf
         for col in self.numeric_df_cols:
@@ -117,10 +141,11 @@ class ReverseTestsMixin:
         pdf, psdf = self.pdf, self.psdf
         for col in self.numeric_df_cols:
             pser, psser = pdf[col], psdf[col]
-            self.assert_eq(1 % pser, 1 % psser, check_exact=False)
+            ignore_null = self.ignore_null(col)
+            self.assert_eq(1 % pser, 1 % psser, check_exact=False, ignore_null=ignore_null)
             # self.assert_eq(0.1 % pser, 0.1 % psser)
-            self.assert_eq(True % pser, True % psser, check_exact=False)
-            self.assert_eq(False % pser, False % psser, check_exact=False)
+            self.assert_eq(True % pser, True % psser, check_exact=False, ignore_null=ignore_null)
+            self.assert_eq(False % pser, False % psser, check_exact=False, ignore_null=ignore_null)
             self.assertRaises(TypeError, lambda: datetime.date(1994, 1, 1) % psser)
             self.assertRaises(TypeError, lambda: datetime.datetime(1994, 1, 1) % psser)
 
@@ -134,12 +159,6 @@ class ReverseTests(
 
 
 if __name__ == "__main__":
-    from pyspark.pandas.tests.data_type_ops.test_num_reverse import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -117,12 +117,12 @@ select col, date_format(col, 'F'), to_char(col, 'F'), to_varchar(col, 'F') from 
 -- !query schema
 struct<col:timestamp,date_format(col, F):string,date_format(col, F):string,date_format(col, F):string>
 -- !query output
-1582-05-31 19:40:35.123	3	3	3
-1969-12-31 15:00:00	3	3	3
-1970-12-31 04:59:59.999	3	3	3
-1996-03-31 07:03:33.123	3	3	3
+1582-05-31 19:40:35.123	5	5	5
+1969-12-31 15:00:00	5	5	5
+1970-12-31 04:59:59.999	5	5	5
+1996-03-31 07:03:33.123	5	5	5
 2018-11-17 05:33:33.123	3	3	3
-2019-12-31 09:33:33.123	3	3	3
+2019-12-31 09:33:33.123	5	5	5
 2100-01-01 01:33:33.123	1	1	1
 
 
@@ -450,3 +450,19 @@ select date_format(timestamp_ntz'2023-08-18 09:13:14.123456', 'yyyy-MM-dd HH:mm:
 struct<date_format(TIMESTAMP_NTZ '2023-08-18 09:13:14.123456', yyyy-MM-dd HH:mm:ss.SSSSSS):string,date_format(TIMESTAMP_NTZ '2023-08-18 09:13:14.123456', yyyy-MM-dd HH:mm:ss.SSSSSS):string,date_format(TIMESTAMP_NTZ '2023-08-18 09:13:14.123456', yyyy-MM-dd HH:mm:ss.SSSSSS):string>
 -- !query output
 2023-08-18 09:13:14.123456	2023-08-18 09:13:14.123456	2023-08-18 09:13:14.123456
+
+
+-- !query
+select to_char(TIME'12:13:14', 'HH:mm:ss'), to_varchar(TIME'12:13:14', 'HH:mm:ss')
+-- !query schema
+struct<date_format(TIME '12:13:14', HH:mm:ss):string,date_format(TIME '12:13:14', HH:mm:ss):string>
+-- !query output
+12:13:14	12:13:14
+
+
+-- !query
+select to_char(TIME'23:59:59.123456', 'HH:mm:ss.SSSSSS'), to_varchar(TIME'23:59:59.123456', 'HH:mm:ss.SSSSSS')
+-- !query schema
+struct<date_format(TIME '23:59:59.123456', HH:mm:ss.SSSSSS):string,date_format(TIME '23:59:59.123456', HH:mm:ss.SSSSSS):string>
+-- !query output
+23:59:59.123456	23:59:59.123456

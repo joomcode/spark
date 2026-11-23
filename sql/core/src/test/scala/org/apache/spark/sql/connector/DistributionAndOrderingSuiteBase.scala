@@ -18,7 +18,6 @@ package org.apache.spark.sql.connector
 
 import org.scalatest.BeforeAndAfter
 
-import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst
 import org.apache.spark.sql.catalyst.analysis.Resolver
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
@@ -31,12 +30,15 @@ import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.test.SharedSparkSession
 
 abstract class DistributionAndOrderingSuiteBase
-    extends QueryTest with SharedSparkSession with BeforeAndAfter with AdaptiveSparkPlanHelper {
+    extends SharedSparkSession with BeforeAndAfter with AdaptiveSparkPlanHelper {
   import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
+
+  /** The catalog implementation `testcat` is registered with. */
+  protected def catalogClassName: String = classOf[InMemoryCatalog].getName
 
   override def beforeAll(): Unit = {
     super.beforeAll()
-    spark.conf.set("spark.sql.catalog.testcat", classOf[InMemoryCatalog].getName)
+    spark.conf.set("spark.sql.catalog.testcat", catalogClassName)
   }
 
   override def afterAll(): Unit = {
@@ -51,9 +53,8 @@ abstract class DistributionAndOrderingSuiteBase
       plan: QueryPlan[T]): Partitioning = partitioning match {
     case HashPartitioning(exprs, numPartitions) =>
       HashPartitioning(exprs.map(resolveAttrs(_, plan)), numPartitions)
-    case KeyGroupedPartitioning(clustering, numPartitions, partValues, originalPartValues) =>
-      KeyGroupedPartitioning(clustering.map(resolveAttrs(_, plan)), numPartitions, partValues,
-        originalPartValues)
+    case kp: KeyedPartitioning =>
+      kp.copy(expressions = kp.expressions.map(resolveAttrs(_, plan)))
     case PartitioningCollection(partitionings) =>
       PartitioningCollection(partitionings.map(resolvePartitioning(_, plan)))
     case RangePartitioning(ordering, numPartitions) =>
@@ -69,7 +70,7 @@ abstract class DistributionAndOrderingSuiteBase
   protected def resolveDistribution[T <: QueryPlan[T]](
       distribution: physical.Distribution,
       plan: QueryPlan[T]): physical.Distribution = distribution match {
-    case physical.ClusteredDistribution(clustering, numPartitions, _) =>
+    case physical.ClusteredDistribution(clustering, numPartitions, _, _) =>
       physical.ClusteredDistribution(clustering.map(resolveAttrs(_, plan)), numPartitions)
     case physical.OrderedDistribution(ordering) =>
       physical.OrderedDistribution(ordering.map(resolveAttrs(_, plan).asInstanceOf[SortOrder]))

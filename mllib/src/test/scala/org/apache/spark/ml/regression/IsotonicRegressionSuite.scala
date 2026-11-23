@@ -22,6 +22,7 @@ import org.apache.spark.ml.param.ParamsSuite
 import org.apache.spark.ml.util.{DefaultReadWriteTest, MLTest, MLTestingUtils}
 import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.functions.col
+import org.apache.spark.util.SizeEstimator
 
 class IsotonicRegressionSuite extends MLTest with DefaultReadWriteTest {
 
@@ -67,10 +68,23 @@ class IsotonicRegressionSuite extends MLTest with DefaultReadWriteTest {
     }
   }
 
+  test("model size estimation") {
+    val dataset = generateIsotonicInput(Seq(1, 2, 3, 1, 6, 17, 16, 17, 18))
+    val model = new IsotonicRegression().fit(dataset)
+
+    val expectedSize = model.estimateMatadataSize +
+      SizeEstimator.estimate(model.boundaries.toArray) +
+      SizeEstimator.estimate(model.predictions.toArray)
+    assert(model.estimatedSize === expectedSize)
+  }
+
   test("params validation") {
     val dataset = generateIsotonicInput(Seq(1, 2, 3))
     val ir = new IsotonicRegression
     ParamsSuite.checkParams(ir)
+    assert(ir.getIntermediateStorageLevel === "MEMORY_AND_DISK")
+    ir.setIntermediateStorageLevel("DISK_ONLY")
+    assert(ir.getIntermediateStorageLevel === "DISK_ONLY")
     val model = ir.fit(dataset)
     ParamsSuite.checkParams(model)
   }

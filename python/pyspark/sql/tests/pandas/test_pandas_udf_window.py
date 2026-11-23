@@ -15,31 +15,30 @@
 # limitations under the License.
 #
 
-import unittest
 import logging
-from typing import cast
+import unittest
 from decimal import Decimal
 
 from pyspark.errors import AnalysisException, PythonException
+from pyspark.sql import Row
 from pyspark.sql import functions as sf
-from pyspark.sql.functions import udf, pandas_udf, PandasUDFType
-from pyspark.sql.window import Window
+from pyspark.sql.functions import PandasUDFType, pandas_udf, udf
 from pyspark.sql.types import (
     DecimalType,
+    DoubleType,
+    FloatType,
     IntegerType,
     LongType,
-    FloatType,
-    DoubleType,
 )
-from pyspark.testing.sqlutils import (
-    ReusedSQLTestCase,
+from pyspark.sql.window import Window
+from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import (
+    assertDataFrameEqual,
     have_pandas,
     have_pyarrow,
     pandas_requirement_message,
     pyarrow_requirement_message,
 )
-from pyspark.testing.utils import assertDataFrameEqual
-from pyspark.sql import Row
 from pyspark.util import is_remote_only
 
 if have_pandas:
@@ -48,7 +47,7 @@ if have_pandas:
 
 @unittest.skipIf(
     not have_pandas or not have_pyarrow,
-    cast(str, pandas_requirement_message or pyarrow_requirement_message),
+    pandas_requirement_message or pyarrow_requirement_message,
 )
 class WindowPandasUDFTestsMixin:
     @property
@@ -437,7 +436,7 @@ class WindowPandasUDFTestsMixin:
                 with self.subTest(bound=bound, query_no=i):
                     assertDataFrameEqual(windowed, df.withColumn("wm", sf.mean(df.v).over(w)))
 
-        with self.tempView("v"), self.temp_func("weighted_mean"):
+        with self.temp_view("v"), self.temp_func("weighted_mean"):
             df.createOrReplaceTempView("v")
             self.spark.udf.register("weighted_mean", weighted_mean)
 
@@ -465,7 +464,7 @@ class WindowPandasUDFTestsMixin:
         df = self.data
         weighted_mean = self.pandas_agg_weighted_mean_udf
 
-        with self.tempView("v"), self.temp_func("weighted_mean"):
+        with self.temp_view("v"), self.temp_func("weighted_mean"):
             df.createOrReplaceTempView("v")
             self.spark.udf.register("weighted_mean", weighted_mean)
 
@@ -533,7 +532,7 @@ class WindowPandasUDFTestsMixin:
                 with self.subTest(bound=bound, query_no=i):
                     assertDataFrameEqual(windowed, df.withColumn("wm", sf.mean(df.v).over(w)))
 
-        with self.tempView("v"), self.temp_func("weighted_mean"):
+        with self.temp_view("v"), self.temp_func("weighted_mean"):
             df.createOrReplaceTempView("v")
             self.spark.udf.register("weighted_mean", weighted_mean)
 
@@ -606,7 +605,7 @@ class WindowPandasUDFTestsMixin:
                 mean_udf = pandas_udf(lambda v: value, t, PandasUDFType.GROUPED_AGG)
                 result = df.select(mean_udf(df["v"]).over(w)).first()[0]
                 assert result == Decimal("1.0")
-                assert type(result) == Decimal
+                assert isinstance(result, Decimal)
 
     def test_arrow_cast_str_to_numeric(self):
         df = self.data
@@ -711,12 +710,6 @@ class WindowPandasUDFTests(WindowPandasUDFTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.pandas.test_pandas_udf_window import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

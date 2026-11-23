@@ -82,7 +82,8 @@ class Strategy @Since("1.3.0") (
     @Since("1.2.0") @BeanProperty var useNodeIdCache: Boolean = false,
     @Since("1.2.0") @BeanProperty var checkpointInterval: Int = 10,
     @Since("3.0.0") @BeanProperty var minWeightFractionPerNode: Double = 0.0,
-    @BeanProperty private[spark] var bootstrap: Boolean = false) extends Serializable {
+    @BeanProperty private[spark] var bootstrap: Boolean = false,
+    @BeanProperty private[spark] var pruneTree: Boolean = true) extends Serializable {
 
   /**
    */
@@ -95,10 +96,35 @@ class Strategy @Since("1.3.0") (
    */
   @Since("1.2.0")
   def isMulticlassWithCategoricalFeatures: Boolean = {
-    isMulticlassClassification && (categoricalFeaturesInfo.size > 0)
+    isMulticlassClassification && (categoricalFeaturesInfo.nonEmpty)
   }
 
   // scalastyle:off argcount
+  /**
+   * Retains the constructor signature used before the pruning parameter was introduced.
+   */
+  def this(
+      algo: Algo,
+      impurity: Impurity,
+      maxDepth: Int,
+      numClasses: Int,
+      maxBins: Int,
+      quantileCalculationStrategy: QuantileStrategy,
+      categoricalFeaturesInfo: Map[Int, Int],
+      minInstancesPerNode: Int,
+      minInfoGain: Double,
+      maxMemoryInMB: Int,
+      subsamplingRate: Double,
+      useNodeIdCache: Boolean,
+      checkpointInterval: Int,
+      minWeightFractionPerNode: Double,
+      bootstrap: Boolean) = {
+    this(algo, impurity, maxDepth, numClasses, maxBins, quantileCalculationStrategy,
+      categoricalFeaturesInfo, minInstancesPerNode, minInfoGain, maxMemoryInMB,
+      subsamplingRate, useNodeIdCache, checkpointInterval, minWeightFractionPerNode,
+      bootstrap, pruneTree = true)
+  }
+
   /**
    * Backwards compatible constructor for [[org.apache.spark.mllib.tree.configuration.Strategy]]
    */
@@ -201,7 +227,9 @@ class Strategy @Since("1.3.0") (
     new Strategy(algo, impurity, maxDepth, numClasses, maxBins,
       quantileCalculationStrategy, categoricalFeaturesInfo, minInstancesPerNode,
       minInfoGain, maxMemoryInMB, subsamplingRate, useNodeIdCache,
-      checkpointInterval, minWeightFractionPerNode)
+      checkpointInterval, minWeightFractionPerNode,
+      bootstrap = bootstrap,
+      pruneTree = pruneTree)
   }
 }
 

@@ -1,0 +1,28 @@
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+year month interval one column:               Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+----------------------------------------------------------------------------------------------------------------------------
+year month interval one column enable radix           22387          22509         180          4.5         223.9       1.0X
+year month interval one column disable radix          32200          32881        1067          3.1         322.0       0.7X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+year month interval two columns:               Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+-----------------------------------------------------------------------------------------------------------------------------
+year month interval two columns enable radix           34204          34374         266          2.9         342.0       1.0X
+year month interval two columns disable radix          34294          34546         230          2.9         342.9       1.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+day time interval one columns:               Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+---------------------------------------------------------------------------------------------------------------------------
+day time interval one columns enable radix           20493          20643         215          4.9         204.9       1.0X
+day time interval one columns disable radix          32966          33454         570          3.0         329.7       0.6X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+day time interval two columns:               Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+---------------------------------------------------------------------------------------------------------------------------
+day time interval two columns enable radix           33460          33743         314          3.0         334.6       1.0X
+day time interval two columns disable radix          32977          33410         375          3.0         329.8       1.0X
+

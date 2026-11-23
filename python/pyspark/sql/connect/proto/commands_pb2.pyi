@@ -33,6 +33,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
 import builtins
 import collections.abc
 import google.protobuf.any_pb2
@@ -558,7 +559,9 @@ class WriteOperation(google.protobuf.message.Message):
         ):  # noqa: F821
             DESCRIPTOR: google.protobuf.descriptor.EnumDescriptor
             TABLE_SAVE_METHOD_UNSPECIFIED: WriteOperation.SaveTable._TableSaveMethod.ValueType  # 0
-            TABLE_SAVE_METHOD_SAVE_AS_TABLE: WriteOperation.SaveTable._TableSaveMethod.ValueType  # 1
+            TABLE_SAVE_METHOD_SAVE_AS_TABLE: (
+                WriteOperation.SaveTable._TableSaveMethod.ValueType
+            )  # 1
             TABLE_SAVE_METHOD_INSERT_INTO: WriteOperation.SaveTable._TableSaveMethod.ValueType  # 2
 
         class TableSaveMethod(_TableSaveMethod, metaclass=_TableSaveMethodEnumTypeWrapper): ...
@@ -618,6 +621,7 @@ class WriteOperation(google.protobuf.message.Message):
     BUCKET_BY_FIELD_NUMBER: builtins.int
     OPTIONS_FIELD_NUMBER: builtins.int
     CLUSTERING_COLUMNS_FIELD_NUMBER: builtins.int
+    WITH_SCHEMA_EVOLUTION_FIELD_NUMBER: builtins.int
     @property
     def input(self) -> pyspark.sql.connect.proto.relations_pb2.Relation:
         """(Required) The output of the `input` relation will be persisted according to the options."""
@@ -651,6 +655,8 @@ class WriteOperation(google.protobuf.message.Message):
         self,
     ) -> google.protobuf.internal.containers.RepeatedScalarFieldContainer[builtins.str]:
         """(Optional) Columns used for clustering the table."""
+    with_schema_evolution: builtins.bool
+    """(Optional) Whether schema evolution is enabled for the write."""
     def __init__(
         self,
         *,
@@ -664,6 +670,7 @@ class WriteOperation(google.protobuf.message.Message):
         bucket_by: global___WriteOperation.BucketBy | None = ...,
         options: collections.abc.Mapping[builtins.str, builtins.str] | None = ...,
         clustering_columns: collections.abc.Iterable[builtins.str] | None = ...,
+        with_schema_evolution: builtins.bool = ...,
     ) -> None: ...
     def HasField(
         self,
@@ -711,6 +718,8 @@ class WriteOperation(google.protobuf.message.Message):
             b"source",
             "table",
             b"table",
+            "with_schema_evolution",
+            b"with_schema_evolution",
         ],
     ) -> None: ...
     @typing.overload
@@ -800,6 +809,7 @@ class WriteOperationV2(google.protobuf.message.Message):
     MODE_FIELD_NUMBER: builtins.int
     OVERWRITE_CONDITION_FIELD_NUMBER: builtins.int
     CLUSTERING_COLUMNS_FIELD_NUMBER: builtins.int
+    WITH_SCHEMA_EVOLUTION_FIELD_NUMBER: builtins.int
     @property
     def input(self) -> pyspark.sql.connect.proto.relations_pb2.Relation:
         """(Required) The output of the `input` relation will be persisted according to the options."""
@@ -836,6 +846,8 @@ class WriteOperationV2(google.protobuf.message.Message):
         self,
     ) -> google.protobuf.internal.containers.RepeatedScalarFieldContainer[builtins.str]:
         """(Optional) Columns used for clustering the table."""
+    with_schema_evolution: builtins.bool
+    """(Optional) Whether schema evolution is enabled for the write."""
     def __init__(
         self,
         *,
@@ -851,6 +863,7 @@ class WriteOperationV2(google.protobuf.message.Message):
         mode: global___WriteOperationV2.Mode.ValueType = ...,
         overwrite_condition: pyspark.sql.connect.proto.expressions_pb2.Expression | None = ...,
         clustering_columns: collections.abc.Iterable[builtins.str] | None = ...,
+        with_schema_evolution: builtins.bool = ...,
     ) -> None: ...
     def HasField(
         self,
@@ -888,6 +901,8 @@ class WriteOperationV2(google.protobuf.message.Message):
             b"table_name",
             "table_properties",
             b"table_properties",
+            "with_schema_evolution",
+            b"with_schema_evolution",
         ],
     ) -> None: ...
     def WhichOneof(
@@ -928,6 +943,7 @@ class WriteStreamOperationStart(google.protobuf.message.Message):
     AVAILABLE_NOW_FIELD_NUMBER: builtins.int
     ONCE_FIELD_NUMBER: builtins.int
     CONTINUOUS_CHECKPOINT_INTERVAL_FIELD_NUMBER: builtins.int
+    REAL_TIME_BATCH_DURATION_FIELD_NUMBER: builtins.int
     OUTPUT_MODE_FIELD_NUMBER: builtins.int
     QUERY_NAME_FIELD_NUMBER: builtins.int
     PATH_FIELD_NUMBER: builtins.int
@@ -954,6 +970,7 @@ class WriteStreamOperationStart(google.protobuf.message.Message):
     available_now: builtins.bool
     once: builtins.bool
     continuous_checkpoint_interval: builtins.str
+    real_time_batch_duration: builtins.str
     output_mode: builtins.str
     query_name: builtins.str
     path: builtins.str
@@ -978,6 +995,7 @@ class WriteStreamOperationStart(google.protobuf.message.Message):
         available_now: builtins.bool = ...,
         once: builtins.bool = ...,
         continuous_checkpoint_interval: builtins.str = ...,
+        real_time_batch_duration: builtins.str = ...,
         output_mode: builtins.str = ...,
         query_name: builtins.str = ...,
         path: builtins.str = ...,
@@ -1005,6 +1023,8 @@ class WriteStreamOperationStart(google.protobuf.message.Message):
             b"path",
             "processing_time_interval",
             b"processing_time_interval",
+            "real_time_batch_duration",
+            b"real_time_batch_duration",
             "sink_destination",
             b"sink_destination",
             "table_name",
@@ -1044,6 +1064,8 @@ class WriteStreamOperationStart(google.protobuf.message.Message):
             b"processing_time_interval",
             "query_name",
             b"query_name",
+            "real_time_batch_duration",
+            b"real_time_batch_duration",
             "sink_destination",
             b"sink_destination",
             "table_name",
@@ -1061,7 +1083,11 @@ class WriteStreamOperationStart(google.protobuf.message.Message):
         self, oneof_group: typing_extensions.Literal["trigger", b"trigger"]
     ) -> (
         typing_extensions.Literal[
-            "processing_time_interval", "available_now", "once", "continuous_checkpoint_interval"
+            "processing_time_interval",
+            "available_now",
+            "once",
+            "continuous_checkpoint_interval",
+            "real_time_batch_duration",
         ]
         | None
     ): ...
@@ -2218,6 +2244,7 @@ class CheckpointCommand(google.protobuf.message.Message):
     LOCAL_FIELD_NUMBER: builtins.int
     EAGER_FIELD_NUMBER: builtins.int
     STORAGE_LEVEL_FIELD_NUMBER: builtins.int
+    RELATION_ID_FIELD_NUMBER: builtins.int
     @property
     def relation(self) -> pyspark.sql.connect.proto.relations_pb2.Relation:
         """(Required) The logical plan to checkpoint."""
@@ -2230,6 +2257,11 @@ class CheckpointCommand(google.protobuf.message.Message):
     @property
     def storage_level(self) -> pyspark.sql.connect.proto.common_pb2.StorageLevel:
         """(Optional) For local checkpoint, the storage level to use."""
+    relation_id: builtins.str
+    """(Optional) ID to assign to the checkpointed DataFrame in the current session.
+    If omitted, the server generates an ID. If provided, it must be non-empty and
+    must not already identify a cached DataFrame in this session.
+    """
     def __init__(
         self,
         *,
@@ -2237,14 +2269,19 @@ class CheckpointCommand(google.protobuf.message.Message):
         local: builtins.bool = ...,
         eager: builtins.bool = ...,
         storage_level: pyspark.sql.connect.proto.common_pb2.StorageLevel | None = ...,
+        relation_id: builtins.str | None = ...,
     ) -> None: ...
     def HasField(
         self,
         field_name: typing_extensions.Literal[
+            "_relation_id",
+            b"_relation_id",
             "_storage_level",
             b"_storage_level",
             "relation",
             b"relation",
+            "relation_id",
+            b"relation_id",
             "storage_level",
             b"storage_level",
         ],
@@ -2252,6 +2289,8 @@ class CheckpointCommand(google.protobuf.message.Message):
     def ClearField(
         self,
         field_name: typing_extensions.Literal[
+            "_relation_id",
+            b"_relation_id",
             "_storage_level",
             b"_storage_level",
             "eager",
@@ -2260,10 +2299,17 @@ class CheckpointCommand(google.protobuf.message.Message):
             b"local",
             "relation",
             b"relation",
+            "relation_id",
+            b"relation_id",
             "storage_level",
             b"storage_level",
         ],
     ) -> None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing_extensions.Literal["_relation_id", b"_relation_id"]
+    ) -> typing_extensions.Literal["relation_id"] | None: ...
+    @typing.overload
     def WhichOneof(
         self, oneof_group: typing_extensions.Literal["_storage_level", b"_storage_level"]
     ) -> typing_extensions.Literal["storage_level"] | None: ...

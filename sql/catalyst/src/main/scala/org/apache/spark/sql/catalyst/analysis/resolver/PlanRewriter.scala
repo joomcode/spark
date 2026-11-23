@@ -24,11 +24,13 @@ import org.apache.spark.sql.catalyst.trees.TreePattern.PLAN_EXPRESSION
 
 /**
  * Utility wrapper on top of [[RuleExecutor]], used to apply post-resolution rules on single-pass
- * resolution result. [[SinglePassRewriter]] transforms the plan and the subqueries inside.
+ * resolution result. [[PlanRewriter]] transforms the plan and the subqueries inside.
  */
 class PlanRewriter(
     planRewriteRules: Seq[Rule[LogicalPlan]],
-    extendedRewriteRules: Seq[Rule[LogicalPlan]]) {
+    extendedRewriteRules: Seq[Rule[LogicalPlan]])
+    extends ResolverMetricTracker
+    {
   private val planRewriter = new RuleExecutor[LogicalPlan] {
     override def batches: Seq[Batch] =
       Seq(
@@ -50,8 +52,10 @@ class PlanRewriter(
    * them and then applying post-resolution rules on the entire plan.
    */
   def rewriteWithSubqueries(plan: LogicalPlan): LogicalPlan = {
-    AnalysisHelper.allowInvokingTransformsInAnalyzer {
-      doRewriteWithSubqueries(plan)
+    recordProfile("rewriteWithSubqueries") {
+      AnalysisHelper.allowInvokingTransformsInAnalyzer {
+        doRewriteWithSubqueries(plan)
+      }
     }
   }
 

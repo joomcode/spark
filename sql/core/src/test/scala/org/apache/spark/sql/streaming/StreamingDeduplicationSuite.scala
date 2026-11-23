@@ -60,6 +60,79 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest
     )
   }
 
+  // Canonical quiet NaN and a non-canonical NaN with a different bit pattern.
+  // Both are NaN, but they have distinct raw bit representations.
+  private val canonicalNaN = java.lang.Float.intBitsToFloat(0x7fc00000)
+  private val nonCanonicalNaN = java.lang.Float.intBitsToFloat(0x7f800001)
+  assert(java.lang.Float.isNaN(canonicalNaN) && java.lang.Float.isNaN(nonCanonicalNaN),
+    "Both values must be NaN")
+  assert(java.lang.Float.floatToRawIntBits(canonicalNaN) !=
+    java.lang.Float.floatToRawIntBits(nonCanonicalNaN),
+    "The two NaN values must have different bit patterns")
+
+  test("same NaN bit pattern should be deduplicated") {
+    val inputData = MemoryStream[(Float, Int)]
+    val result = inputData.toDS().toDF("value", "id").dropDuplicates("value")
+
+    testStream(result, Append)(
+      AddData(inputData, (canonicalNaN, 1)),
+      CheckLastBatch((canonicalNaN, 1)),
+      assertNumStateRows(total = 1, updated = 1),
+
+      AddData(inputData, (canonicalNaN, 2)),
+      CheckLastBatch(),
+      assertNumStateRows(total = 1, updated = 0),
+
+      CheckAnswer((canonicalNaN, 1))
+    )
+  }
+
+  /**
+   * Tests that different NaN bit patterns are deduplicated for a given key type.
+   * `buildKey` transforms the base DataFrame (columns: f, id) to add a "key" column.
+   */
+  private def testNaNDedup(keyDesc: String, buildKey: DataFrame => DataFrame): Unit = {
+    test(s"NaN normalization in dedup key: $keyDesc") {
+      val inputData = MemoryStream[(Float, Int)]
+      val base = inputData.toDS().toDF("f", "id")
+      val result = buildKey(base).dropDuplicates("key").select("f", "id")
+
+      testStream(result, Append)(
+        AddData(inputData, (canonicalNaN, 1)),
+        CheckLastBatch((canonicalNaN, 1)),
+        assertNumStateRows(total = 1, updated = 1),
+
+        // Non-canonical NaN should be treated as a duplicate
+        AddData(inputData, (nonCanonicalNaN, 2)),
+        CheckLastBatch(),
+        assertNumStateRows(total = 1, updated = 0),
+
+        CheckAnswer((canonicalNaN, 1))
+      )
+    }
+  }
+
+  testNaNDedup("scalar float", _.withColumn("key", col("f")))
+  testNaNDedup("struct containing float", _.withColumn("key", struct(col("f"))))
+  testNaNDedup("array containing float", _.withColumn("key", array(col("f"))))
+
+  test("negative zero and positive zero should be deduplicated") {
+    val inputData = MemoryStream[(Float, Int)]
+    val result = inputData.toDS().toDF("value", "id").dropDuplicates("value")
+
+    testStream(result, Append)(
+      AddData(inputData, (0.0f, 1)),
+      CheckLastBatch((0.0f, 1)),
+      assertNumStateRows(total = 1, updated = 1),
+
+      AddData(inputData, (-0.0f, 2)),
+      CheckLastBatch(),
+      assertNumStateRows(total = 1, updated = 0),
+
+      CheckAnswer((0.0f, 1))
+    )
+  }
+
   test("deduplicate with some columns") {
     val inputData = MemoryStream[(String, Int)]
     val result = inputData.toDS().dropDuplicates("_1")
@@ -303,6 +376,38 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest
     )
   }
 
+  test("SPARK-58979: dedup event-time projected away") {
+    val input = MemoryStream[(String, Long)]
+    val result = input.toDF()
+      .selectExpr("_1 AS id", "CAST(_2 AS TIMESTAMP) AS ts")
+      .withWatermark("ts", "10 seconds")
+      .dropDuplicates("id")
+      .select("id")
+
+    testStream(result, Append)(
+      AddData(input, ("a", 1000000L)),
+      CheckNewAnswer("a"),
+      AddData(input, ("b", 1000L)),
+      CheckNewAnswer()
+    )
+  }
+
+  test("SPARK-58979: dedup event-time retained") {
+    val input = MemoryStream[(String, Long)]
+    val result = input.toDF()
+      .selectExpr("_1 AS id", "CAST(_2 AS TIMESTAMP) AS ts")
+      .withWatermark("ts", "10 seconds")
+      .dropDuplicates("id")
+      .selectExpr("id", "CAST(ts AS LONG) AS tsl")
+
+    testStream(result, Append)(
+      AddData(input, ("a", 1000000L)),
+      CheckNewAnswer(("a", 1000000L)),
+      AddData(input, ("b", 1000L)),
+      CheckNewAnswer()
+    )
+  }
+
   test("test no-data flag") {
     val flagKey = SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key
 
@@ -343,7 +448,7 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest
     " shifted partition IDs") {
     def constructUnionDf(desiredPartitionsForInput1: Int)
       : (MemoryStream[Int], MemoryStream[Int], DataFrame) = {
-      val input1 = MemoryStream[Int](desiredPartitionsForInput1)
+      val input1 = MemoryStream[Int](spark, desiredPartitionsForInput1)
       val input2 = MemoryStream[Int]
       val df1 = input1.toDF().select($"value")
       val df2 = input2.toDF().dropDuplicates("value")
@@ -610,6 +715,113 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest
       valueSchema = new StructType(),
       sqlConf = spark.sessionState.conf
     )
+  }
+
+  // Total incremental removals over the query's retained recent progress (recentProgress is
+  // retention-bounded, so this is not the full batch history), read from the operator's
+  // numRowsIncrementallyRemoved custom metric. Where a stateful operator ran (stateOperators is
+  // non-empty) the metric must be present -- assert rather than default it to 0, so a regression
+  // that stops emitting the metric fails the test instead of silently reading as zero.
+  private def numRowsIncrementallyRemoved(q: StreamingQuery): Long = {
+    q.recentProgress.flatMap(_.stateOperators.headOption).map { op =>
+      assert(op.customMetrics.containsKey("numRowsIncrementallyRemoved"),
+        s"numRowsIncrementallyRemoved custom metric missing; got ${op.customMetrics}")
+      op.customMetrics.get("numRowsIncrementallyRemoved").toLong
+    }.sum
+  }
+
+  // Total state rows removed over the query's retained recent progress (recentProgress is
+  // retention-bounded, so this is not the full batch history), read from the operator's first-class
+  // numRowsRemoved metric (the incremental removals are a subset of these). This asserts that
+  // eviction actually removed state, which numRowsIncrementallyRemoved alone does not: a batch-end
+  // drain removes rows without incrementing the incremental counter.
+  private def totalStateRowsRemoved(q: StreamingQuery): Long =
+    q.recentProgress.flatMap(_.stateOperators.headOption.map(_.numRowsRemoved)).sum
+
+  test("deduplicate with watermark - incremental cleanup preserves dedup output") {
+    // With a non-zero incremental cleanup factor, removal of watermark-expired state is spread
+    // across input-record processing rather than occurring all at once at batch end. The
+    // deduplicated OUTPUT must be unchanged. (State is evicted against the late-events watermark
+    // under incremental cleanup, so the timing of state removal lags by a batch compared to the
+    // factor-0 default -- this test asserts on output and on the late-event safety property, not
+    // on per-batch state counts.)
+    withSQLConf(SQLConf.STREAMING_STATE_INCREMENTAL_CLEANUP_FACTOR.key -> "10") {
+      val inputData = MemoryStream[Int]
+      val result = inputData.toDS()
+        .withColumn("eventTime", timestamp_seconds($"value"))
+        .withWatermark("eventTime", "10 seconds")
+        .dropDuplicates()
+        .select($"eventTime".cast("long").as[Long])
+
+      testStream(result, Append)(
+        // Duplicates within the batch are dropped; each distinct event time is emitted once.
+        AddData(inputData, (1 to 5).flatMap(_ => (10 to 15)): _*),
+        CheckAnswer(10 to 15: _*),
+
+        AddData(inputData, 25), // Advances watermark; 25 is new and emitted.
+        CheckNewAnswer(25),
+
+        // A record at 10 is now below the watermark: it must be dropped, and crucially it must not
+        // be re-emitted even though incremental cleanup may not yet have removed its key. This is
+        // the safety property behind evicting against the late-events (not eviction) watermark.
+        AddData(inputData, 10),
+        CheckNewAnswer(),
+
+        AddData(inputData, 45),
+        CheckNewAnswer(45),
+
+        // A duplicate of a surviving recent key (45) is still deduplicated.
+        AddData(inputData, 45),
+        CheckNewAnswer()
+      )
+    }
+  }
+
+  test("deduplicate with watermark - incremental cleanup evicts during record processing") {
+    // A batch that carries input records AND has state eligible for eviction under the late-events
+    // watermark should evict incrementally as those records are processed, so
+    // numRowsIncrementallyRemoved is non-zero. (Eviction uses the late-events watermark under
+    // incremental cleanup, which lags the eviction watermark by one batch.)
+    withSQLConf(SQLConf.STREAMING_STATE_INCREMENTAL_CLEANUP_FACTOR.key -> "10") {
+      val inputData = MemoryStream[Int]
+      val result = inputData.toDS()
+        .withColumn("eventTime", timestamp_seconds($"value"))
+        .withWatermark("eventTime", "10 seconds")
+        .dropDuplicates()
+        .select($"eventTime".cast("long").as[Long])
+
+      testStream(result, Append)(
+        // Batch 0: three distinct keys at 10, 11, 12. Watermark is 0, nothing evictable yet.
+        AddData(inputData, 10, 11, 12),
+        CheckAnswer(10, 11, 12),
+        assertNumStateRows(total = 3, updated = 3),
+        AssertOnQuery(q => numRowsIncrementallyRemoved(q) == 0,
+          "no incremental removal before any state is evictable"),
+
+        // Batch 1: a new key at 100 advances the eviction watermark to 90, but the late-events
+        // watermark used by incremental cleanup still lags (it is the previous batch's eviction
+        // watermark). The keys [10, 11, 12] are not yet below the late-events watermark, so no
+        // removal happens in this batch; it is deferred to batch 2.
+        AddData(inputData, 100),
+        CheckNewAnswer(100),
+
+        // Batch 2: another new record. By now the late-events watermark has advanced past the
+        // original keys, so processing this record incrementally evicts them.
+        AddData(inputData, 101),
+        CheckNewAnswer(101),
+        AssertOnQuery(q => numRowsIncrementallyRemoved(q) > 0,
+          "expired keys should be removed incrementally while processing input records"),
+        // Assert the state was actually removed, not merely that the incremental counter moved:
+        // the three original keys [10, 11, 12] must be gone, leaving only the recent keys. Reading
+        // the first-class numRowsRemoved metric (rather than the output) is what catches a
+        // regression that leaves state behind while still producing correct output.
+        AssertOnQuery(q => totalStateRowsRemoved(q) >= 3,
+          "expired keys must be removed from state, not just counted as incremental"),
+        // The surviving state is only the most recent keys; correctness is unchanged.
+        AddData(inputData, 10), // below watermark, dropped
+        CheckNewAnswer()
+      )
+    }
   }
 }
 

@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.LongAdder
 import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
 
-import org.mockito.ArgumentMatchers.any
+import org.mockito.ArgumentMatchers.{any, isA}
 import org.mockito.Mockito._
 import org.mockito.invocation.InvocationOnMock
 import org.roaringbitmap.RoaringBitmap
@@ -206,6 +206,101 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
 
     masterTracker.stop()
     rpcEnv.shutdown()
+  }
+
+  // SPARK-60950: for the queued request kinds the endpoint only posts the request, so on both
+  // routes the handler runs, and throws, on a map-output-dispatcher MessageLoop thread. These
+  // tests post directly so they can drive the MessageLoop with mocked call contexts, including
+  // ones whose reply or sendFailure throws, without setting up an RpcEnv and endpoint.
+
+  /** Creates a master tracker that has shuffle 10 with a single registered map output. */
+  private def newTrackerMasterWithOneMapOutput(sparkConf: SparkConf): MapOutputTrackerMaster = {
+    val tracker = newTrackerMaster(sparkConf)
+    tracker.registerShuffle(10, 1, MergeStatus.SHUFFLE_PUSH_DUMMY_NUM_REDUCES)
+    tracker.registerMapOutput(10, 0, MapStatus(
+      BlockManagerId("88", "mph", 1000), createArray(10, 0L), 5))
+    tracker
+  }
+
+  /** Creates a mock call context; `name` shows up in Mockito verification failures. */
+  private def newCallContext(name: String): RpcCallContext = {
+    val context = mock(classOf[RpcCallContext], withSettings().name(name))
+    when(context.senderAddress).thenReturn(RpcAddress("localhost", 12345))
+    context
+  }
+
+  test("SPARK-60950: master replies with a failure when a map output request handler throws") {
+    val masterTracker = newTrackerMaster()
+    try {
+      // Shuffle 10 is not registered, so looking up its status throws NoSuchElementException.
+      val requests: Seq[(String, RpcCallContext => MapOutputTrackerMasterMessage)] = Seq(
+        ("GetMapOutputMessage", GetMapOutputMessage(10, _)),
+        ("GetMapAndMergeOutputMessage", GetMapAndMergeOutputMessage(10, _)))
+      requests.foreach { case (name, request) =>
+        val context = newCallContext(name)
+        masterTracker.post(request(context))
+        verify(context, timeout(30000)).sendFailure(isA(classOf[NoSuchElementException]))
+        verify(context, never()).reply(any())
+      }
+    } finally {
+      masterTracker.stop()
+    }
+  }
+
+  test("SPARK-60950: master replies with a failure when sending the reply throws") {
+    val masterTracker = newTrackerMasterWithOneMapOutput(conf)
+    try {
+      // Models a reply that cannot be delivered, e.g. one that fails to serialize.
+      val replyError = new IllegalStateException("injected reply failure")
+      val requests: Seq[(String, RpcCallContext => MapOutputTrackerMasterMessage)] = Seq(
+        ("GetMapOutputMessage", GetMapOutputMessage(10, _)),
+        ("GetShufflePushMergersMessage", GetShufflePushMergersMessage(10, _)))
+      requests.foreach { case (name, request) =>
+        val context = newCallContext(name)
+        doThrow(replyError).when(context).reply(any())
+        masterTracker.post(request(context))
+        verify(context, timeout(30000)).sendFailure(replyError)
+      }
+    } finally {
+      masterTracker.stop()
+    }
+  }
+
+  test("SPARK-60950: master replies with a failure when the handler throws a fatal error") {
+    val masterTracker = newTrackerMasterWithOneMapOutput(conf)
+    try {
+      // A fatal error is rethrown after the reply and ends the MessageLoop that handled it, so
+      // this test does not rely on that loop serving any later request.
+      val fatalError = new LinkageError("injected fatal reply failure")
+      val context = newCallContext("GetMapOutputMessage")
+      doThrow(fatalError).when(context).reply(any())
+      masterTracker.post(GetMapOutputMessage(10, context))
+      verify(context, timeout(30000)).sendFailure(fatalError)
+    } finally {
+      masterTracker.stop()
+    }
+  }
+
+  test("SPARK-60950: MessageLoop keeps serving requests when the failure reply also throws") {
+    // A single dispatcher thread, so the second request is served by the same MessageLoop that
+    // handled the failure.
+    val masterTracker = newTrackerMasterWithOneMapOutput(
+      new SparkConf().set(SHUFFLE_MAPOUTPUT_DISPATCHER_NUM_THREADS, 1))
+    try {
+      val failingContext = newCallContext("failingContext")
+      doThrow(new IllegalStateException("injected sendFailure failure"))
+        .when(failingContext).sendFailure(any())
+      // Shuffle 11 is not registered, so the handler throws and the loop calls sendFailure.
+      masterTracker.post(GetMapOutputMessage(11, failingContext))
+      verify(failingContext, timeout(30000)).sendFailure(any())
+
+      val context = newCallContext("context")
+      masterTracker.post(GetMapOutputMessage(10, context))
+      verify(context, timeout(30000)).reply(any())
+      verify(context, never()).sendFailure(any())
+    } finally {
+      masterTracker.stop()
+    }
   }
 
   test("min broadcast size exceeds max RPC message size") {
@@ -637,7 +732,7 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
         mapWorkerRpcEnv.setupEndpointRef(rpcEnv.address, MapOutputTracker.ENDPOINT_NAME)
 
       val fetchedBytes = mapWorkerTracker.trackerEndpoint
-        .askSync[(Array[Byte], Array[Byte])](GetMapAndMergeResultStatuses(20))
+        .askSync[(Array[Byte], Array[Byte], Array[Byte])](GetMapAndMergeResultStatuses(20))
       assert(masterTracker.getNumAvailableMergeResults(20) == 1)
       assert(masterTracker.getNumAvailableOutputs(20) == 100)
 
@@ -1124,7 +1219,7 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
       tracker.registerMapOutput(0, 0, MapStatus(BlockManagerId("exec-1", "hostA", 1000),
         Array(2L), 0))
       tracker.removeOutputsOnHost("hostA")
-      assert(tracker.shuffleStatuses(0).mapIdToMapIndex.filter(_._2 == 0).size == 0)
+      assert(tracker.shuffleStatuses(0).mapIdToMapIndex.filter(_._2 == 0).isEmpty)
     } finally {
       tracker.stop()
       rpcEnv.shutdown()
@@ -1141,7 +1236,7 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
       tracker.registerMapOutput(0, 0, MapStatus(BlockManagerId("exec-1", "hostA", 1000),
         Array(2L), 0))
       tracker.unregisterMapOutput(0, 0, BlockManagerId("exec-1", "hostA", 1000))
-      assert(tracker.shuffleStatuses(0).mapIdToMapIndex.filter(_._2 == 0).size == 0)
+      assert(tracker.shuffleStatuses(0).mapIdToMapIndex.filter(_._2 == 0).isEmpty)
     } finally {
       tracker.stop()
       rpcEnv.shutdown()
@@ -1163,6 +1258,136 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
       assert(tracker.shuffleStatuses(0).mapIdToMapIndex.filter(_._2 == 0).size == 1)
     } finally {
       tracker.stop()
+      rpcEnv.shutdown()
+    }
+  }
+
+  test("SPARK-57994: updateMapOutput buffers and replays a relocation that races registration") {
+    val newConf = new SparkConf
+    newConf.set(STORAGE_DECOMMISSION_SHUFFLE_BUFFER_RACING_MIGRATIONS, true)
+    val hostname = "localhost"
+    val rpcEnv = createRpcEnv("spark", hostname, 0, new SecurityManager(newConf))
+    val masterTracker = newTrackerMaster(newConf)
+    masterTracker.trackerEndpoint = rpcEnv.setupEndpoint(MapOutputTracker.ENDPOINT_NAME,
+      new MapOutputTrackerMasterEndpoint(rpcEnv, masterTracker, newConf))
+    val workerRpcEnv = createRpcEnv("spark-worker", hostname, 0, new SecurityManager(newConf))
+    val workerTracker = new MapOutputTrackerWorker(newConf)
+    workerTracker.trackerEndpoint =
+      workerRpcEnv.setupEndpointRef(rpcEnv.address, MapOutputTracker.ENDPOINT_NAME)
+
+    try {
+      masterTracker.registerShuffle(10, 1, MergeStatus.SHUFFLE_PUSH_DUMMY_NUM_REDUCES)
+      val origin = BlockManagerId("exec-1", "hostA", 1000)
+      val peer = BlockManagerId("exec-2", "hostB", 1000)
+
+      // The migrated block is reported by the peer before the task-completion event registers the
+      // map output on the driver. The map is untracked, so the relocation is buffered rather than
+      // dropped.
+      masterTracker.updateMapOutput(10, 100, peer)
+      assert(masterTracker.getNumAvailableOutputs(10) == 0,
+        "Relocation before registration must not create an output on its own")
+
+      // Task completion registers the map output at the origin (decommissioning) executor. The
+      // buffered relocation is replayed, so the location becomes the peer.
+      masterTracker.registerMapOutput(10, 0, MapStatus(origin, Array(2L), 100))
+      assert(masterTracker.getNumAvailableOutputs(10) == 1)
+
+      // The origin executor is decommissioned and removed. Without the buffer-and-replay fix the
+      // output would still point at the origin and be nulled here, producing a null MapStatus /
+      // fetch failure downstream. With the fix it points at the peer, so removal is a no-op.
+      masterTracker.removeOutputsOnExecutor("exec-1")
+      assert(masterTracker.getNumAvailableOutputs(10) == 1,
+        "The replayed peer location should survive removal of the origin executor")
+
+      masterTracker.incrementEpoch()
+      workerTracker.updateEpoch(masterTracker.getEpoch)
+      val result = workerTracker.getMapSizesByExecutorId(10, 0).toSeq
+      assert(result.nonEmpty, "Reducer should find the migrated map output at the peer")
+      assert(result.head._1 == peer)
+    } finally {
+      masterTracker.stop()
+      workerTracker.stop()
+      rpcEnv.shutdown()
+      workerRpcEnv.shutdown()
+    }
+  }
+
+  test("SPARK-57994: updateMapOutput drops a racing relocation when buffering is disabled") {
+    val newConf = new SparkConf
+    newConf.set(STORAGE_DECOMMISSION_SHUFFLE_BUFFER_RACING_MIGRATIONS, false)
+    val rpcEnv = createRpcEnv("spark", "localhost", 0, new SecurityManager(newConf))
+    val masterTracker = newTrackerMaster(newConf)
+    masterTracker.trackerEndpoint = rpcEnv.setupEndpoint(MapOutputTracker.ENDPOINT_NAME,
+      new MapOutputTrackerMasterEndpoint(rpcEnv, masterTracker, newConf))
+
+    try {
+      masterTracker.registerShuffle(10, 1, MergeStatus.SHUFFLE_PUSH_DUMMY_NUM_REDUCES)
+      val origin = BlockManagerId("exec-1", "hostA", 1000)
+      val peer = BlockManagerId("exec-2", "hostB", 1000)
+
+      // With buffering off, a relocation for an untracked map output is dropped (legacy behavior),
+      // so the later registration keeps the origin location unchanged.
+      masterTracker.updateMapOutput(10, 100, peer)
+      masterTracker.registerMapOutput(10, 0, MapStatus(origin, Array(2L), 100))
+
+      masterTracker.incrementEpoch()
+      val result = masterTracker.getMapSizesByExecutorId(10, 0).toSeq
+      assert(result.head._1 == origin,
+        "With buffering disabled the dropped relocation leaves the origin location in place")
+    } finally {
+      masterTracker.stop()
+      rpcEnv.shutdown()
+    }
+  }
+
+  test("SPARK-57491: staleMapIndexes propagated from driver to worker via getStatuses") {
+    val rpcEnv = createRpcEnv("test")
+    val masterTracker = newTrackerMaster()
+    try {
+      masterTracker.trackerEndpoint = rpcEnv.setupEndpoint(MapOutputTracker.ENDPOINT_NAME,
+        new MapOutputTrackerMasterEndpoint(rpcEnv, masterTracker, conf))
+      // Simulate driver side: register shuffle
+      masterTracker.registerShuffle(0, 4, 2)
+      masterTracker.registerMapOutput(0, 0,
+        MapStatus(BlockManagerId("exec-1", "hostA", 1000), Array(100L, 200L), 0))
+      masterTracker.registerMapOutput(0, 1,
+        MapStatus(BlockManagerId("exec-2", "hostB", 1000), Array(300L, 400L), 1))
+
+      val initialEpoch = masterTracker.getEpoch
+
+      // Mark partition 1 as stale via MapOutputTrackerMaster: marks the partition and bumps
+      // the epoch so reducers with a cached (empty) stale set are forced to re-fetch
+      masterTracker.markStalePushedPartition(0, 1)
+
+      // Verify epoch was bumped so reducer-side stale set cache is invalidated
+      assert(masterTracker.getEpoch > initialEpoch,
+        s"Expected epoch to be bumped past $initialEpoch, got ${masterTracker.getEpoch}")
+
+      val shuffleStatus = masterTracker.shuffleStatuses(0)
+
+      // Verify the stale mark was recorded on the shuffle status
+      assert(shuffleStatus.getStaleMapIndexes.contains(1))
+
+      // Serialize statuses including staleMapIndexes (simulates what driver sends to executors)
+      val (mapBytes, mergeBytes, staleBytes) =
+        shuffleStatus.serializedMapAndMergeStatus(
+          masterTracker.broadcastManager, isLocal = true, minBroadcastSize = Int.MaxValue, conf)
+
+      // Simulate worker side: deserialize and verify staleMapIndexes are received
+      val deserializedStale = MapOutputTracker.deserializeStaleMapIndexes(staleBytes)
+      assert(deserializedStale.contains(1))
+
+      // Also verify via MapOutputTrackerWorker (the path used by real executors)
+      val workerTracker = new MapOutputTrackerWorker(conf)
+      // Manually populate what the worker would get from a getStatuses fetch
+      workerTracker.staleMapIndexes.put(0, {
+        val s = new JHashSet[Int]()
+        s.addAll(deserializedStale)
+        s
+      })
+      assert(workerTracker.getStaleMapIndexes(0).contains(1))
+    } finally {
+      masterTracker.stop()
       rpcEnv.shutdown()
     }
   }

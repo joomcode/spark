@@ -16,13 +16,13 @@
 #
 
 import unittest
+from typing import cast
 
+from pyspark import pipelines as dp
 from pyspark.errors import PySparkException
 from pyspark.pipelines.graph_element_registry import graph_element_registration_context
-from pyspark import pipelines as dp
 from pyspark.pipelines.output import Sink
 from pyspark.pipelines.tests.local_graph_element_registry import LocalGraphElementRegistry
-from typing import cast
 
 
 class GraphElementRegistryTest(unittest.TestCase):
@@ -131,10 +131,6 @@ class GraphElementRegistryTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    try:
-        import xmlrunner  # type: ignore
+    from pyspark.testing import main
 
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -27,13 +27,14 @@ import org.apache.spark.sql.catalyst.catalog.CatalogFunction
 import org.apache.spark.sql.catalyst.catalog.CatalogTable._
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.plans.logical.Repartition
+import org.apache.spark.sql.catalyst.util.CharVarcharUtils
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.withDefaultTimeZone
 import org.apache.spark.sql.connector.catalog._
 import org.apache.spark.sql.connector.catalog.CatalogManager.SESSION_CATALOG_NAME
 import org.apache.spark.sql.errors.DataTypeErrors.toSQLId
 import org.apache.spark.sql.internal.SQLConf._
-import org.apache.spark.sql.test.{SharedSparkSession, SQLTestUtils}
-import org.apache.spark.sql.types.{IntegerType, StructField, StructType}
+import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types.{CharType, IntegerType, StructField, StructType, VarcharType}
 import org.apache.spark.util.ArrayImplicits._
 
 /**
@@ -41,7 +42,7 @@ import org.apache.spark.util.ArrayImplicits._
  * Currently, the test cases in this suite should have same behavior across all kind of views
  * TODO: Combine this with [[SQLViewSuite]]
  */
-abstract class SQLViewTestSuite extends QueryTest with SQLTestUtils {
+abstract class SQLViewTestSuite extends QueryTest {
   import testImplicits._
 
   protected def viewTypeString: String
@@ -208,11 +209,9 @@ abstract class SQLViewTestSuite extends QueryTest with SQLTestUtils {
           },
           condition = "RECURSIVE_VIEW",
           parameters = Map(
-            "viewIdent" -> tableIdentifier("v1").quotedString,
-            "newPath" -> (s"${tableIdentifier("v1").quotedString} " +
-              s"-> ${tableIdentifier("v2").quotedString} " +
-              s"-> ${tableIdentifier("v1").quotedString}"))
-        )
+            "viewIdent" -> ".*`v1`.*",
+            "newPath" -> ".*`v1`.*`v2`.*`v1`.*"),
+          matchPVals = true)
       }
     }
   }
@@ -378,6 +377,24 @@ abstract class SQLViewTestSuite extends QueryTest with SQLTestUtils {
         // drop invalid view should be fine
         sql(s"DROP VIEW $viewName")
       }
+    }
+  }
+
+  test("SPARK-55019: view can be dropped using DROP TABLE") {
+    withView("v") {
+      // First, create a simple view.
+      val viewName = createView("v", "SELECT 1 AS a")
+      checkAnswer(sql(s"SELECT * FROM $viewName"), Row(1))
+      // Then, drop the view using DROP TABLE.
+      sql(s"DROP TABLE $viewName")
+      // Finally, verify that the view is dropped.
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"SELECT * FROM $viewName")
+        },
+        condition = "TABLE_OR_VIEW_NOT_FOUND",
+        parameters = Map("relationName" -> toSQLId(viewName.split("\\.").toSeq)),
+        ExpectedContext(s"$viewName", 14, 13 + viewName.length))
     }
   }
 
@@ -611,6 +628,28 @@ class PersistedViewTestSuite extends SQLViewTestSuite with SharedSparkSession {
     }
   }
 
+  test("SPARK-60876: allow an explicit alias over an outer auto gen alias column") {
+    withView("v") {
+      sql("CREATE VIEW v AS SELECT l.x FROM (SELECT count(*) FROM VALUES (1), (2) t(a)) a, " +
+        "LATERAL (SELECT a.`count(1)` AS x) l")
+      checkAnswer(sql("SELECT * FROM v"), Seq(Row(2)))
+    }
+  }
+
+  test("SPARK-60876: view over an outer CHAR/VARCHAR column keeps the CHAR/VARCHAR type") {
+    withTable("t") {
+      withView("v") {
+        sql("CREATE TABLE t(c CHAR(5), v VARCHAR(3)) USING parquet")
+        sql("INSERT INTO t VALUES ('ab', 'xy')")
+        sql("CREATE VIEW v AS SELECT l.k, l.w FROM t, LATERAL (SELECT t.c AS k, t.v AS w) l")
+        val schema = spark.table("v").schema
+        assert(CharVarcharUtils.getRawType(schema(0).metadata) === Some(CharType(5)))
+        assert(CharVarcharUtils.getRawType(schema(1).metadata) === Some(VarcharType(3)))
+        checkAnswer(sql("SELECT k FROM v WHERE k = 'ab'"), Row("ab   "))
+      }
+    }
+  }
+
   test("SPARK-35686: error out for alter view with auto gen alias") {
     withView("v") {
       sql("CREATE VIEW v AS SELECT 1 AS a")
@@ -817,7 +856,7 @@ class PersistedViewTestSuite extends SQLViewTestSuite with SharedSparkSession {
       condition = "INVALID_TEMP_OBJ_REFERENCE",
       parameters = Map(
         "obj" -> "VIEW",
-        "objName" -> "`unknown`",
+        "objName" -> "`spark_catalog`.`default`.`v_table_3`",
         "tempObj" -> "VARIABLE",
         "tempObjName" -> "`table_name`"
       )
@@ -832,7 +871,7 @@ class PersistedViewTestSuite extends SQLViewTestSuite with SharedSparkSession {
       condition = "INVALID_TEMP_OBJ_REFERENCE",
       parameters = Map(
         "obj" -> "VIEW",
-        "objName" -> "`unknown`",
+        "objName" -> "`v_table_4`",
         "tempObj" -> "VARIABLE",
         "tempObjName" -> "`table_name`"
       )

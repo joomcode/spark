@@ -15,22 +15,23 @@
 # limitations under the License.
 #
 
-import unittest
 import logging
+import unittest
 
-from pyspark.sql.functions import arrow_udf, ArrowUDFType
-from pyspark.util import PythonEvalType, is_remote_only
-from pyspark.sql import Row, functions as sf
+from pyspark.errors import AnalysisException, PySparkTypeError, PythonException
+from pyspark.sql import Row
+from pyspark.sql import functions as sf
+from pyspark.sql.functions import ArrowUDFType, arrow_udf
 from pyspark.sql.window import Window
-from pyspark.errors import AnalysisException, PythonException, PySparkTypeError
-from pyspark.testing.utils import (
-    have_numpy,
-    numpy_requirement_message,
-    have_pyarrow,
-    pyarrow_requirement_message,
-    assertDataFrameEqual,
-)
 from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import (
+    assertDataFrameEqual,
+    have_numpy,
+    have_pyarrow,
+    numpy_requirement_message,
+    pyarrow_requirement_message,
+)
+from pyspark.util import PythonEvalType, is_remote_only
 
 
 @unittest.skipIf(not have_pyarrow, pyarrow_requirement_message)
@@ -406,7 +407,7 @@ class WindowArrowUDFTestsMixin:
                         windowed.collect(), df.withColumn("wm", sf.mean(df.v).over(w)).collect()
                     )
 
-        with self.tempView("v"), self.temp_func("weighted_mean"):
+        with self.temp_view("v"), self.temp_func("weighted_mean"):
             df.createOrReplaceTempView("v")
             self.spark.udf.register("weighted_mean", weighted_mean)
 
@@ -437,7 +438,7 @@ class WindowArrowUDFTestsMixin:
         df = self.data
         weighted_mean = self.arrow_agg_weighted_mean_udf
 
-        with self.tempView("v"), self.temp_func("weighted_mean"):
+        with self.temp_view("v"), self.temp_func("weighted_mean"):
             df.createOrReplaceTempView("v")
             self.spark.udf.register("weighted_mean", weighted_mean)
 
@@ -507,7 +508,7 @@ class WindowArrowUDFTestsMixin:
                         windowed.collect(), df.withColumn("wm", sf.mean(df.v).over(w)).collect()
                     )
 
-        with self.tempView("v"), self.temp_func("weighted_mean"):
+        with self.temp_view("v"), self.temp_func("weighted_mean"):
             df.createOrReplaceTempView("v")
             self.spark.udf.register("weighted_mean", weighted_mean)
 
@@ -661,8 +662,7 @@ class WindowArrowUDFTestsMixin:
     def test_time_min(self):
         import pyarrow as pa
 
-        df = self.spark.sql(
-            """
+        df = self.spark.sql("""
             SELECT * FROM VALUES
             (1, TIME '12:34:56'),
             (1, TIME '1:2:3'),
@@ -670,8 +670,7 @@ class WindowArrowUDFTestsMixin:
             (2, TIME '10:58:59'),
             (2, TIME '10:00:03')
             AS tab(i, t)
-            """
-        )
+            """)
         w1 = Window.partitionBy("i").orderBy("t")
         w2 = Window.orderBy("t")
 
@@ -855,12 +854,6 @@ class WindowArrowUDFTests(WindowArrowUDFTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.arrow.test_arrow_udf_window import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

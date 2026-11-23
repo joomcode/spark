@@ -45,7 +45,15 @@ object DefaultCollationTypeCoercion {
   def apply(expression: Expression, collation: String): Expression = {
     val collatedStringType = StringType(collation)
     expression match {
-      case _: DefaultStringProducingExpression if collatedStringType != StringType =>
+      // Skip an expression carrying an explicitly collated string type (e.g. `JSON_ARRAY(...
+      // RETURNING STRING COLLATE UTF8_BINARY)`): a deliberate choice the object/view default must
+      // not overwrite, even for the default UTF8_BINARY. Only the explicit `COLLATE` form is a
+      // distinct instance; `DataTypeAstBuilder` returns the companion for a plain `STRING`, so a
+      // plain `RETURNING STRING` is indistinguishable from omission and recolored like it.
+      // `isExplicitlyCollatedStringType` tells the distinct instance from the companion by
+      // reference identity.
+      case e: DefaultStringProducingExpression
+          if collatedStringType != StringType && !isExplicitlyCollatedStringType(e.dataType) =>
         Cast(child = expression, dataType = collatedStringType)
       case literal: Literal if hasDefaultStringType(literal.dataType) =>
         literal.copy(dataType = replaceDefaultStringType(literal.dataType, collatedStringType))
@@ -87,12 +95,19 @@ object DefaultCollationTypeCoercion {
     }
 
   /**
+   * A [[StringType]] with an explicit collation -- even the default UTF8_BINARY, which is still a
+   * distinct instance from the companion-object default (see [[isDefaultStringType]]).
+   */
+  private def isExplicitlyCollatedStringType(dataType: DataType): Boolean =
+    dataType.isInstanceOf[StringType] && !isDefaultStringType(dataType)
+
+  /**
    * When a default collation is specified for a View,
    * and the cast's dataType contains companion object [[StringType]],
    * we should change all its occurrences to [[StringType]] with default collation.
    */
   private def shouldApplyCollationToCast(cast: Cast): Boolean = {
-    cast.getTagValue(Cast.USER_SPECIFIED_CAST).isDefined &&
+    cast.containsTag(Cast.USER_SPECIFIED_CAST) &&
     hasDefaultStringType(cast.dataType)
   }
 }

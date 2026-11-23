@@ -21,10 +21,12 @@ import org.apache.spark.sql.{AnalysisException, Row}
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
 import org.apache.spark.sql.catalyst.util.quoteIdentifier
 import org.apache.spark.sql.execution.command
+import org.apache.spark.tags.DataSourceV2Test
 
 /**
  * The class contains tests for the `SHOW PARTITIONS` command to check V2 table catalogs.
  */
+@DataSourceV2Test
 class ShowPartitionsSuite extends command.ShowPartitionsSuiteBase with CommandSuiteBase {
 
   test("show partitions of non-partitioned table") {
@@ -75,6 +77,18 @@ class ShowPartitionsSuite extends command.ShowPartitionsSuiteBase with CommandSu
       createNullPartTable(t, "parquet")
       runShowPartitionsSql(s"SHOW PARTITIONS $t", Row("part=") :: Row("part=null") :: Nil)
       checkAnswer(spark.table(t), Row(0, "") :: Row(1, null) :: Nil)
+    }
+  }
+
+  test("SHOW PARTITIONS AS JSON is not supported for V2 tables") {
+    withNamespaceAndTable("ns", "dateTable") { t =>
+      createDateTable(t)
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"SHOW PARTITIONS $t AS JSON")
+        },
+        condition = "NOT_SUPPORTED_COMMAND_FOR_V2_TABLE",
+        parameters = Map("cmd" -> "SHOW PARTITIONS AS JSON"))
     }
   }
 }

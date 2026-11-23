@@ -15,33 +15,32 @@
 # limitations under the License.
 #
 
-import unittest
 import datetime
-from typing import cast
+import unittest
 
-from pyspark.sql.functions import udf, pandas_udf, PandasUDFType, assert_true, lit
+from pyspark.errors import ParseException, PySparkTypeError, PythonException
+from pyspark.sql.functions import PandasUDFType, assert_true, lit, pandas_udf, udf
 from pyspark.sql.types import (
-    DoubleType,
-    StructType,
-    StructField,
-    LongType,
     DayTimeIntervalType,
+    DoubleType,
+    LongType,
+    StructField,
+    StructType,
     VariantType,
 )
-from pyspark.errors import ParseException, PythonException, PySparkTypeError
-from pyspark.util import PythonEvalType
-from pyspark.testing.sqlutils import (
-    ReusedSQLTestCase,
+from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import (
     have_pandas,
     have_pyarrow,
     pandas_requirement_message,
     pyarrow_requirement_message,
 )
+from pyspark.util import PythonEvalType
 
 
 @unittest.skipIf(
     not have_pandas or not have_pyarrow,
-    cast(str, pandas_requirement_message or pyarrow_requirement_message),
+    pandas_requirement_message or pyarrow_requirement_message,
 )
 class PandasUDFTestsMixin:
     def test_pandas_udf_basic(self):
@@ -245,8 +244,12 @@ class PandasUDFTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_DATATYPE_OR_STR",
-            messageParameters={"arg_name": "returnType", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "DataType or str",
+                "arg_name": "returnType",
+                "arg_type": "int",
+            },
         )
 
     def test_stopiteration_in_udf(self):
@@ -310,8 +313,8 @@ class PandasUDFTestsMixin:
         )
 
     def test_pandas_udf_detect_unsafe_type_conversion(self):
-        import pandas as pd
         import numpy as np
+        import pandas as pd
 
         values = [1.0] * 3
         pdf = pd.DataFrame({"A": values})
@@ -323,9 +326,7 @@ class PandasUDFTestsMixin:
 
         # Since 0.11.0, PyArrow supports the feature to raise an error for unsafe cast.
         with self.sql_conf({"spark.sql.execution.pandas.convertToArrowArraySafely": True}):
-            with self.assertRaisesRegex(
-                Exception, "Exception thrown when converting pandas.Series"
-            ):
+            with self.assertRaisesRegex(Exception, "Failed to convert the value"):
                 df.select(["A"]).withColumn("udf", udf("A")).collect()
 
         # Disabling Arrow safe type check.
@@ -343,9 +344,7 @@ class PandasUDFTestsMixin:
 
         # When enabling safe type check, Arrow 0.11.0+ disallows overflow cast.
         with self.sql_conf({"spark.sql.execution.pandas.convertToArrowArraySafely": True}):
-            with self.assertRaisesRegex(
-                Exception, "Exception thrown when converting pandas.Series"
-            ):
+            with self.assertRaisesRegex(Exception, "Failed to convert the value"):
                 df.withColumn("udf", udf("id")).collect()
 
         # Disabling safe type check, let Arrow do the cast anyway.
@@ -353,8 +352,9 @@ class PandasUDFTestsMixin:
             df.withColumn("udf", udf("id")).collect()
 
     def test_pandas_udf_int_to_decimal_coercion(self):
-        import pandas as pd
         from decimal import Decimal
+
+        import pandas as pd
 
         df = self.spark.range(0, 3)
 
@@ -376,7 +376,7 @@ class PandasUDFTestsMixin:
         ):
             self.assertRaisesRegex(
                 PythonException,
-                "Exception thrown when converting pandas.Series",
+                "Failed to convert the value",
                 df.withColumn("decimal_val", int_to_decimal_udf("id")).collect,
             )
 
@@ -391,7 +391,7 @@ class PandasUDFTestsMixin:
             # intToDecimalCoercionEnabled is not required for this case
             with self.sql_conf(
                 {
-                    "spark.sql.execution.pythonUDF.pandas.intToDecimalCoercionEnabled": intToDecimalCoercionEnabled  # noqa: E501
+                    "spark.sql.execution.pythonUDF.pandas.intToDecimalCoercionEnabled": intToDecimalCoercionEnabled
                 }
             ):
                 result = df.withColumn("decimal_val", high_precision_udf("id")).collect()
@@ -460,18 +460,31 @@ class PandasUDFTestsMixin:
         result = empty_df.select(add1("id"))
         self.assertEqual(result.collect(), [])
 
+    def test_pandas_udf_nullable_large_integers(self):
+        import pandas as pd
+
+        @pandas_udf("long")
+        def identity(s: pd.Series) -> pd.Series:
+            return s
+
+        query = """
+            SELECT * FROM VALUES
+            (9223372036854775707, 1), (NULL, 2)
+            AS tab(a, b)
+            """
+
+        with self.sql_conf({"spark.sql.execution.pythonUDF.pandas.preferIntExtensionDtype": True}):
+            df = self.spark.sql(query).repartition(1).sortWithinPartitions("b")
+            expected = df.select("a").collect()
+            results = df.select(identity("a").alias("a")).collect()
+            self.assertEqual(results, expected)
+
 
 class PandasUDFTests(PandasUDFTestsMixin, ReusedSQLTestCase):
     pass
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.pandas.test_pandas_udf import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

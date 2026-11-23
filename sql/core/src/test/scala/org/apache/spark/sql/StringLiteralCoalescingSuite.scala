@@ -28,7 +28,7 @@ import org.apache.spark.sql.test.SharedSparkSession
  * This feature works in all contexts where string literals are accepted,
  * not just in expressions.
  */
-class StringLiteralCoalescingSuite extends QueryTest with SharedSparkSession {
+class StringLiteralCoalescingSuite extends SharedSparkSession {
 
   // ========================================================================
   // Basic String Literal Coalescing Tests
@@ -436,8 +436,12 @@ class StringLiteralCoalescingSuite extends QueryTest with SharedSparkSession {
              OPTIONS('myoption' R'C:\Users\' 'data')""")
 
       val createStmt = sql("SHOW CREATE TABLE t").collect().head.getString(0)
-      // Backslashes are preserved in R-string parts when using per-token processing
-      assert(createStmt.contains(raw"C:\Users\data"))
+      // Backslashes from the R-string part survive, escaped, so the emitted DDL parses
+      // back to the original value instead of losing them to escape processing.
+      assert(createStmt.contains(raw"C:\\Users\\data"))
+      assert(
+        sql(raw"""SELECT 'C:\\Users\\data'""").collect().head.getString(0) ===
+          raw"C:\Users\data")
     }
   }
 

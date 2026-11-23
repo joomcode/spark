@@ -18,14 +18,14 @@
 package org.apache.spark.util
 
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream}
-import java.lang.invoke.{MethodHandleInfo, SerializedLambda}
+import java.lang.invoke.{LambdaMetafactory, MethodHandle, MethodHandleInfo, MethodHandles, MethodType, SerializedLambda}
 import java.lang.reflect.{Field, Modifier}
 
-import scala.collection.mutable.{Map, Queue, Set, Stack}
+import scala.collection.immutable
+import scala.collection.mutable.{ArrayBuffer, Map, Queue, Set, Stack}
 import scala.jdk.CollectionConverters._
 
-import org.apache.xbean.asm9.{ClassReader, ClassVisitor, Handle, MethodVisitor, Type}
-import org.apache.xbean.asm9.Opcodes._
+import org.apache.xbean.asm9.{ClassReader, ClassVisitor, Handle, MethodVisitor, Opcodes, Type}
 import org.apache.xbean.asm9.tree.{ClassNode, MethodNode}
 
 import org.apache.spark.SparkException
@@ -35,6 +35,40 @@ import org.apache.spark.internal.Logging
  * A cleaner that renders closures serializable if they can be done so safely.
  */
 private[spark] object ClosureCleaner extends Logging {
+  /**
+   * Per-class memo of which closure methods contain a non-local return, i.e. allocate a
+   * `scala/runtime/NonLocalReturnControl`. The verdict is a pure function of the class's
+   * immutable bytecode, so one ASM parse per class answers for every `clean()` call.
+   */
+  private val methodsWithNonLocalReturn = new ClassValue[immutable.Set[String]] {
+    override def computeValue(cls: Class[_]): immutable.Set[String] = {
+      val collector = new ReturnStatementCollector
+      val reader = getClassReader(cls)
+      if (reader != null) {
+        reader.accept(collector, 0)
+      } else {
+        logDebug(s"Cannot get class bytes for ${cls.getName}; skipping return-statement check")
+      }
+      collector.found.toSet
+    }
+  }
+
+  /** Whether `implMethodName` (any closure method, if `None`) of `cls` has a non-local return. */
+  private[util] def hasReturnStatement(cls: Class[_], implMethodName: Option[String]): Boolean = {
+    val found = methodsWithNonLocalReturn.get(cls)
+    implMethodName match {
+      case None => found.nonEmpty
+      case Some(target) =>
+        // Some lambdas get an "$adapted" boxing bridge (e.g. { _: Int => return; Seq() }) while
+        // others do not ({ _: Int => return; true }, fully specialized). When the bridge
+        // exists, the SerializedLambda's impl method is the bridge, which only delegates: the
+        // `new NonLocalReturnControl` instruction is emitted in the underlying unadapted
+        // method, so also match with the suffix stripped.
+        // See https://github.com/scala/scala-dev/issues/109.
+        found.contains(target) || found.contains(target.stripSuffix("$adapted"))
+    }
+  }
+
   // Get an ASM class reader for a given class from the JAR that loaded it
   private[util] def getClassReader(cls: Class[_]): ClassReader = {
     // Copy data over, before delegating to ClassReader - else we can run out of open file handles.
@@ -190,11 +224,18 @@ private[spark] object ClosureCleaner extends Logging {
    * @param cleanTransitively whether to clean enclosing closures transitively
    * @param accessedFields    a map from a class to a set of its fields that are accessed by
    *                          the starting closure
+   * @return Some(cleaned closure) if the closure was cleaned, None otherwise.
+   *         On the clone-based path (Java 22+ or when explicitly enabled), the returned
+   *         closure is a new lambda instance with cleaned outer references.
+   *         On the legacy mutation path, the closure is mutated in place and
+   *         Some with the same reference is returned.
    */
-  private[spark] def clean(
-      func: AnyRef,
+  private[spark] def clean[F <: AnyRef](
+      func: F,
       cleanTransitively: Boolean,
-      accessedFields: Map[Class[_], Set[String]]): Boolean = {
+      accessedFields: Map[Class[_], Set[String]]): Option[F] = {
+    var cleanedFunc: F = func
+
     // indylambda check. Most likely to be the case with 2.12, 2.13
     // so we check first
     // non LMF-closures should be less frequent from now on
@@ -202,14 +243,14 @@ private[spark] object ClosureCleaner extends Logging {
 
     if (!isClosure(func.getClass) && maybeIndylambdaProxy.isEmpty) {
       logDebug(s"Expected a closure; got ${func.getClass.getName}")
-      return false
+      return None
     }
 
     // TODO: clean all inner closures first. This requires us to find the inner objects.
     // TODO: cache outerClasses / innerClasses / accessedFields
 
     if (func == null) {
-      return false
+      return None
     }
 
     if (maybeIndylambdaProxy.isEmpty) {
@@ -220,6 +261,13 @@ private[spark] object ClosureCleaner extends Logging {
 
       logDebug(s"Cleaning indylambda closure: $implMethodName")
 
+      // A closure with no captured arguments needs no cleaning, and cannot contain a non-local
+      // return (the `NonLocalReturnControl` key is allocated in the enclosing method and would
+      // be captured), so return before loading and parsing the capturing class.
+      if (lambdaProxy.getCapturedArgCount == 0) {
+        return None
+      }
+
       // capturing class is the class that declared this lambda
       val capturingClassName = lambdaProxy.getCapturingClass.replace('/', '.')
       val classLoader = func.getClass.getClassLoader // this is the safest option
@@ -228,15 +276,12 @@ private[spark] object ClosureCleaner extends Logging {
       // scalastyle:on classforname
 
       // Fail fast if we detect return statements in closures
-      val capturingClassReader = getClassReader(capturingClass)
-      capturingClassReader.accept(new ReturnStatementFinder(Option(implMethodName)), 0)
-
-      val outerThis = if (lambdaProxy.getCapturedArgCount > 0) {
-        // only need to clean when there is an enclosing non-null "this" captured by the closure
-        Option(lambdaProxy.getCapturedArg(0)).getOrElse(return false)
-      } else {
-        return false
+      if (hasReturnStatement(capturingClass, Option(implMethodName))) {
+        throw new ReturnStatementInClosureException
       }
+
+      // only need to clean when there is an enclosing non-null "this" captured by the closure
+      val outerThis = Option(lambdaProxy.getCapturedArg(0)).getOrElse(return None)
 
       // clean only if enclosing "this" is something cleanable, i.e. a Scala REPL line object or
       // Ammonite command helper object.
@@ -245,22 +290,28 @@ private[spark] object ClosureCleaner extends Logging {
       if (isDefinedInAmmonite(outerThis.getClass)) {
         // If outerThis is a lambda, we have to clean that instead
         IndylambdaScalaClosures.getSerializationProxy(outerThis).foreach { _ =>
-          return clean(outerThis, cleanTransitively, accessedFields)
+          val cleanedOuterThis = clean(outerThis, cleanTransitively, accessedFields)
+          if (cleanedOuterThis.isEmpty) {
+            return None
+          } else {
+            return Some(
+              cloneIndyLambda(func, cleanedOuterThis.get, lambdaProxy).getOrElse(func))
+          }
         }
-        cleanupAmmoniteReplClosure(func, lambdaProxy, outerThis, cleanTransitively)
+        cleanedFunc = cleanupAmmoniteReplClosure(func, lambdaProxy, outerThis, cleanTransitively)
       } else {
         val isClosureDeclaredInScalaRepl = capturingClassName.startsWith("$line") &&
           capturingClassName.endsWith("$iw")
         if (isClosureDeclaredInScalaRepl && outerThis.getClass.getName == capturingClassName) {
           assert(accessedFields.isEmpty)
-          cleanupScalaReplClosure(func, lambdaProxy, outerThis, cleanTransitively)
+          cleanedFunc = cleanupScalaReplClosure(func, lambdaProxy, outerThis, cleanTransitively)
         }
       }
 
       logDebug(s" +++ indylambda closure ($implMethodName) is now cleaned +++")
     }
 
-    true
+    Some(cleanedFunc)
   }
 
   /**
@@ -300,7 +351,9 @@ private[spark] object ClosureCleaner extends Logging {
     }
 
     // Fail fast if we detect return statements in closures
-    getClassReader(func.getClass).accept(new ReturnStatementFinder(), 0)
+    if (hasReturnStatement(func.getClass, None)) {
+      throw new ReturnStatementInClosureException
+    }
 
     // If accessed fields is not populated yet, we assume that
     // the closure we are trying to clean is the starting one
@@ -396,11 +449,11 @@ private[spark] object ClosureCleaner extends Logging {
    * @param outerThis lambda enclosing class
    * @param cleanTransitively whether to clean enclosing closures transitively
    */
-  private def cleanupScalaReplClosure(
-      func: AnyRef,
+  private def cleanupScalaReplClosure[F <: AnyRef](
+      func: F,
       lambdaProxy: SerializedLambda,
       outerThis: AnyRef,
-      cleanTransitively: Boolean): Unit = {
+      cleanTransitively: Boolean): F = {
 
     val capturingClass = outerThis.getClass
     val accessedFields: Map[Class[_], Set[String]] = Map.empty
@@ -422,13 +475,19 @@ private[spark] object ClosureCleaner extends Logging {
       logDebug(s" + cloning instance of REPL class ${capturingClass.getName}")
       val clonedOuterThis = cloneAndSetFields(
         parent = null, outerThis, capturingClass, accessedFields)
-
-      val outerField = func.getClass.getDeclaredField("arg$1")
-      // SPARK-37072: When Java 17 is used and `outerField` is read-only,
-      // the content of `outerField` cannot be set by reflect api directly.
-      // But we can remove the `final` modifier of `outerField` before set value
-      // and reset the modifier after set value.
-      setFieldAndIgnoreModifiers(func, outerField, clonedOuterThis)
+      cloneIndyLambda(func, clonedOuterThis, lambdaProxy).getOrElse {
+        val outerField = func.getClass.getDeclaredField("arg$1")
+        // SPARK-37072: When `outerField` is read-only,
+        // the content of `outerField` cannot be set by reflect api directly.
+        // But we can remove the `final` modifier of `outerField` before set value
+        // and reset the modifier after set value.
+        // This path is reached only on Java 21 when `jdk.reflect.useDirectMethodHandle` is not
+        // `true`, e.g., with `-Djdk.reflect.useDirectMethodHandle=false`.
+        setFieldAndIgnoreModifiers(func, outerField, clonedOuterThis)
+        func
+      }
+    } else {
+      func
     }
   }
 
@@ -457,11 +516,11 @@ private[spark] object ClosureCleaner extends Logging {
    * @param outerThis         lambda enclosing class
    * @param cleanTransitively whether to clean enclosing closures transitively
    */
-  private def cleanupAmmoniteReplClosure(
-      func: AnyRef,
+  private def cleanupAmmoniteReplClosure[F <: AnyRef](
+      func: F,
       lambdaProxy: SerializedLambda,
       outerThis: AnyRef,
-      cleanTransitively: Boolean): Unit = {
+      cleanTransitively: Boolean): F = {
 
     val accessedFields: Map[Class[_], Set[String]] = Map.empty
     initAccessedFields(accessedFields, Seq(outerThis.getClass))
@@ -550,13 +609,16 @@ private[spark] object ClosureCleaner extends Logging {
       cmdClones(outerThis.getClass)
     }
 
-    val outerField = func.getClass.getDeclaredField("arg$1")
-    // update lambda capturing class reference
-    setFieldAndIgnoreModifiers(func, outerField, outerThisClone)
+    cloneIndyLambda(func, outerThisClone, lambdaProxy).getOrElse {
+      val outerField = func.getClass.getDeclaredField("arg$1")
+      // update lambda capturing class reference
+      setFieldAndIgnoreModifiers(func, outerField, outerThisClone)
+      func
+    }
   }
 
   private def setFieldAndIgnoreModifiers(obj: AnyRef, field: Field, value: AnyRef): Unit = {
-    val modifiersField = getFinalModifiersFieldForJava17(field)
+    val modifiersField = getFinalModifiersField(field)
     modifiersField
       .foreach(m => m.setInt(field, field.getModifiers & ~Modifier.FINAL))
     field.setAccessible(true)
@@ -567,9 +629,10 @@ private[spark] object ClosureCleaner extends Logging {
   }
 
   /**
-   * This method is used to get the final modifier field when on Java 17.
+   * This method is used to get the `modifiers` field of `java.lang.reflect.Field`
+   * when the given `field` is final, so that the `final` modifier can be removed temporarily.
    */
-  private def getFinalModifiersFieldForJava17(field: Field): Option[Field] = {
+  private def getFinalModifiersField(field: Field): Option[Field] = {
     if (Modifier.isFinal(field.getModifiers)) {
       val methodGetDeclaredFields0 = classOf[Class[_]]
         .getDeclaredMethod("getDeclaredFields0", classOf[Boolean])
@@ -595,6 +658,92 @@ private[spark] object ClosureCleaner extends Logging {
       field.set(obj, enclosingObject)
     }
     obj
+  }
+
+  private def cloneIndyLambda[F <: AnyRef](
+      indyLambda: F,
+      outerThis: AnyRef,
+      lambdaProxy: SerializedLambda): Option[F] = {
+    val javaVersion = Runtime.version().feature()
+    val useClone = System.getProperty("spark.cloneBasedClosureCleaner.enabled") == "true" ||
+      System.getenv("SPARK_CLONE_BASED_CLOSURE_CLEANER") == "1" || javaVersion >= 22 ||
+      System.getProperty("jdk.reflect.useDirectMethodHandle", "true") == "true"
+
+    if (useClone) {
+      val factory = makeClonedIndyLambdaFactory(indyLambda.getClass, lambdaProxy)
+
+      val argsBuffer = new ArrayBuffer[Object]()
+      var i = 0
+      while (i < lambdaProxy.getCapturedArgCount) {
+        val arg = lambdaProxy.getCapturedArg(i)
+        argsBuffer.append(arg)
+        i += 1
+      }
+      val clonedLambda =
+        factory.invokeWithArguments(outerThis +: argsBuffer.tail.toArray: _*).asInstanceOf[F]
+      Some(clonedLambda)
+    } else {
+      None
+    }
+  }
+
+  private def makeClonedIndyLambdaFactory(
+      originalFuncClass: Class[_],
+      lambdaProxy: SerializedLambda): MethodHandle = {
+    val classLoader = originalFuncClass.getClassLoader
+
+    // scalastyle:off classforname
+    val fInterface = Class.forName(
+      lambdaProxy.getFunctionalInterfaceClass.replace("/", "."), false, classLoader)
+    // scalastyle:on classforname
+    val numCapturedArgs = lambdaProxy.getCapturedArgCount
+    val implMethodType = MethodType.fromMethodDescriptorString(
+      lambdaProxy.getImplMethodSignature, classLoader)
+    val invokedMethodType = MethodType.methodType(
+      fInterface, (0 until numCapturedArgs).map(i => implMethodType.parameterType(i)).toArray)
+
+    // scalastyle:off classforname
+    val implClassName = lambdaProxy.getImplClass.replace("/", ".")
+    val implClass = Class.forName(implClassName, false, classLoader)
+    // scalastyle:on classforname
+    val replLookup = getFullPowerLookupFor(implClass)
+
+    val implMethodName = lambdaProxy.getImplMethodName
+    val implMethodHandle = replLookup.findStatic(implClass, implMethodName, implMethodType)
+    val funcMethodType = MethodType.fromMethodDescriptorString(
+      lambdaProxy.getFunctionalInterfaceMethodSignature, classLoader)
+    val instantiatedMethodType = MethodType.fromMethodDescriptorString(
+      lambdaProxy.getInstantiatedMethodType, classLoader)
+
+    val callSite = LambdaMetafactory.altMetafactory(
+      replLookup,
+      lambdaProxy.getFunctionalInterfaceMethodName,
+      invokedMethodType,
+      funcMethodType,
+      implMethodHandle,
+      instantiatedMethodType,
+      LambdaMetafactory.FLAG_SERIALIZABLE)
+
+    callSite.getTarget
+  }
+
+  /**
+   * This method is used for full-power lookup for `targetClass` which is used for cloning lambdas
+   * created at each REPL line. `targetClass` is expected the enclosing class of a lambda.
+   * `MethodHandles.privateLookupIn(targetClass, MethodHandles.lookup())` is not
+   * helpful for such use case because targetClass and `ClosureCleaner` which
+   * `MethodHandles.lookup()` calls are loaded into different class loaders, and the method returns
+   * a lookup which doesn't have enough privilege to create a lambda using
+   * LambdaMetaFactory.altMetafactory.
+   */
+  private def getFullPowerLookupFor(targetClass: Class[_]): MethodHandles.Lookup = {
+    val replLookupCtor = classOf[MethodHandles.Lookup].getDeclaredConstructor(
+      classOf[Class[_]],
+      classOf[Class[_]],
+      classOf[Int])
+    replLookupCtor.setAccessible(true)
+    // -1 means full-power.
+    replLookupCtor.newInstance(targetClass, null, -1)
   }
 }
 
@@ -671,7 +820,7 @@ private[spark] object IndylambdaScalaClosures extends Logging {
    * Returns true if both criteria above are met.
    */
   def isLambdaBodyCapturingOuter(handle: Handle, ownerInternalName: String): Boolean = {
-    handle.getTag == H_INVOKESTATIC &&
+    handle.getTag == Opcodes.H_INVOKESTATIC &&
       handle.getName.contains("$anonfun$") &&
       handle.getOwner == ownerInternalName &&
       handle.getDesc.startsWith(s"(L$ownerInternalName;")
@@ -686,7 +835,7 @@ private[spark] object IndylambdaScalaClosures extends Logging {
    */
   def isInnerClassCtorCapturingOuter(
       op: Int, owner: String, name: String, desc: String, callerInternalName: String): Boolean = {
-    op == INVOKESPECIAL && name == "<init>" && desc.startsWith(s"(L$callerInternalName;")
+    op == Opcodes.INVOKESPECIAL && name == "<init>" && desc.startsWith(s"(L$callerInternalName;")
   }
 
   /**
@@ -882,14 +1031,14 @@ private[spark] object IndylambdaScalaClosures extends Logging {
       addAmmoniteCommandFieldsToTracking(currentClass)
       val currentMethodNode = methodNodeById(currentId)
       logTrace(s"  scanning ${currentId.cls.getName}.${currentId.name}${currentId.desc}")
-      currentMethodNode.accept(new MethodVisitor(ASM9) {
+      currentMethodNode.accept(new MethodVisitor(Opcodes.ASM9) {
         val currentClassName = currentClass.getName
         val currentClassInternalName = currentClassName.replace('.', '/')
 
         // Find and update the accessedFields info. Only fields on known outer classes are tracked.
         // This is the FieldAccessFinder equivalent.
         override def visitFieldInsn(op: Int, owner: String, name: String, desc: String): Unit = {
-          if (op == GETFIELD || op == PUTFIELD) {
+          if (op == Opcodes.GETFIELD || op == Opcodes.PUTFIELD) {
             val ownerExternalName = owner.replace('/', '.')
             for (cl <- accessedFields.keys if cl.getName == ownerExternalName) {
               logTrace(s"    found field access $name on $ownerExternalName")
@@ -969,30 +1118,24 @@ private[spark] object IndylambdaScalaClosures extends Logging {
 private[spark] class ReturnStatementInClosureException
   extends SparkException("Return statements aren't allowed in Spark closures")
 
-private class ReturnStatementFinder(targetMethodName: Option[String] = None)
-  extends ClassVisitor(ASM9) {
+/** Collects the names of all closure methods that contain a non-local return. */
+private class ReturnStatementCollector extends ClassVisitor(Opcodes.ASM9) {
+  val found = Set.empty[String]
+
   override def visitMethod(access: Int, name: String, desc: String,
       sig: String, exceptions: Array[String]): MethodVisitor = {
 
     // $anonfun$ covers indylambda closures
     if (name.contains("apply") || name.contains("$anonfun$")) {
-      // A method with suffix "$adapted" will be generated in cases like
-      // { _:Int => return; Seq()} but not { _:Int => return; true}
-      // closure passed is $anonfun$t$1$adapted while actual code resides in $anonfun$s$1
-      // visitor will see only $anonfun$s$1$adapted, so we remove the suffix, see
-      // https://github.com/scala/scala-dev/issues/109
-      val isTargetMethod = targetMethodName.isEmpty ||
-        name == targetMethodName.get || name == targetMethodName.get.stripSuffix("$adapted")
-
-      new MethodVisitor(ASM9) {
+      new MethodVisitor(Opcodes.ASM9) {
         override def visitTypeInsn(op: Int, tp: String): Unit = {
-          if (op == NEW && tp.contains("scala/runtime/NonLocalReturnControl") && isTargetMethod) {
-            throw new ReturnStatementInClosureException
+          if (op == Opcodes.NEW && tp.contains("scala/runtime/NonLocalReturnControl")) {
+            found += name
           }
         }
       }
     } else {
-      new MethodVisitor(ASM9) {}
+      new MethodVisitor(Opcodes.ASM9) {}
     }
   }
 }
@@ -1016,7 +1159,7 @@ private[util] class FieldAccessFinder(
     findTransitively: Boolean,
     specificMethod: Option[MethodIdentifier[_]] = None,
     visitedMethods: Set[MethodIdentifier[_]] = Set.empty)
-  extends ClassVisitor(ASM9) {
+  extends ClassVisitor(Opcodes.ASM9) {
 
   override def visitMethod(
       access: Int,
@@ -1031,9 +1174,9 @@ private[util] class FieldAccessFinder(
       return null
     }
 
-    new MethodVisitor(ASM9) {
+    new MethodVisitor(Opcodes.ASM9) {
       override def visitFieldInsn(op: Int, owner: String, name: String, desc: String): Unit = {
-        if (op == GETFIELD) {
+        if (op == Opcodes.GETFIELD) {
           for (cl <- fields.keys if cl.getName == owner.replace('/', '.')) {
             fields(cl) += name
           }
@@ -1045,7 +1188,7 @@ private[util] class FieldAccessFinder(
         for (cl <- fields.keys if cl.getName == owner.replace('/', '.')) {
           // Check for calls a getter method for a variable in an interpreter wrapper object.
           // This means that the corresponding field will be accessed, so we should save it.
-          if (op == INVOKEVIRTUAL && owner.endsWith("$iwC") && !name.endsWith("$outer")) {
+          if (op == Opcodes.INVOKEVIRTUAL && owner.endsWith("$iwC") && !name.endsWith("$outer")) {
             fields(cl) += name
           }
           // Optionally visit other methods to find fields that are transitively referenced
@@ -1071,7 +1214,7 @@ private[util] class FieldAccessFinder(
   }
 }
 
-private class InnerClosureFinder(output: Set[Class[_]]) extends ClassVisitor(ASM9) {
+private class InnerClosureFinder(output: Set[Class[_]]) extends ClassVisitor(Opcodes.ASM9) {
   var myName: String = null
 
   // TODO: Recursively find inner closures that we indirectly reference, e.g.
@@ -1086,11 +1229,11 @@ private class InnerClosureFinder(output: Set[Class[_]]) extends ClassVisitor(ASM
 
   override def visitMethod(access: Int, name: String, desc: String,
       sig: String, exceptions: Array[String]): MethodVisitor = {
-    new MethodVisitor(ASM9) {
+    new MethodVisitor(Opcodes.ASM9) {
       override def visitMethodInsn(
           op: Int, owner: String, name: String, desc: String, itf: Boolean): Unit = {
         val argTypes = Type.getArgumentTypes(desc)
-        if (op == INVOKESPECIAL && name == "<init>" && argTypes.length > 0
+        if (op == Opcodes.INVOKESPECIAL && name == "<init>" && argTypes.length > 0
             && argTypes(0).toString.startsWith("L") // is it an object?
             && argTypes(0).getInternalName == myName) {
           output += SparkClassUtils.classForName(

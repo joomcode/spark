@@ -17,11 +17,11 @@
 # under the License.
 #
 
-name: "Build / RocksDB as UI Backend (master, Hadoop 3, JDK 17, Scala 2.13)"
+name: "Build / RocksDB as UI Backend (JDK 21, Scala 2.13)"
 
 on:
   schedule:
-    - cron: '0 6 * * *'
+    - cron: '17 10 3-31/3 * *'
   workflow_dispatch:
 
 jobs:
@@ -32,13 +32,13 @@ jobs:
     uses: ./.github/workflows/build_and_test.yml
     if: github.repository == 'apache/spark'
     with:
-      java: 17
+      java: 21
       branch: master
       hadoop: hadoop3
       envs: >-
         {
-          "PYSPARK_IMAGE_TO_TEST": "python-311",
-          "PYTHON_TO_TEST": "python3.11",
+          "PYSPARK_IMAGE_TO_TEST": "python-312",
+          "PYTHON_TO_TEST": "python3.12",
           "LIVE_UI_LOCAL_STORE_DIR": "/tmp/kvStore",
         }
       jobs: >-

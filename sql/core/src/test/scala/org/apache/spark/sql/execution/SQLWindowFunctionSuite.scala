@@ -18,7 +18,7 @@
 package org.apache.spark.sql.execution
 
 import org.apache.spark.TestUtils.assertSpilled
-import org.apache.spark.sql.{AnalysisException, QueryTest, Row}
+import org.apache.spark.sql.{AnalysisException, Row}
 import org.apache.spark.sql.internal.SQLConf.{WINDOW_EXEC_BUFFER_IN_MEMORY_THRESHOLD, WINDOW_EXEC_BUFFER_SPILL_THRESHOLD}
 import org.apache.spark.sql.test.SharedSparkSession
 
@@ -28,7 +28,7 @@ case class WindowData(month: Int, area: String, product: Int)
 /**
  * Test suite for SQL window functions.
  */
-class SQLWindowFunctionSuite extends QueryTest with SharedSparkSession {
+class SQLWindowFunctionSuite extends SharedSparkSession {
 
   import testImplicits._
 
@@ -104,6 +104,57 @@ class SQLWindowFunctionSuite extends QueryTest with SharedSparkSession {
           ("c", 10, 10d/17),
           ("c", 9, 9d/17)
         ).map(i => Row(i._1, i._2, i._3)))
+    }
+  }
+
+  test("SPARK-59175: window expression with GROUP BY expression") {
+    withTempView("events") {
+      sql("SELECT * FROM VALUES ('us'), ('US'), ('us'), ('ca'), ('CA'), ('mx'), ('br') " +
+        "AS t(country)").createOrReplaceTempView("events")
+
+      val groupByExpr = sql(
+        """
+          |WITH ranked AS (
+          |  SELECT
+          |    CASE
+          |      WHEN ROW_NUMBER() OVER (ORDER BY COUNT(1) DESC) <= 2 THEN UPPER(country)
+          |      ELSE 'Other'
+          |    END AS bucket,
+          |    COUNT(1) AS events
+          |  FROM events
+          |  GROUP BY UPPER(country)
+          |)
+          |SELECT bucket, SUM(events) AS events
+          |FROM ranked
+          |GROUP BY bucket
+          |""".stripMargin)
+      checkAnswer(groupByExpr, Seq(Row("US", 3), Row("CA", 2), Row("Other", 2)))
+
+      val groupByColumn = sql(
+        """
+          |SELECT
+          |  CASE
+          |    WHEN ROW_NUMBER() OVER (ORDER BY COUNT(1) DESC, country) <= 2 THEN UPPER(country)
+          |    ELSE 'Other'
+          |  END AS bucket,
+          |  COUNT(1) AS events
+          |FROM events
+          |GROUP BY country
+          |""".stripMargin)
+      checkAnswer(groupByColumn,
+        Seq(Row("US", 2), Row("CA", 1), Row("Other", 1), Row("Other", 1),
+          Row("Other", 1), Row("Other", 1)))
+
+      val separateItems = sql(
+        """
+          |SELECT
+          |  UPPER(country) AS bucket,
+          |  ROW_NUMBER() OVER (ORDER BY COUNT(1) DESC, UPPER(country)) AS rn
+          |FROM events
+          |GROUP BY UPPER(country)
+          |""".stripMargin)
+      checkAnswer(separateItems,
+        Seq(Row("US", 1), Row("CA", 2), Row("BR", 3), Row("MX", 4)))
     }
   }
 

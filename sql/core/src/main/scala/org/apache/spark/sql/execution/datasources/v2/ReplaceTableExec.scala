@@ -23,8 +23,8 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.TableSpec
-import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Column, Identifier, StagedTable, StagingTableCatalog, TableCatalog, TableInfo}
-import org.apache.spark.sql.connector.expressions.Transform
+import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Column, Identifier, StagedTable, StagingTableCatalog, TableCatalog, TableInfo, WriteDistributionMode}
+import org.apache.spark.sql.connector.expressions.{SortOrder => V2SortOrder, Transform}
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.util.Utils
@@ -36,7 +36,9 @@ case class ReplaceTableExec(
     partitioning: Seq[Transform],
     tableSpec: TableSpec,
     orCreate: Boolean,
-    invalidateCache: (TableCatalog, Identifier) => Unit) extends LeafV2CommandExec {
+    invalidateCache: (TableCatalog, Identifier) => Unit,
+    writeDistributionMode: WriteDistributionMode,
+    writeOrdering: Seq[V2SortOrder]) extends LeafV2CommandExec {
 
   val tableProperties = CatalogV2Util.convertTableProperties(tableSpec)
 
@@ -45,13 +47,17 @@ case class ReplaceTableExec(
       invalidateCache(catalog, ident)
       catalog.dropTable(ident)
     } else if (!orCreate) {
-      throw QueryCompilationErrors.cannotReplaceMissingTableError(ident)
+      throw QueryCompilationErrors.cannotReplaceMissingTableError(
+        ident,
+        CatalogV2Util.searchPathForTableIdentifier(catalog, ident))
     }
     val tableInfo = new TableInfo.Builder()
       .withColumns(columns)
       .withPartitions(partitioning.toArray)
       .withProperties(tableProperties.asJava)
       .withConstraints(tableSpec.constraints.toArray)
+      .withWriteDistributionMode(writeDistributionMode)
+      .withWriteOrdering(writeOrdering.toArray)
       .build()
     catalog.createTable(ident, tableInfo)
     Seq.empty
@@ -67,7 +73,9 @@ case class AtomicReplaceTableExec(
     partitioning: Seq[Transform],
     tableSpec: TableSpec,
     orCreate: Boolean,
-    invalidateCache: (TableCatalog, Identifier) => Unit) extends LeafV2CommandExec {
+    invalidateCache: (TableCatalog, Identifier) => Unit,
+    writeDistributionMode: WriteDistributionMode,
+    writeOrdering: Seq[V2SortOrder]) extends LeafV2CommandExec {
 
   val tableProperties = CatalogV2Util.convertTableProperties(tableSpec)
 
@@ -83,6 +91,9 @@ case class AtomicReplaceTableExec(
         .withColumns(columns)
         .withPartitions(partitioning.toArray)
         .withProperties(tableProperties.asJava)
+        .withConstraints(tableSpec.constraints.toArray)
+        .withWriteDistributionMode(writeDistributionMode)
+        .withWriteOrdering(writeOrdering.toArray)
         .build()
       catalog.stageCreateOrReplace(identifier, tableInfo)
     } else if (catalog.tableExists(identifier)) {
@@ -91,14 +102,22 @@ case class AtomicReplaceTableExec(
           .withColumns(columns)
           .withPartitions(partitioning.toArray)
           .withProperties(tableProperties.asJava)
+          .withConstraints(tableSpec.constraints.toArray)
+          .withWriteDistributionMode(writeDistributionMode)
+          .withWriteOrdering(writeOrdering.toArray)
           .build()
         catalog.stageReplace(identifier, tableInfo)
       } catch {
         case e: NoSuchTableException =>
-          throw QueryCompilationErrors.cannotReplaceMissingTableError(identifier, Some(e))
+          throw QueryCompilationErrors.cannotReplaceMissingTableError(
+            identifier,
+            CatalogV2Util.searchPathForTableIdentifier(catalog, identifier),
+            Some(e))
       }
     } else {
-      throw QueryCompilationErrors.cannotReplaceMissingTableError(identifier)
+      throw QueryCompilationErrors.cannotReplaceMissingTableError(
+        identifier,
+        CatalogV2Util.searchPathForTableIdentifier(catalog, identifier))
     }
     commitOrAbortStagedChanges(staged)
     Seq.empty

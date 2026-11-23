@@ -45,13 +45,40 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     def desc: String
     override def toString: String = s"$desc: $expr"
   }
-  /** Predicate for watermark on state keys */
-  case class JoinStateKeyWatermarkPredicate(expr: Expression)
+  /**
+   * Predicate for watermark on state keys.
+   *
+   * @param stateWatermark Current batch's eviction watermark. Entries with timestamp
+   *                       at or below this value are eligible for eviction in this batch.
+   * @param prevStateWatermark Safe exclusive lower bound in the same timestamp domain as
+   *                           `stateWatermark`. It is derived from a prior eviction cutoff
+   *                           only when prior eviction and late-input filtering prove that
+   *                           the skipped range is empty: entries at or below this value
+   *                           were already evicted, and newly admitted rows cannot land
+   *                           there. The effective range of entries to evict in this batch
+   *                           is `(prevStateWatermark, stateWatermark]`. State manager
+   *                           implementations can leverage this lower bound to optimize
+   *                           eviction (e.g. narrowing the scan range to skip already-evicted
+   *                           entries). `None` means we do not have a known lower bound, or
+   *                           cannot prove that late-input filtering excludes newly admitted
+   *                           rows at or below it. In that case eviction must consider all
+   *                           entries up to `stateWatermark`.
+   */
+  case class JoinStateKeyWatermarkPredicate(
+      expr: Expression,
+      stateWatermark: Long,
+      prevStateWatermark: Option[Long] = None)
     extends JoinStateWatermarkPredicate {
     def desc: String = "key predicate"
   }
-  /** Predicate for watermark on state values */
-  case class JoinStateValueWatermarkPredicate(expr: Expression)
+  /**
+   * Predicate for watermark on state values. See [[JoinStateKeyWatermarkPredicate]] for
+   * the semantics of `stateWatermark` and `prevStateWatermark`.
+   */
+  case class JoinStateValueWatermarkPredicate(
+      expr: Expression,
+      stateWatermark: Long,
+      prevStateWatermark: Option[Long] = None)
     extends JoinStateWatermarkPredicate {
     def desc: String = "value predicate"
   }
@@ -185,6 +212,7 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       rightKeys: Seq[Expression],
       condition: Option[Expression],
       eventTimeWatermarkForEviction: Option[Long],
+      eventTimeWatermarkForLateEvents: Option[Long],
       useFirstEventTimeColumn: Boolean): JoinStateWatermarkPredicates = {
 
     // Perform assertions against multiple event time columns in the same DataFrame. This method
@@ -212,18 +240,50 @@ object StreamingSymmetricHashJoinHelper extends Logging {
           oneSideJoinKeys(joinKeyOrdinalForWatermark.get).dataType,
           oneSideJoinKeys(joinKeyOrdinalForWatermark.get).nullable)
         val expr = watermarkExpression(Some(keyExprWithWatermark), eventTimeWatermarkForEviction)
-        expr.map(JoinStateKeyWatermarkPredicate.apply _)
-
+        expr.map { e =>
+          // V4 can skip keys at or below the previous watermark only if late-input filtering
+          // rejects new rows in that range on this same key. A watermark on the other input's
+          // equality key can drive eviction even when this input has no watermark, or has one
+          // on a different column. New rows can then pass late-input filtering with keys
+          // already eligible for eviction. V4 must scan from the beginning to find them;
+          // otherwise, outer joins can fail to emit null rows for these unmatched inputs.
+          val prevStateKeyWatermark =
+            if (oneSideInputAttributes.find(_.metadata.contains(delayKey))
+              .exists(oneSideJoinKeys(joinKeyOrdinalForWatermark.get).semanticEquals)) {
+              eventTimeWatermarkForLateEvents
+            } else {
+              None
+            }
+          // watermarkExpression only provides the expression when eventTimeWatermarkForEviction
+          // is defined.
+          JoinStateKeyWatermarkPredicate(
+            e,
+            eventTimeWatermarkForEviction.get,
+            prevStateKeyWatermark)
+        }
       } else if (isWatermarkDefinedOnInput) { // case 2 in the StreamingSymmetricHashJoinExec docs
         val stateValueWatermark = StreamingJoinHelper.getStateValueWatermark(
           attributesToFindStateWatermarkFor = AttributeSet(oneSideInputAttributes),
           attributesWithEventWatermark = AttributeSet(otherSideInputAttributes),
           condition,
           eventTimeWatermarkForEviction)
+        // A row can pass late-input filtering but already be eligible for eviction in this batch.
+        // When the previous join-derived state cutoff is ahead of the late-input watermark, a new
+        // row can fall at or below that cutoff. V4 must scan from the beginning to find such rows.
+        val prevStateValueWatermark = eventTimeWatermarkForLateEvents.flatMap { lateWatermark =>
+          StreamingJoinHelper.getStateValueWatermark(
+            attributesToFindStateWatermarkFor = AttributeSet(oneSideInputAttributes),
+            attributesWithEventWatermark = AttributeSet(otherSideInputAttributes),
+            condition,
+            eventTimeWatermarkForLateEvents).filter(_ <= lateWatermark)
+        }
         val inputAttributeWithWatermark = oneSideInputAttributes.find(_.metadata.contains(delayKey))
         val expr = watermarkExpression(inputAttributeWithWatermark, stateValueWatermark)
-        expr.map(JoinStateValueWatermarkPredicate.apply _)
-
+        expr.map { e =>
+          // watermarkExpression only provides the expression when eventTimeWatermarkForEviction
+          // is defined
+          JoinStateValueWatermarkPredicate(e, stateValueWatermark.get, prevStateValueWatermark)
+        }
       } else {
         None
       }
@@ -236,7 +296,7 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     JoinStateWatermarkPredicates(leftStateWatermarkPredicate, rightStateWatermarkPredicate)
   }
 
-  private def findJoinKeyOrdinalForWatermark(
+  private[join] def findJoinKeyOrdinalForWatermark(
       leftKeys: Seq[Expression],
       rightKeys: Seq[Expression]): Option[Int] = {
     // Join keys of both sides generate rows of the same fields, that is, same sequence of data

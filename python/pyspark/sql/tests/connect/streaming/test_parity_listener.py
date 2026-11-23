@@ -15,13 +15,13 @@
 # limitations under the License.
 #
 
-import unittest
 import time
 
 import pyspark.cloudpickle
-from pyspark.sql.tests.streaming.test_streaming_listener import StreamingListenerTestsMixin
-from pyspark.sql.streaming.listener import StreamingQueryListener
+from pyspark.errors import AnalysisException
 from pyspark.sql.functions import count, lit
+from pyspark.sql.streaming.listener import StreamingQueryListener
+from pyspark.sql.tests.streaming.test_streaming_listener import StreamingListenerTestsMixin
 from pyspark.testing.connectutils import ReusedConnectTestCase
 from pyspark.testing.utils import eventually
 
@@ -203,10 +203,14 @@ class StreamingListenerParityTests(StreamingListenerTestsMixin, ReusedConnectTes
 
             q.stop()
             # need to wait a while before QueryTerminatedEvent reaches client
-            time.sleep(5)
-            self.assertTrue(len(listener_good.start) > 0)
-            self.assertTrue(len(listener_good.progress) > 0)
-            self.assertTrue(len(listener_good.terminated) > 0)
+
+            @eventually(timeout=5, catch_assertions=True)
+            def check_listner():
+                self.assertTrue(len(listener_good.start) > 0)
+                self.assertTrue(len(listener_good.progress) > 0)
+                self.assertTrue(len(listener_good.terminated) > 0)
+
+            check_listner()
         finally:
             for listener in self.spark.streams._sqlb._listener_bus:
                 self.spark.streams.removeListener(listener)
@@ -246,26 +250,33 @@ class StreamingListenerParityTests(StreamingListenerTestsMixin, ReusedConnectTes
                 q.stop()
                 self.assertFalse(q.isActive)
 
-                time.sleep(
-                    60
-                )  # Sleep to make sure listener_terminated_events is written successfully
+                events = {
+                    "start_event": None,
+                    "progress_event": None,
+                    "terminated_event": None,
+                }
 
-                start_event = pyspark.cloudpickle.loads(
-                    self.spark.read.table("listener_start_events").collect()[0][0]
-                )
+                @eventually(timeout=60, catch_assertions=True)
+                def load_event(event_name, table_name):
+                    try:
+                        table = self.spark.read.table(table_name).collect()
+                    except AnalysisException as e:
+                        # It's possible that the table has not been created yet
+                        if e.getCondition() == "TABLE_OR_VIEW_NOT_FOUND":
+                            return False
+                        raise e
+                    if len(table) == 0:
+                        return False
+                    events[event_name] = pyspark.cloudpickle.loads(table[0][0])
+                    return True
 
-                progress_event = pyspark.cloudpickle.loads(
-                    self.spark.read.table("listener_progress_events").collect()[0][0]
-                )
+                load_event("start_event", "listener_start_events")
+                load_event("progress_event", "listener_progress_events")
+                load_event("terminated_event", "listener_terminated_events")
 
-                terminated_event = pyspark.cloudpickle.loads(
-                    self.spark.read.table("listener_terminated_events").collect()[0][0]
-                )
-
-                self.check_start_event(start_event)
-                self.check_progress_event(progress_event, is_stateful=True)
-                self.check_terminated_event(terminated_event)
-
+                self.check_start_event(events["start_event"])
+                self.check_progress_event(events["progress_event"], is_stateful=True)
+                self.check_terminated_event(events["terminated_event"])
         finally:
             self.spark.streams.removeListener(test_listener)
             # Remove again to verify this won't throw any error
@@ -312,13 +323,55 @@ class StreamingListenerParityTests(StreamingListenerTestsMixin, ReusedConnectTes
                 q.stop()
 
 
+class StreamingListenerSessionStopTests(ReusedConnectTestCase):
+    @classmethod
+    def conf(cls):
+        conf = super().conf()
+        # ReusedConnectTestCase makes the server end every stream after 1 second or 123 bytes,
+        # so that the client reattaches. A reattach of the event stream after stop() fails for
+        # the released session, and the handler thread then clears the listeners itself before
+        # close() runs. With the defaults, the release ends the event stream, as on a server of
+        # the default configurations, and close() still has the listeners to remove.
+        conf.set("spark.connect.execute.reattachable.senderMaxStreamDuration", "2m")
+        conf.set("spark.connect.execute.reattachable.senderMaxStreamSize", "1g")
+        return conf
+
+    def test_stopped_session_with_listeners_is_collected_without_a_warning(self):
+        # stop() releases the session, which removes its server side listener, ends the event
+        # stream and the handler thread, and closes the client. SparkSession.__del__ then closes
+        # the listener bus, which must send no removal on the closed client, and so warn
+        # nothing, whatever the number of listeners is: close() removes every listener, and the
+        # removal of the last one is the one that would warn.
+        import gc
+        import os
+        import warnings
+        import weakref
+        from unittest import mock
+
+        for num_listeners in [1, 2]:
+            with self.subTest(num_listeners=num_listeners):
+                session = self.spark.newSession()
+                for _ in range(num_listeners):
+                    session.streams.addListener(TestListenerLocalV1())
+                thread = session.streams._sqlb._execution_thread
+                collected = weakref.ref(session)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    with mock.patch.dict(os.environ):
+                        # In the local mode, stop() stops the local Connect server of this
+                        # suite too. Release only this session, and keep the server.
+                        os.environ.pop("SPARK_LOCAL_REMOTE", None)
+                        session.stop()
+                    thread.join(timeout=60)
+                    self.assertFalse(thread.is_alive())
+                    del session
+                    gc.collect()
+                    self.assertIsNone(collected())
+                messages = [str(w.message) for w in caught]
+                self.assertEqual([m for m in messages if "Failed to remove the listener" in m], [])
+
+
 if __name__ == "__main__":
-    from pyspark.sql.tests.connect.streaming.test_parity_listener import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

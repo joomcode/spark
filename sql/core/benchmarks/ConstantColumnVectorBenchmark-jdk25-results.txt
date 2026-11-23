@@ -1,0 +1,280 @@
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write with StringType, row length = 1:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+--------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                    1              1           0     433137.6           0.0       1.0X
+OnHeapColumnVector                                   2950           2957          10        138.9           7.2       0.0X
+OffHeapColumnVector                                  3732           3738           9        109.8           9.1       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write with StringType, row length = 5:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+--------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                    1              1           0     542362.1           0.0       1.0X
+OnHeapColumnVector                                   4580           4580           0         89.4          11.2       0.0X
+OffHeapColumnVector                                  5752           5757           8         71.2          14.0       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write with StringType, row length = 10:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+---------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                     1              1           0     543169.8           0.0       1.0X
+OnHeapColumnVector                                    4897           4905          12         83.6          12.0       0.0X
+OffHeapColumnVector                                   5536           5538           3         74.0          13.5       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write with StringType, row length = 15:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+---------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                     1              1           0     542067.8           0.0       1.0X
+OnHeapColumnVector                                    5901           5905           6         69.4          14.4       0.0X
+OffHeapColumnVector                                   5638           5648          14         72.6          13.8       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write with StringType, row length = 20:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+---------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                     1              1           0     541952.4           0.0       1.0X
+OnHeapColumnVector                                    5306           5311           7         77.2          13.0       0.0X
+OffHeapColumnVector                                   6106           6142          50         67.1          14.9       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write with StringType, row length = 30:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+---------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                     1              1           0     542478.5           0.0       1.0X
+OnHeapColumnVector                                    5503           5506           5         74.4          13.4       0.0X
+OffHeapColumnVector                                   6294           6303          13         65.1          15.4       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write with IntegerType:              Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                  1              1           0     603950.7           0.0       1.0X
+OnHeapColumnVector                                   16             16           0      25424.6           0.0       0.0X
+OffHeapColumnVector                                  65             65           0       6306.0           0.2       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write with LongType:                 Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                  1              1           0     553621.2           0.0       1.0X
+OnHeapColumnVector                                   35             35           0      11857.3           0.1       0.0X
+OffHeapColumnVector                                  67             68           1       6106.1           0.2       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write with FloatType:                Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                  1              1           0     491628.7           0.0       1.0X
+OnHeapColumnVector                                   16             17           0      24908.4           0.0       0.1X
+OffHeapColumnVector                                 128            128           0       3199.0           0.3       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write with DoubleType:               Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                  1              1           0     338476.0           0.0       1.0X
+OnHeapColumnVector                                   35             35           1      11818.2           0.1       0.0X
+OffHeapColumnVector                                 129            129           0       3167.8           0.3       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test read with StringType, row length = 1:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+-------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                   0              0           0  409190809.2           0.0       1.0X
+OnHeapColumnVector                                    99             99           0       4148.3           0.2       0.0X
+OffHeapColumnVector                                 2973           2978           7        137.8           7.3       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test read with StringType, row length = 5:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+-------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                   0              0           0  409190809.2           0.0       1.0X
+OnHeapColumnVector                                  3180           3185           7        128.8           7.8       0.0X
+OffHeapColumnVector                                 2971           2974           3        137.8           7.3       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test read with StringType, row length = 10:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+--------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                    0              0           0  409190809.2           0.0       1.0X
+OnHeapColumnVector                                   3091           3092           1        132.5           7.5       0.0X
+OffHeapColumnVector                                  2976           2979           4        137.7           7.3       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test read with StringType, row length = 15:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+--------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                    0              0           0  409190809.2           0.0       1.0X
+OnHeapColumnVector                                   3083           3090           9        132.9           7.5       0.0X
+OffHeapColumnVector                                  2988           3004          23        137.1           7.3       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test read with StringType, row length = 20:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+--------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                    0              0           0  409190809.2           0.0       1.0X
+OnHeapColumnVector                                   3087           3087           1        132.7           7.5       0.0X
+OffHeapColumnVector                                  2964           2967           4        138.2           7.2       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test read with StringType, row length = 30:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+--------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                    0              0           0  409190809.2           0.0       1.0X
+OnHeapColumnVector                                   3090           3093           4        132.6           7.5       0.0X
+OffHeapColumnVector                                  2974           2975           1        137.7           7.3       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test read with IntegerType:               Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                               2615           2619           5        156.6           6.4       1.0X
+OnHeapColumnVector                                 2924           2926           3        140.1           7.1       0.9X
+OffHeapColumnVector                                2891           2896           7        141.7           7.1       0.9X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test read with LongType:                  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                  0              0           0    1022070.8           0.0       1.0X
+OnHeapColumnVector                                    1              1           0     492049.2           0.0       0.5X
+OffHeapColumnVector                                 767            768           2        534.2           1.9       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test read with FloatType:                 Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                               2247           2247           0        182.3           5.5       1.0X
+OnHeapColumnVector                                 2522           2525           4        162.4           6.2       0.9X
+OffHeapColumnVector                                2900           2901           1        141.2           7.1       0.8X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test read with DoubleType:                Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                               2405           2410           8        170.3           5.9       1.0X
+OnHeapColumnVector                                 3128           3145          24        131.0           7.6       0.8X
+OffHeapColumnVector                                4701           4704           4         87.1          11.5       0.5X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write and read with StringType, row length = 1:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+-----------------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                          2480           2482           3        165.2           6.1       1.0X
+OnHeapColumnVector                                            4803           4805           3         85.3          11.7       0.5X
+OffHeapColumnVector                                           4730           4740          14         86.6          11.5       0.5X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write and read with StringType, row length = 5:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+-----------------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                          2487           2489           2        164.7           6.1       1.0X
+OnHeapColumnVector                                            4817           4826          12         85.0          11.8       0.5X
+OffHeapColumnVector                                           4737           4745          11         86.5          11.6       0.5X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write and read with StringType, row length = 10:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                           2479           2486          10        165.2           6.1       1.0X
+OnHeapColumnVector                                             4803           4805           2         85.3          11.7       0.5X
+OffHeapColumnVector                                            4735           4740           7         86.5          11.6       0.5X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write and read with StringType, row length = 15:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                           2475           2482          10        165.5           6.0       1.0X
+OnHeapColumnVector                                             4798           4805          11         85.4          11.7       0.5X
+OffHeapColumnVector                                            4728           4732           6         86.6          11.5       0.5X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write and read with StringType, row length = 20:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                           2478           2482           6        165.3           6.1       1.0X
+OnHeapColumnVector                                             4992           4997           6         82.0          12.2       0.5X
+OffHeapColumnVector                                            4732           4734           4         86.6          11.6       0.5X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write and read with StringType, row length = 30:  Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                           2475           2477           2        165.5           6.0       1.0X
+OnHeapColumnVector                                             4797           4798           2         85.4          11.7       0.5X
+OffHeapColumnVector                                            4736           4780          62         86.5          11.6       0.5X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write and read with IntegerType:     Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                               3152           3155           4        129.9           7.7       1.0X
+OnHeapColumnVector                                 3273           3288          21        125.2           8.0       1.0X
+OffHeapColumnVector                                3280           3289          13        124.9           8.0       1.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write and read with LongType:        Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                  0              0           0 14124137931.0           0.0       1.0X
+OnHeapColumnVector                                  767            768           1        533.9           1.9       0.0X
+OffHeapColumnVector                                 766            767           1        534.5           1.9       0.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write and read with FloatType:       Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                               2939           3093         218        139.4           7.2       1.0X
+OnHeapColumnVector                                 3035           3039           6        135.0           7.4       1.0X
+OffHeapColumnVector                                3019           3034          22        135.7           7.4       1.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test write and read with DoubleType:      Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                               3037           3044           9        134.9           7.4       1.0X
+OnHeapColumnVector                                 4759           4760           2         86.1          11.6       0.6X
+OffHeapColumnVector                                4806           4810           6         85.2          11.7       0.6X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test isNull with StringType:              Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                  0              0           0  405143422.4           0.0       1.0X
+OnHeapColumnVector                                    0              0           0    4428060.2           0.0       0.0X
+OffHeapColumnVector                                   0              0           0  409190809.2           0.0       1.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test isNull with IntegerType:             Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                  0              0           0  405143422.4           0.0       1.0X
+OnHeapColumnVector                                    0              0           0    4428060.2           0.0       0.0X
+OffHeapColumnVector                                   0              0           0  409190809.2           0.0       1.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test isNull with LongType:                Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                  0              0           0  405143422.4           0.0       1.0X
+OnHeapColumnVector                                    0              0           0    4428060.2           0.0       0.0X
+OffHeapColumnVector                                   0              0           0  409190809.2           0.0       1.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test isNull with FloatType:               Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                  0              0           0  405143422.4           0.0       1.0X
+OnHeapColumnVector                                    0              0           0    4428060.2           0.0       0.0X
+OffHeapColumnVector                                   0              0           0  409190809.2           0.0       1.0X
+
+OpenJDK 64-Bit Server VM 25.0.5.0.3+1-LTS on Linux 7.0.0-1019-azure
+AMD EPYC 7763 64-Core Processor
+Test isNull with DoubleType:              Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
+------------------------------------------------------------------------------------------------------------------------
+ConstantColumnVector                                  0              0           0  405143422.4           0.0       1.0X
+OnHeapColumnVector                                    0              0           0    4428060.2           0.0       0.0X
+OffHeapColumnVector                                   0              0           0  409190809.2           0.0       1.0X
+

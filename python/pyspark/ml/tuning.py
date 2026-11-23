@@ -15,12 +15,13 @@
 # limitations under the License.
 #
 
+import itertools
 import json
 import os
 import sys
-import itertools
 from multiprocessing.pool import ThreadPool
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -33,39 +34,39 @@ from typing import (
     Union,
     cast,
     overload,
-    TYPE_CHECKING,
 )
 
 import numpy as np
 
-from pyspark import keyword_only, since, inheritable_thread_target
-from pyspark.ml import Estimator, Transformer, Model
-from pyspark.ml.common import inherit_doc, _py2java, _java2py
+from pyspark import inheritable_thread_target, keyword_only, since
+from pyspark.ml.base import Estimator, Model, Transformer
+from pyspark.ml.common import _java2py, _py2java, inherit_doc
 from pyspark.ml.evaluation import Evaluator, JavaEvaluator
-from pyspark.ml.param import Params, Param, TypeConverters
+from pyspark.ml.param import Param, Params, TypeConverters
 from pyspark.ml.param.shared import HasCollectSubModels, HasParallelism, HasSeed
 from pyspark.ml.util import (
     DefaultParamsReader,
     DefaultParamsWriter,
+    JavaMLWriter,
     MetaAlgorithmReadWrite,
     MLReadable,
     MLReader,
     MLWritable,
     MLWriter,
-    JavaMLWriter,
-    try_remote_write,
-    try_remote_read,
     _cache_spark_dataset,
+    try_remote_read,
+    try_remote_write,
 )
-from pyspark.ml.wrapper import JavaParams, JavaEstimator, JavaWrapper
+from pyspark.ml.wrapper import JavaEstimator, JavaParams, JavaWrapper
 from pyspark.sql import functions as F
 from pyspark.sql.dataframe import DataFrame
 
 if TYPE_CHECKING:
-    from pyspark.ml._typing import ParamMap
-    from py4j.java_gateway import JavaObject
     from py4j.java_collections import JavaArray
+    from py4j.java_gateway import JavaObject
+
     from pyspark.core.context import SparkContext
+    from pyspark.ml._typing import ParamMap
 
 __all__ = [
     "ParamGridBuilder",
@@ -77,13 +78,13 @@ __all__ = [
 
 
 def _parallelFitTasks(
-    est: Estimator,
+    est: Estimator[Transformer],
     train: DataFrame,
     eva: Evaluator,
     validation: DataFrame,
     epm: Sequence["ParamMap"],
     collectSubModel: bool,
-) -> List[Callable[[], Tuple[int, float, Transformer]]]:
+) -> List[Callable[[], Tuple[int, float, Union[Transformer, None]]]]:
     """
     Creates a list of callables which can be called from different threads to fit and evaluate
     an estimator in parallel. Each callable returns an `(index, metric)` pair.
@@ -110,7 +111,7 @@ def _parallelFitTasks(
     """
     modelIter = est.fitMultiple(train, epm)
 
-    def singleTask() -> Tuple[int, float, Transformer]:
+    def singleTask() -> Tuple[int, float, Union[Transformer, None]]:
         index, model = next(modelIter)
         # TODO: duplicate evaluator to take extra params from input
         #  Note: Supporting tuning params in evaluator need update method
@@ -169,12 +170,10 @@ class ParamGridBuilder:
         return self
 
     @overload
-    def baseOn(self, __args: "ParamMap") -> "ParamGridBuilder":
-        ...
+    def baseOn(self, __args: "ParamMap") -> "ParamGridBuilder": ...
 
     @overload
-    def baseOn(self, *args: Tuple[Param, Any]) -> "ParamGridBuilder":
-        ...
+    def baseOn(self, *args: Tuple[Param, Any]) -> "ParamGridBuilder": ...
 
     @since("1.4.0")
     def baseOn(self, *args: Union["ParamMap", Tuple[Param, Any]]) -> "ParamGridBuilder":
@@ -570,7 +569,7 @@ class CrossValidatorModelReader(MLReader["CrossValidatorModel"]):
         persistSubModels = ("persistSubModels" in metadata) and metadata["persistSubModels"]
 
         if persistSubModels:
-            subModels = [[None] * len(estimatorParamMaps)] * numFolds
+            subModels = [[None] * len(estimatorParamMaps) for _ in range(numFolds)]
             for splitIndex in range(numFolds):
                 for paramIndex in range(len(estimatorParamMaps)):
                     modelPath = os.path.join(
@@ -853,9 +852,10 @@ class CrossValidator(
             validation = datasets[i][1]
             train = datasets[i][0]
 
-            with _cache_spark_dataset(train) as train, _cache_spark_dataset(
-                validation
-            ) as validation:
+            with (
+                _cache_spark_dataset(train) as train,
+                _cache_spark_dataset(validation) as validation,
+            ):
                 tasks = map(
                     inheritable_thread_target(dataset.sparkSession),
                     _parallelFitTasks(est, train, eva, validation, epm, collectSubModelsParam),
@@ -1758,7 +1758,7 @@ if __name__ == "__main__":
     sc = spark.sparkContext
     globs["sc"] = sc
     globs["spark"] = spark
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
     spark.stop()
     if failure_count:
         sys.exit(-1)

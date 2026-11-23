@@ -14,24 +14,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import unittest
 import tempfile
+import unittest
 from pathlib import Path
 
 from pyspark.testing.connectutils import (
     ReusedConnectTestCase,
-    should_test_connect,
     connect_requirement_message,
+    should_test_connect,
 )
 from pyspark.testing.utils import have_yaml, yaml_requirement_message
-
 
 if should_test_connect and have_yaml:
     from pyspark.pipelines.cli import (
         change_dir,
         find_pipeline_spec,
-        load_pipeline_spec,
         init,
+        load_pipeline_spec,
         register_definitions,
     )
     from pyspark.pipelines.tests.local_graph_element_registry import LocalGraphElementRegistry
@@ -89,10 +88,6 @@ class InitCLITests(ReusedConnectTestCase):
 
 
 if __name__ == "__main__":
-    try:
-        import xmlrunner  # type: ignore
+    from pyspark.testing import main
 
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

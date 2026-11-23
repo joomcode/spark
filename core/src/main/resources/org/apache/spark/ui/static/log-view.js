@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-/* global $ */
+/* global $, uiRoot */
 
 var baseParams;
 
@@ -49,8 +49,8 @@ function disableMoreButton() {
 
 function noNewAlert() {
   var alert = $(".no-new-alert");
-  alert.css("display", "block");
-  window.setTimeout(function () {alert.css("display", "none");}, 4000);
+  alert.removeClass("d-none");
+  window.setTimeout(function () {alert.addClass("d-none");}, 4000);
 }
 
 
@@ -63,7 +63,7 @@ function getRESTEndPoint() {
   if (ind > 0) {
     return words.slice(0, ind + 2).join('/') + "/log";
   }
-  return "/log"
+  return uiRoot + "/log";
 }
 
 /* eslint-disable no-unused-vars */

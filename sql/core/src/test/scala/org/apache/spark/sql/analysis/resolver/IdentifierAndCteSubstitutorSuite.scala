@@ -17,7 +17,6 @@
 
 package org.apache.spark.sql.analysis.resolver
 
-import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
 import org.apache.spark.sql.catalyst.analysis.resolver.{
   IdentifierAndCteSubstitutor,
@@ -27,7 +26,7 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.test.SharedSparkSession
 
-class IdentifierAndCteSubstitutorSuite extends QueryTest with SharedSparkSession {
+class IdentifierAndCteSubstitutorSuite extends SharedSparkSession {
   test("Plan is unchanged") {
     val substitutor = new IdentifierAndCteSubstitutor
 
@@ -72,7 +71,7 @@ class IdentifierAndCteSubstitutorSuite extends QueryTest with SharedSparkSession
         planAfterSubstitution
           .asInstanceOf[UnresolvedWith]
           .cteRelations(0)
-          ._2
+          .plan
           .children(0)
           .children(0)
           .children(0)
@@ -114,7 +113,7 @@ class IdentifierAndCteSubstitutorSuite extends QueryTest with SharedSparkSession
           .children(0)
           .asInstanceOf[UnresolvedWith]
           .cteRelations(0)
-          ._2
+          .plan
           .children(0)
           .children(0)
           .children(0)
@@ -148,7 +147,7 @@ class IdentifierAndCteSubstitutorSuite extends QueryTest with SharedSparkSession
           .children(0)
           .asInstanceOf[UnresolvedWith]
           .cteRelations(0)
-          ._2
+          .plan
           .children(0)
           .children(0)
           .isInstanceOf[UnresolvedRelation]
@@ -159,7 +158,7 @@ class IdentifierAndCteSubstitutorSuite extends QueryTest with SharedSparkSession
           .children(0)
           .asInstanceOf[UnresolvedWith]
           .cteRelations(1)
-          ._2
+          .plan
           .children(0)
           .children(0)
           .isInstanceOf[UnresolvedCteRelationRef]

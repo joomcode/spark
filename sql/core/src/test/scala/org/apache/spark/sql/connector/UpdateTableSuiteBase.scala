@@ -18,15 +18,40 @@
 package org.apache.spark.sql.connector
 
 import org.apache.spark.SparkRuntimeException
-import org.apache.spark.sql.Row
-import org.apache.spark.sql.connector.catalog.{Column, ColumnDefaultValue, TableChange, TableInfo}
+import org.apache.spark.internal.config
+import org.apache.spark.sql.{sources, AnalysisException, Row}
+import org.apache.spark.sql.QueryTest.withQueryExecutionsCaptured
+import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
+import org.apache.spark.sql.catalyst.plans.logical.{ReplaceData, WriteDelta}
+import org.apache.spark.sql.catalyst.trees.TreePattern.WITH_EXPRESSION
+import org.apache.spark.sql.connector.catalog.{Aborted, Column, ColumnDefaultValue, Committed, InMemoryTable, TableChange, TableInfo}
 import org.apache.spark.sql.connector.expressions.{GeneralScalarExpression, LiteralValue}
+import org.apache.spark.sql.connector.write.UpdateSummary
+import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, DataSourceV2ScanRelation}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{IntegerType, StringType}
 
 abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
 
   import testImplicits._
+
+  protected def deltaUpdate: Boolean = false
+
+  protected def getUpdateSummary(): UpdateSummary = {
+    val t = catalog.loadTable(ident).asInstanceOf[InMemoryTable]
+    t.commits.last.writeSummary.get.asInstanceOf[UpdateSummary]
+  }
+
+  protected def checkUpdateMetrics(
+      numUpdatedRows: Long,
+      numCopiedRows: Long): Unit = {
+    val summary = getUpdateSummary()
+    assert(summary.numUpdatedRows() === numUpdatedRows,
+      s"Expected numUpdatedRows=$numUpdatedRows, got ${summary.numUpdatedRows()}")
+    val expectedCopied = if (deltaUpdate) 0L else numCopiedRows
+    assert(summary.numCopiedRows() === expectedCopied,
+      s"Expected numCopiedRows=$expectedCopied, got ${summary.numCopiedRows()}")
+  }
 
   test("update table containing added column with default value") {
     createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
@@ -63,6 +88,8 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
         Row(3, 300, "hr", "explicit-text"),
         Row(4, 400, "software", "explicit-text"),
         Row(5, 500, "hr", null)))
+
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 1)
   }
 
   test("update table with expression-based default values") {
@@ -134,6 +161,8 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     sql(s"UPDATE $tableNameAsString SET dep = 'invalid' WHERE salary <= 1")
 
     checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Nil)
+
+    checkUpdateMetrics(numUpdatedRows = 0, numCopiedRows = 0)
   }
 
   test("update with basic filters") {
@@ -148,6 +177,41 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, 100, "invalid") :: Row(2, 200, "software") :: Row(3, 300, "hr") :: Nil)
+
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 1)
+  }
+
+  test("SPARK-59962: update with a condition reading a computed value twice") {
+    // BETWEEN reads `salary + pk` twice. The condition keeps no `With`, and the group filter
+    // condition, only evaluated in the runtime group filter, keeps it for that filter to
+    // memoize; with the filter, a group-based update copies none of the `hr` rows. One that
+    // gains nothing from memoizing is still inlined there, so a condition that folds to true
+    // leaves a true group filter condition.
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    val (cond, groupFilterCond) = executeAndKeepConditions {
+      sql(s"UPDATE $tableNameAsString SET dep = 'x' WHERE (salary + pk) BETWEEN 150 AND 250")
+    }
+    assert(!cond.containsPattern(WITH_EXPRESSION), s"condition: $cond")
+    assert(groupFilterCond.exists(_.containsPattern(WITH_EXPRESSION)),
+      s"group filter condition: $groupFilterCond")
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, 100, "hr") :: Row(2, 200, "x") :: Row(3, 300, "hr") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 0)
+
+    val (_, constantGroupFilterCond) = executeAndKeepConditions {
+      sql(s"UPDATE $tableNameAsString SET dep = 'y' WHERE 1 BETWEEN 0 AND 2")
+    }
+    assert(constantGroupFilterCond.contains(TrueLiteral),
+      s"group filter condition: $constantGroupFilterCond")
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, 100, "y") :: Row(2, 200, "y") :: Row(3, 300, "y") :: Nil)
   }
 
   test("update with aliases") {
@@ -162,6 +226,8 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, -1, "hr") :: Row(2, 200, "software") :: Row(3, -1, "hr") :: Nil)
+
+    checkUpdateMetrics(numUpdatedRows = 2, numCopiedRows = 0)
   }
 
   test("update aligns assignments") {
@@ -175,6 +241,46 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, 10, 109, "hr") :: Row(2, 22, 222, "hr") :: Nil)
+
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 1)
+  }
+
+  test("SPARK-60978: update keeps columns whose names differ only by case") {
+    // such a table can only be created and read in a case-sensitive session
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+      createAndInitTable("pk INT NOT NULL, salary INT, SALARY INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "SALARY": 200, "dep": "hr" }
+          |{ "pk": 2, "salary": 300, "SALARY": 400, "dep": "hr" }
+          |""".stripMargin)
+    }
+
+    // the statement does not name the colliding columns so it is not ambiguous
+    sql(s"UPDATE $tableNameAsString SET pk = 3 WHERE pk = 1")
+
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(3, 100, 200, "hr") :: Row(2, 300, 400, "hr") :: Nil)
+    }
+  }
+
+  test("SPARK-60979: update keeps columns whose names differ only by case and type") {
+    // such a table can only be created and read in a case-sensitive session
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+      createAndInitTable("pk INT NOT NULL, salary INT NOT NULL, SALARY STRING, dep STRING",
+        """{ "pk": 1, "salary": 100, "SALARY": null, "dep": "hr" }
+          |{ "pk": 2, "salary": 300, "SALARY": "x", "dep": "hr" }
+          |""".stripMargin)
+    }
+
+    // the statement does not name the colliding columns so it is not ambiguous
+    sql(s"UPDATE $tableNameAsString SET pk = 3 WHERE pk = 1")
+
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(3, 100, null, "hr") :: Row(2, 300, "x", "hr") :: Nil)
+    }
   }
 
   test("update non-existing records") {
@@ -189,6 +295,40 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, 100, "hr") :: Row(2, 200, "hardware") :: Row(3, null, "hr") :: Nil)
+
+    checkUpdateMetrics(numUpdatedRows = 0, numCopiedRows = 0)
+  }
+
+  test("update with literal false condition") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "hardware" }
+        |{ "pk": 3, "salary": null, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"UPDATE $tableNameAsString SET salary = -1 WHERE false")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, 100, "hr") :: Row(2, 200, "hardware") :: Row(3, null, "hr") :: Nil)
+
+    checkUpdateMetrics(numUpdatedRows = 0, numCopiedRows = 0)
+  }
+
+  test("update with literal true condition") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "hardware" }
+        |{ "pk": 3, "salary": null, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"UPDATE $tableNameAsString SET salary = -1 WHERE true")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, -1, "hr") :: Row(2, -1, "hardware") :: Row(3, -1, "hr") :: Nil)
+
+    checkUpdateMetrics(numUpdatedRows = 3, numCopiedRows = 0)
   }
 
   test("update without condition") {
@@ -203,6 +343,8 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, -1, "hr") :: Row(2, -1, "hardware") :: Row(3, -1, "hr") :: Nil)
+
+    checkUpdateMetrics(numUpdatedRows = 3, numCopiedRows = 0)
   }
 
   test("update with NULL conditions on partition columns") {
@@ -217,12 +359,14 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, 100, null) :: Row(2, 200, "hr") :: Row(3, 300, "hardware") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 0, numCopiedRows = 0)
 
     // should update one matching row with a null-safe condition
     sql(s"UPDATE $tableNameAsString SET salary = -1 WHERE dep <=> NULL")
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, -1, null) :: Row(2, 200, "hr") :: Row(3, 300, "hardware") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 0)
   }
 
   test("update with NULL conditions on data columns") {
@@ -237,12 +381,14 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, null, "hr") :: Row(2, 200, "hr") :: Row(3, 300, "hardware") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 0, numCopiedRows = 0)
 
     // should update one matching row with a null-safe condition
     sql(s"UPDATE $tableNameAsString SET dep = 'invalid' WHERE salary <=> NULL")
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, null, "invalid") :: Row(2, 200, "hr") :: Row(3, 300, "hardware") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 1)
   }
 
   test("update with IN and NOT IN predicates") {
@@ -256,16 +402,62 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, -1, "hr") :: Row(2, 200, "hardware") :: Row(3, null, "hr") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 1)
 
     sql(s"UPDATE $tableNameAsString SET salary = -1 WHERE salary NOT IN (null, 1)")
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, -1, "hr") :: Row(2, 200, "hardware") :: Row(3, null, "hr") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 0, numCopiedRows = 0)
 
     sql(s"UPDATE $tableNameAsString SET salary = 100 WHERE salary NOT IN (1, 10)")
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, 100, "hr") :: Row(2, 100, "hardware") :: Row(3, null, "hr") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 2, numCopiedRows = 1)
+  }
+
+  test("metric values are stable across stage retries") {
+    // INJECT_SHUFFLE_FETCH_FAILURES corrupts the partition-0 task of the first successful
+    // attempt of every shuffle map stage, so a downstream stage FetchFails and the producer
+    // re-runs. UPDATE writer-side metrics live on the result stage (`metric.add(N)` at
+    // end-of-task in WritingSparkTask), and ResultStage.findMissingPartitions only re-runs
+    // partitions that haven't successfully completed, so the writer accumulator single-counts;
+    // this test is regression coverage that retries don't break the SLAM-aware `UpdateSummary`.
+    // It does not independently assert that a retry fired (there is no overcounting metric to
+    // observe on the result stage).
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      withTempView("source") {
+        createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+          """{ "pk": 1, "salary": 100, "dep": "hr" }
+            |{ "pk": 2, "salary": 200, "dep": "software" }
+            |{ "pk": 3, "salary": 300, "dep": "hr" }
+            |{ "pk": 4, "salary": 400, "dep": "software" }
+            |""".stripMargin)
+
+        val sourceDF = Seq(1, 2).toDF("pk")
+        sourceDF.createOrReplaceTempView("source")
+
+        withSparkContextConf(
+            config.Tests.INJECT_SHUFFLE_FETCH_FAILURES.key -> "true") {
+          sql(
+            s"""UPDATE $tableNameAsString
+               |SET salary = salary + 100
+               |WHERE pk IN (SELECT pk FROM source)
+               |""".stripMargin)
+        }
+
+        checkUpdateMetrics(numUpdatedRows = 2, numCopiedRows = 2)
+
+        checkAnswer(
+          sql(s"SELECT * FROM $tableNameAsString"),
+          Seq(
+            Row(1, 200, "hr"),
+            Row(2, 300, "software"),
+            Row(3, 300, "hr"),
+            Row(4, 400, "software")))
+      }
+    }
   }
 
   test("update nested struct fields") {
@@ -280,12 +472,14 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, Row(-1, Row(Seq(-1), Map("k" -> "v"))), "hr") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 0)
 
     // set primitive, array, map columns to NULL (proper casts should be in inserted)
     sql(s"UPDATE $tableNameAsString SET s.c1 = NULL, s.c2 = NULL WHERE pk = 1")
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, Row(null, null), "hr") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 0)
 
     // assign an entire struct
     sql(
@@ -295,6 +489,7 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, Row(1, Row(Seq(1), null)), "hr") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 0)
   }
 
   test("update fields inside NULL structs") {
@@ -306,6 +501,8 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, Row(-1, null), "hr") :: Nil)
+
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 0)
   }
 
   test("update refreshes relation cache") {
@@ -341,6 +538,8 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
             Row(3, 200, "hardware") ::
             Row(4, 300, "hr") :: Nil)
 
+        checkUpdateMetrics(numUpdatedRows = 2, numCopiedRows = 1)
+
         // verify the view reflects the changes in the table
         checkAnswer(sql("SELECT * FROM temp"), Nil)
       }
@@ -358,6 +557,93 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, -1, Row(300, "v1"), "hr") :: Row(2, 200, Row(200, "v2"), "software") :: Nil)
+
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 0)
+  }
+
+  test("SPARK-60673: update with metadata columns in the condition and assignments") {
+    // the metadata columns must be read even if the operation does not require them
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "hr" }
+        |{ "pk": 3, "id": 1, "dep": "software" }
+        |""".stripMargin)
+
+    sql(s"UPDATE $tableNameAsString SET id = -1 WHERE _partition = 'hr' AND id < 2")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, -1, "hr") :: Row(2, 2, "hr") :: Row(3, 1, "software") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 1)
+
+    sql(s"UPDATE $tableNameAsString t SET t.id = t.index + 10 WHERE t.pk = 3")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, -1, "hr") :: Row(2, 2, "hr") :: Row(3, 10, "software") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 0)
+  }
+
+  test("SPARK-60721: update with assignments to metadata columns") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |""".stripMargin)
+
+    Seq(
+      s"UPDATE $tableNameAsString SET index = 5 WHERE pk = 1" -> "index",
+      s"UPDATE $tableNameAsString t SET t.id = -1, t._partition = 'x' WHERE t.pk = 1" ->
+        "_partition",
+      // the implicit cast in the condition resolves the command in a later analyzer iteration
+      s"UPDATE $tableNameAsString SET index = 5 WHERE id < 1.5" -> "index"
+    ).foreach { case (updateStmt, metadataCol) =>
+      val e = intercept[AnalysisException](sql(updateStmt))
+      assert(e.getCondition == "DATATYPE_MISMATCH.INVALID_ROW_LEVEL_OPERATION_ASSIGNMENTS")
+      assert(e.getMessage.contains(s"Cannot assign to metadata column '$metadataCol'"))
+    }
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, 1, "hr") :: Row(2, 2, "software") :: Nil)
+  }
+
+  test("SPARK-60721: update ignores assignments to metadata columns in legacy mode") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |""".stripMargin)
+
+    withSQLConf(SQLConf.LEGACY_IGNORE_METADATA_COLUMN_ASSIGNMENTS.key -> "true") {
+      sql(s"UPDATE $tableNameAsString SET id = -1, index = 5 WHERE pk = 1")
+    }
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, -1, "hr") :: Row(2, 2, "software") :: Nil)
+  }
+
+  test("SPARK-61683: update of a table accepting any schema rejects metadata column assignments") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |""".stripMargin)
+    sql(s"ALTER TABLE $tableNameAsString SET TBLPROPERTIES ('accept-any-schema' = 'true')")
+
+    // Spark does not align the assignments for such a table, so this SET clause lists every column
+    // of the target table, including the metadata columns that AddMetadataColumns adds to it
+    val updateStmt = s"UPDATE $tableNameAsString " +
+      "SET pk = pk, id = -1, dep = dep, index = 5, _partition = _partition WHERE pk = 1"
+    val e = intercept[AnalysisException](sql(updateStmt))
+    assert(e.getCondition == "DATATYPE_MISMATCH.INVALID_ROW_LEVEL_OPERATION_ASSIGNMENTS")
+    assert(e.getMessage.contains("Cannot assign to metadata column 'index'"))
+
+    withSQLConf(SQLConf.LEGACY_IGNORE_METADATA_COLUMN_ASSIGNMENTS.key -> "true") {
+      sql(updateStmt)
+    }
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, -1, "hr") :: Row(2, 2, "software") :: Nil)
   }
 
   test("update with IN subqueries") {
@@ -385,6 +671,7 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 1, "invalid") :: Row(2, 2, "hardware") :: Row(3, null, "hr") :: Nil)
+      checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 1)
 
       sql(
         s"""UPDATE $tableNameAsString
@@ -397,6 +684,7 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 1, "invalid") :: Row(2, 2, "invalid") :: Row(3, null, "invalid") :: Nil)
+      checkUpdateMetrics(numUpdatedRows = 2, numCopiedRows = 0)
     }
   }
 
@@ -421,6 +709,8 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 1, "invalid") :: Row(2, 2, "hardware") :: Row(3, null, "hr") :: Nil)
+
+      checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 1)
     }
   }
 
@@ -447,6 +737,7 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 1, "hr") :: Row(2, 2, "hardware") :: Row(3, null, "hr") :: Nil)
+      checkUpdateMetrics(numUpdatedRows = 0, numCopiedRows = 0)
 
       sql(
         s"""UPDATE $tableNameAsString
@@ -457,6 +748,7 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 1, "invalid") :: Row(2, 2, "invalid") :: Row(3, null, "hr") :: Nil)
+      checkUpdateMetrics(numUpdatedRows = 2, numCopiedRows = 1)
 
       sql(
         s"""UPDATE $tableNameAsString
@@ -469,6 +761,7 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 1, "hr") :: Row(2, 2, "hr") :: Row(3, null, "hr") :: Nil)
+      checkUpdateMetrics(numUpdatedRows = 2, numCopiedRows = 0)
     }
   }
 
@@ -495,6 +788,7 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 1, "hr") :: Row(2, 2, "hardware") :: Row(3, null, "hr") :: Nil)
+      checkUpdateMetrics(numUpdatedRows = 0, numCopiedRows = 0)
 
       sql(
         s"""UPDATE $tableNameAsString t
@@ -505,6 +799,7 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 1, "invalid") :: Row(2, 2, "hardware") :: Row(3, null, "hr") :: Nil)
+      checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 1)
 
       sql(
         s"""UPDATE $tableNameAsString t
@@ -515,6 +810,7 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 1, "invalid") :: Row(2, 2, "hardware") :: Row(3, null, "invalid") :: Nil)
+      checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 0)
 
       sql(
         s"""UPDATE $tableNameAsString t
@@ -527,6 +823,7 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 1, "invalid") :: Row(2, 2, "hardware") :: Row(3, null, "invalid") :: Nil)
+      checkUpdateMetrics(numUpdatedRows = 0, numCopiedRows = 0)
     }
   }
 
@@ -555,6 +852,7 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 1, "hr") :: Row(2, 2, "invalid") :: Row(3, null, "hr") :: Nil)
+      checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 0)
 
       sql(
         s"""UPDATE $tableNameAsString t
@@ -565,6 +863,7 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 1, "hr") :: Row(2, 2, "invalid") :: Row(3, null, "invalid") :: Nil)
+      checkUpdateMetrics(numUpdatedRows = 2, numCopiedRows = 1)
 
       sql(
         s"""UPDATE $tableNameAsString t
@@ -577,6 +876,7 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 1, "invalid") :: Row(2, 2, "invalid") :: Row(3, null, "invalid") :: Nil)
+      checkUpdateMetrics(numUpdatedRows = 3, numCopiedRows = 0)
     }
   }
 
@@ -601,6 +901,8 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 1, "invalid") :: Row(2, 2, "hardware") :: Row(3, null, "hr") :: Nil)
+
+      checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 1)
     }
   }
 
@@ -617,6 +919,8 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT count(*) FROM $tableNameAsString WHERE value < 2.0"),
       Row(2) :: Nil)
+
+    checkUpdateMetrics(numUpdatedRows = 2, numCopiedRows = 1)
   }
 
   test("SPARK-53538: update with nondeterministic assignments and no wholestage codegen") {
@@ -636,6 +940,8 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT count(*) FROM $tableNameAsString WHERE value < 2.0"),
       Row(2) :: Nil)
+
+    checkUpdateMetrics(numUpdatedRows = 2, numCopiedRows = 1)
   }
 
   test("update with default values") {
@@ -658,6 +964,8 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, 42, "hr") :: Row(2, 2, "software") :: Row(3, 42, "hr") :: Nil)
+
+    checkUpdateMetrics(numUpdatedRows = 2, numCopiedRows = 0)
   }
 
   test("update with current_timestamp default value using DEFAULT keyword") {
@@ -703,6 +1011,192 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       Row(1, Row("x  ", "y"), "hr") ::
         Row(2, Row("bbb", "bbb"), "software") ::
         Row(3, Row("x  ", "y"), "hr") :: Nil)
+
+    checkUpdateMetrics(numUpdatedRows = 2, numCopiedRows = 0)
+  }
+
+  test("SPARK-61462: update with a condition on a CHAR column") {
+    createTable("pk INT NOT NULL, c CHAR(3), id INT, dep STRING")
+
+    append("pk INT NOT NULL, c STRING, id INT, dep STRING",
+      """{ "pk": 1, "c": "a", "id": 1, "dep": "hr" }
+        |{ "pk": 2, "c": "x", "id": 2, "dep": "software" }
+        |{ "pk": 3, "c": "b", "id": 3, "dep": "hr" }
+        |""".stripMargin)
+
+    // the new values that an UPDATE projects on top of the read relation are not paddings
+    sql(s"UPDATE $tableNameAsString SET id = -1 WHERE c IN ('a', 'b', 'c')")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, "a  ", -1, "hr") :: Row(2, "x  ", 2, "software") :: Row(3, "b  ", -1, "hr") :: Nil)
+  }
+
+  test("SPARK-60708: update char/varchar table with metadata columns") {
+    createTable("pk INT NOT NULL, id INT, dep STRING, name VARCHAR(10)")
+
+    append("pk INT NOT NULL, id INT, dep STRING, name STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr", "name": "a" }
+        |{ "pk": 2, "id": 2, "dep": "software", "name": "b" }
+        |{ "pk": 3, "id": 3, "dep": "hr", "name": "c" }
+        |""".stripMargin)
+
+    sql(s"UPDATE $tableNameAsString SET id = -1 WHERE id IN (1, 2) AND _partition = 'hr'")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, -1, "hr", "a") :: Row(2, 2, "software", "b") :: Row(3, 3, "hr", "c") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 1)
+
+    sql(s"UPDATE $tableNameAsString t SET t.id = t.index + 10 WHERE t.pk = 2")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, -1, "hr", "a") :: Row(2, 10, "software", "b") :: Row(3, 3, "hr", "c") :: Nil)
+    checkUpdateMetrics(numUpdatedRows = 1, numCopiedRows = 0)
+  }
+
+  test("SPARK-60708: update char/varchar table with an outer metadata reference") {
+    createTable("pk INT NOT NULL, id INT, dep STRING, name VARCHAR(10)")
+
+    append("pk INT NOT NULL, id INT, dep STRING, name STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr", "name": "a" }
+        |{ "pk": 2, "id": 2, "dep": "software", "name": "b" }
+        |{ "pk": 3, "id": 3, "dep": "hr", "name": "c" }
+        |""".stripMargin)
+
+    withTempView("deps") {
+      Seq("hr").toDF("d").createOrReplaceTempView("deps")
+      sql(s"UPDATE $tableNameAsString t SET id = -1 " +
+        "WHERE id IN (1, 2) AND EXISTS (SELECT 1 FROM deps WHERE deps.d = t._partition)")
+    }
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, -1, "hr", "a") :: Row(2, 2, "software", "b") :: Row(3, 3, "hr", "c") :: Nil)
+  }
+
+  test("SPARK-61479: update with conditions on CHAR columns stored without padding") {
+    withTempView("updated") {
+      createTable("pk INT NOT NULL, c CHAR(3), id INT, dep STRING")
+      // read-side padding also covers values that are not padded in the storage, so the rows to
+      // update must be found by comparing the padded values
+      withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") {
+        append("pk INT NOT NULL, c STRING, id INT, dep STRING",
+          """{ "pk": 1, "c": "a", "id": 1, "dep": "hr" }
+            |{ "pk": 2, "c": "b", "id": 2, "dep": "software" }
+            |{ "pk": 3, "c": "x", "id": 3, "dep": "hr" }
+            |{ "pk": 4, "c": "y", "id": 4, "dep": "finance" }
+            |""".stripMargin)
+      }
+
+      sql(s"UPDATE $tableNameAsString SET id = -1 WHERE c IN ('a', 'b', 'c')")
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, "a  ", -1, "hr") :: Row(2, "b  ", -1, "software") ::
+          Row(3, "x  ", 3, "hr") :: Row(4, "y  ", 4, "finance") :: Nil)
+
+      Seq("x  ").toDF("v").createOrReplaceTempView("updated")
+
+      sql(s"UPDATE $tableNameAsString SET id = -2 WHERE c IN (SELECT v FROM updated)")
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, "a  ", -1, "hr") :: Row(2, "b  ", -1, "software") ::
+          Row(3, "x  ", -2, "hr") :: Row(4, "y  ", 4, "finance") :: Nil)
+
+      Seq("y  ").toDF("v").createOrReplaceTempView("updated")
+
+      sql(
+        s"""UPDATE $tableNameAsString t
+           |SET id = -3
+           |WHERE EXISTS (SELECT 1 FROM updated WHERE updated.v = t.c)
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, "a  ", -1, "hr") :: Row(2, "b  ", -1, "software") ::
+          Row(3, "x  ", -2, "hr") :: Row(4, "y  ", -3, "finance") :: Nil)
+
+      // only the conditions read the padded values, the rows keep what is stored
+      withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") {
+        checkAnswer(
+          sql(s"SELECT c FROM $tableNameAsString"),
+          Row("a") :: Row("b") :: Row("x") :: Row("y") :: Nil)
+      }
+    }
+  }
+
+  test("SPARK-61479: update with a condition on a CHAR partition column stored without padding") {
+    createTable("pk INT NOT NULL, id INT, dep CHAR(8)")
+    withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") {
+      append("pk INT NOT NULL, id INT, dep STRING",
+        """{ "pk": 1, "id": 1, "dep": "hr" }
+          |{ "pk": 2, "id": 2, "dep": "software" }
+          |""".stripMargin)
+    }
+
+    sql(s"UPDATE $tableNameAsString SET id = -1 WHERE dep = 'hr'")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, -1, "hr      ") :: Row(2, 2, "software") :: Nil)
+  }
+
+  test("SPARK-61479: update with values from CHAR columns stored without padding") {
+    createTable("pk INT NOT NULL, c CHAR(3), id INT, v STRING, dep STRING")
+    withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") {
+      append("pk INT NOT NULL, c STRING, id INT, v STRING, dep STRING",
+        """{ "pk": 1, "c": "a", "id": 1, "dep": "hr" }
+          |{ "pk": 2, "c": "b", "id": 2, "dep": "software" }
+          |""".stripMargin)
+    }
+
+    sql(s"UPDATE $tableNameAsString SET v = c, id = IF(c = 'a', 10, 20)")
+
+    checkAnswer(
+      sql(s"SELECT pk, id, v FROM $tableNameAsString"),
+      Row(1, 10, "a  ") :: Row(2, 20, "b  ") :: Nil)
+  }
+
+  test("SPARK-61479: update reads CHAR columns as the read-side configs define") {
+    createTable("pk INT NOT NULL, c CHAR(3), id INT, dep STRING")
+    withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") {
+      append("pk INT NOT NULL, c STRING, id INT, dep STRING",
+        """{ "pk": 1, "c": "a", "id": 1, "dep": "hr" }
+          |""".stripMargin)
+    }
+
+    Seq(
+      Seq(SQLConf.READ_SIDE_CHAR_PADDING.key -> "false") -> 1,
+      Seq(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") -> 1,
+      Seq(
+        SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true",
+        SQLConf.READ_SIDE_CHAR_PADDING.key -> "false") -> 3,
+      Seq(
+        SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true",
+        SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") -> 3
+    ).foreach { case (confs, expectedLength) =>
+      withSQLConf(confs: _*) {
+        sql(s"UPDATE $tableNameAsString SET id = length(c)")
+      }
+      checkAnswer(sql(s"SELECT id FROM $tableNameAsString"), Row(expectedLength))
+    }
+  }
+
+  test("SPARK-61935: update checks NOT NULL for a Scala UDF with a primitive input") {
+    withUserDefinedFunction("plus1" -> true) {
+      spark.udf.register("plus1", (x: Int) => x + 1)
+      createAndInitTable("pk INT NOT NULL, salary INT NOT NULL, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+      val e = intercept[SparkRuntimeException] {
+        sql(s"UPDATE $tableNameAsString SET salary = plus1(IF(pk = 1, NULL, salary)) WHERE pk = 1")
+      }
+      assert(e.getCondition == "NOT_NULL_ASSERT_VIOLATION")
+    }
   }
 
   test("update with NOT NULL checks") {
@@ -762,4 +1256,495 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
           Row(5)))
     }
   }
+
+  test("update with analysis failure and transactional checks") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    val exception = intercept[AnalysisException] {
+      sql(s"UPDATE $tableNameAsString SET invalid_column = -1")
+    }
+
+    assert(exception.getMessage.contains("invalid_column"))
+    assert(catalog.lastTransaction.currentState == Aborted)
+    assert(catalog.lastTransaction.isClosed)
+  }
+
+  test("update with CTE and transactional checks") {
+    // create table
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    // create source table
+    sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT, dep STRING)")
+    sql(s"INSERT INTO $sourceNameAsString VALUES (1, 150, 'hr'), (4, 400, 'finance')")
+
+    // update using CTE
+    val (txn, txnTables) = executeTransaction {
+      sql(
+        s"""WITH cte AS (
+           |  SELECT pk, salary + 50 AS adjusted_salary, dep
+           |  FROM $sourceNameAsString
+           |  WHERE salary > 100
+           |)
+           |UPDATE $tableNameAsString t
+           |SET salary = -1
+           |WHERE t.dep = 'hr' AND EXISTS (SELECT 1 FROM cte WHERE cte.pk = t.pk)
+           |""".stripMargin)
+    }
+
+    // check txn was properly committed and closed
+    assert(txn.currentState == Committed)
+    assert(txn.isClosed)
+    assert(txnTables.size == 2)
+    assert(table.version() == "2")
+
+    // check target table was scanned correctly
+    val targetTxnTable = txnTables(tableNameAsString)
+    val expectedNumTargetScans = if (deltaUpdate) 2 else 3
+    assert(targetTxnTable.scanEvents.size == expectedNumTargetScans)
+
+    // check target table scans for UPDATE condition (dep = 'hr')
+    val numUpdateTargetScans = targetTxnTable.scanEvents.flatten.count {
+      case sources.EqualTo("dep", "hr") => true
+      case _ => false
+    }
+    assert(numUpdateTargetScans == expectedNumTargetScans)
+
+    // check source table was scanned correctly
+    val sourceTxnTable = txnTables(sourceNameAsString)
+    val expectedNumSourceScans = if (deltaUpdate) 2 else 4
+    assert(sourceTxnTable.scanEvents.size == expectedNumSourceScans)
+
+    // check source table scans in CTE (salary > 100)
+    val numCteSourceScans = sourceTxnTable.scanEvents.flatten.count {
+      case sources.GreaterThan("salary", 100) => true
+      case _ => false
+    }
+    assert(numCteSourceScans == expectedNumSourceScans)
+
+    // check txn state was propagated correctly
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, -1, "hr"), // updated
+        Row(2, 200, "software"), // unchanged
+        Row(3, 300, "hr"))) // unchanged (no matching pk in source)
+  }
+
+  test("update with subquery on source table and transactional checks") {
+    // create target table
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    // create source table
+    sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT, dep STRING)")
+    sql(s"INSERT INTO $sourceNameAsString VALUES (1, 150, 'hr'), (4, 400, 'finance')")
+
+    // update using an uncorrelated IN subquery that reads from a transactional catalog table
+    val (txn, txnTables) = executeTransaction {
+      sql(
+        s"""UPDATE $tableNameAsString
+           |SET salary = -1
+           |WHERE pk IN (SELECT pk FROM $sourceNameAsString WHERE dep = 'hr')
+           |""".stripMargin)
+    }
+
+    // check txn was properly committed and closed
+    assert(txn.currentState == Committed)
+    assert(txn.isClosed)
+    assert(txnTables.size == 2)
+    assert(table.version() == "2")
+
+    // check source table was scanned correctly (dep = 'hr' filter in the subquery)
+    val sourceTxnTable = txnTables(sourceNameAsString)
+    val expectedNumSourceScans = if (deltaUpdate) 2 else 4
+    assert(sourceTxnTable.scanEvents.size == expectedNumSourceScans)
+
+    val numSubquerySourceScans = sourceTxnTable.scanEvents.flatten.count {
+      case sources.EqualTo("dep", "hr") => true
+      case _ => false
+    }
+    assert(numSubquerySourceScans == expectedNumSourceScans)
+
+    // check target table was scanned correctly
+    val targetTxnTable = txnTables(tableNameAsString)
+    val expectedNumTargetScans = if (deltaUpdate) 2 else 3
+    assert(targetTxnTable.scanEvents.size == expectedNumTargetScans)
+
+    // check txn state was propagated correctly
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, -1, "hr"), // updated (pk 1 is in subquery result)
+        Row(2, 200, "software"), // unchanged
+        Row(3, 300, "hr"))) // unchanged (pk 3 not in subquery result)
+  }
+
+  test("update with uncorrelated scalar subquery on source table and transactional checks") {
+    // create target table
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    // create source table
+    sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT, dep STRING)")
+    sql(s"INSERT INTO $sourceNameAsString VALUES (1, 150, 'hr'), (4, 400, 'finance')")
+
+    // update using an uncorrelated scalar subquery in the SET clause that reads from a
+    // transactional catalog table; scalar subqueries are executed as SubqueryExec at runtime
+    // and cannot be rewritten as joins
+    val (txn, txnTables) = executeTransaction {
+      sql(
+        s"""UPDATE $tableNameAsString
+           |SET salary = (SELECT max(salary) FROM $sourceNameAsString WHERE dep = 'hr')
+           |WHERE dep = 'hr'
+           |""".stripMargin)
+    }
+
+    // check txn was properly committed and closed
+    assert(txn.currentState == Committed)
+    assert(txn.isClosed)
+    assert(txnTables.size == 2)
+    assert(table.version() == "2")
+
+    // check source table was scanned via the transaction catalog
+    val sourceTxnTable = txnTables(sourceNameAsString)
+    assert(sourceTxnTable.scanEvents.nonEmpty)
+    assert(sourceTxnTable.scanEvents.flatten.exists {
+      case sources.EqualTo("dep", "hr") => true
+      case _ => false
+    })
+
+    // check target table was scanned via the transaction catalog
+    val targetTxnTable = txnTables(tableNameAsString)
+    assert(targetTxnTable.scanEvents.nonEmpty)
+
+    // check txn state was propagated correctly
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, 150, "hr"), // updated (max salary in source for 'hr' is 150)
+        Row(2, 200, "software"), // unchanged
+        Row(3, 150, "hr"))) // updated
+  }
+
+  test("update with constraint violation and transactional checks") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    val exception = intercept[SparkRuntimeException] {
+      executeTransaction {
+        sql(
+          s"""UPDATE $tableNameAsString
+             |SET pk = NULL
+             |WHERE dep = 'hr'
+             |""".stripMargin) // NULL violates NOT NULL constraint
+      }
+    }
+
+    assert(exception.getMessage.contains("NOT_NULL_ASSERT_VIOLATION"))
+    assert(catalog.lastTransaction.currentState == Aborted)
+    assert(catalog.lastTransaction.isClosed)
+  }
+
+  test("update using view with transactional checks") {
+    withView("temp_view") {
+      // create target table
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      // create source table
+      sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT)")
+      sql(s"INSERT INTO $sourceNameAsString (pk, salary) VALUES (1, 150), (4, 400)")
+
+      // create view on top of source and target tables
+      sql(
+        s"""CREATE VIEW temp_view AS
+           |SELECT s.pk, s.salary, t.dep
+           |FROM $sourceNameAsString s
+           |LEFT JOIN (
+           | SELECT * FROM $tableNameAsString WHERE pk < 10
+           |) t ON s.pk = t.pk
+           |""".stripMargin)
+
+      // update target table using view
+      val (txn, txnTables) = executeTransaction {
+        sql(
+          s"""UPDATE $tableNameAsString t
+             |SET salary = -1
+             |WHERE t.dep = 'hr' AND EXISTS (SELECT 1 FROM temp_view v WHERE v.pk = t.pk)
+             |""".stripMargin)
+      }
+
+      // check txn covers both tables and was properly committed and closed
+      assert(txn.currentState == Committed)
+      assert(txn.isClosed)
+      assert(txnTables.size == 2)
+      assert(table.version() == "2")
+
+      // check target table was scanned correctly
+      val targetTxnTable = txnTables(tableNameAsString)
+      val expectedNumTargetScans = if (deltaUpdate) 4 else 7
+      assert(targetTxnTable.scanEvents.size == expectedNumTargetScans)
+
+      // check target table scans as UPDATE target (dep = 'hr')
+      val numUpdateTargetScans = targetTxnTable.scanEvents.flatten.count {
+        case sources.EqualTo("dep", "hr") => true
+        case _ => false
+      }
+      val expectedNumUpdateTargetScans = if (deltaUpdate) 2 else 3
+      assert(numUpdateTargetScans == expectedNumUpdateTargetScans)
+
+      // check target table scans in view as source (pk < 10)
+      val numViewTargetScans = targetTxnTable.scanEvents.flatten.count {
+        case sources.LessThan("pk", 10L) => true
+        case _ => false
+      }
+      val expectedNumViewTargetScans = if (deltaUpdate) 2 else 4
+      assert(numViewTargetScans == expectedNumViewTargetScans)
+
+      // check source table scans in view
+      val sourceTxnTable = txnTables(sourceNameAsString)
+      val expectedNumSourceScans = if (deltaUpdate) 2 else 4
+      assert(sourceTxnTable.scanEvents.size == expectedNumSourceScans)
+
+      // check txn state was propagated correctly
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, -1, "hr"), // updated from view
+          Row(2, 200, "software"), // unchanged
+          Row(3, 300, "hr"))) // unchanged (no matching pk in source)
+    }
+  }
+
+  test("df.explain() on update with transactional checks") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    // sql() is lazy, but explain() forces executedPlan.
+    sql(s"UPDATE $tableNameAsString SET salary = -1 WHERE dep = 'hr'").explain()
+
+    assert(catalog.lastTransaction != null)
+    assert(catalog.lastTransaction.currentState == Committed)
+    assert(catalog.lastTransaction.isClosed)
+    assert(table.version() == "2")
+
+    // The UPDATE was actually executed, not just planned.
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, -1, "hr"), // updated
+        Row(2, 200, "software"))) // unchanged
+  }
+
+  test("EXPLAIN UPDATE SQL with transactional checks") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    // EXPLAIN UPDATE only plans the command, it does not execute the write.
+    sql(s"EXPLAIN UPDATE $tableNameAsString SET salary = -1 WHERE dep = 'hr'")
+
+    // A transaction should not have started at all.
+    assert(catalog.transaction === null)
+
+    // The UPDATE was not executed. Data is unchanged.
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, 100, "hr"),
+        Row(2, 200, "software")))
+  }
+
+  test("SPARK-57681: update with dynamic options") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    checkRowLevelOperationOptions(
+      sql(s"UPDATE $tableNameAsString WITH " +
+        s"(`load-option` = 'load-value', `write-option` = 'write-value') " +
+        s"SET salary = -1 WHERE pk = 1"),
+      "load-option" -> "load-value",
+      "write-option" -> "write-value")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, -1, "hr") :: Row(2, 200, "software") :: Nil)
+  }
+
+  test("SPARK-57681: update with dynamic options and a subquery on the same table") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    checkRowLevelOperationOptions(
+      sql(s"UPDATE $tableNameAsString WITH (`write.split-size` = 10) SET salary = -1 " +
+        s"WHERE pk IN (SELECT pk FROM $tableNameAsString WHERE dep = 'hr')"),
+      "write.split-size" -> "10")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, -1, "hr") :: Row(2, 200, "software") :: Row(3, -1, "hr") :: Nil)
+  }
+
+  test("SPARK-58330: update keeps its own options when a subquery references the same table " +
+    "with different options") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    // The target and the WHERE subquery reference the same table with different options; they
+    // share one per-query relation-cache entry. Each reference must keep its own options.
+    val Seq(qe) = withQueryExecutionsCaptured(spark) {
+      sql(s"UPDATE $tableNameAsString WITH (`write.split-size` = 10) SET salary = -1 " +
+        s"WHERE pk IN (SELECT pk FROM $tableNameAsString WITH (`split-size` = 5) WHERE dep = 'hr')")
+    }
+
+    // target write relation carries only its own option
+    val writeRelation = qe.optimizedPlan.collectFirst {
+      case rd: ReplaceData => rd.table
+      case wd: WriteDelta => wd.table
+    }.getOrElse(fail("couldn't find row-level operation in optimized plan"))
+      .asInstanceOf[DataSourceV2Relation]
+    assert(writeRelation.options.get("write.split-size") === "10", "target relation option")
+    assert(!writeRelation.options.containsKey("split-size"), "target must not see subquery option")
+
+    // the subquery scan carries only its own option
+    val subqueryOptions = qe.optimizedPlan.collect {
+      case r: DataSourceV2Relation => r.options
+      case s: DataSourceV2ScanRelation => s.relation.options
+    }.filter(_.containsKey("split-size"))
+    assert(subqueryOptions.nonEmpty, "subquery relation carrying the option was not found")
+    subqueryOptions.foreach { opts =>
+      assert(opts.get("split-size") === "5", "subquery relation option")
+      assert(!opts.containsKey("write.split-size"), "subquery must not see target option")
+    }
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, -1, "hr") :: Row(2, 200, "software") :: Row(3, -1, "hr") :: Nil)
+  }
+
+  test("SPARK-57681: update with dynamic options and a CTE on the same table") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    checkRowLevelOperationOptions(
+      sql(s"WITH hr_rows AS (SELECT pk FROM $tableNameAsString WHERE dep = 'hr') " +
+        s"UPDATE $tableNameAsString WITH (`write.split-size` = 10) SET salary = -1 " +
+        s"WHERE pk IN (SELECT pk FROM hr_rows)"),
+      "write.split-size" -> "10")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, -1, "hr") :: Row(2, 200, "software") :: Row(3, -1, "hr") :: Nil)
+  }
+
+  test("SPARK-58330: update keeps its own options when a CTE references the same table " +
+    "with different options") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    // The target and the CTE reference the same table with different options; they share one
+    // per-query relation-cache entry. Each reference must keep its own options.
+    val Seq(qe) = withQueryExecutionsCaptured(spark) {
+      sql(s"WITH hr_rows AS (SELECT pk FROM $tableNameAsString WITH (`split-size` = 5) " +
+        s"WHERE dep = 'hr') " +
+        s"UPDATE $tableNameAsString WITH (`write.split-size` = 10) SET salary = -1 " +
+        s"WHERE pk IN (SELECT pk FROM hr_rows)")
+    }
+
+    // target write relation carries only its own option
+    val writeRelation = qe.optimizedPlan.collectFirst {
+      case rd: ReplaceData => rd.table
+      case wd: WriteDelta => wd.table
+    }.getOrElse(fail("couldn't find row-level operation in optimized plan"))
+      .asInstanceOf[DataSourceV2Relation]
+    assert(writeRelation.options.get("write.split-size") === "10", "target relation option")
+    assert(!writeRelation.options.containsKey("split-size"), "target must not see CTE option")
+
+    // the CTE scan carries only its own option
+    val cteOptions = qe.optimizedPlan.collect {
+      case r: DataSourceV2Relation => r.options
+      case s: DataSourceV2ScanRelation => s.relation.options
+    }.filter(_.containsKey("split-size"))
+    assert(cteOptions.nonEmpty, "CTE relation carrying the option was not found")
+    cteOptions.foreach { opts =>
+      assert(opts.get("split-size") === "5", "CTE relation option")
+      assert(!opts.containsKey("write.split-size"), "CTE must not see target option")
+    }
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, -1, "hr") :: Row(2, 200, "software") :: Row(3, -1, "hr") :: Nil)
+  }
+
+  test("update with a SQL variable in the condition") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    withSessionVariable("target_dep") {
+      sql("DECLARE VARIABLE target_dep STRING DEFAULT 'hr'")
+      sql(s"UPDATE $tableNameAsString SET salary = 999 WHERE dep = target_dep")
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, 999, "hr") :: Row(2, 200, "software") :: Nil)
+    }
+  }
+
+  test("update with a SQL scripting local variable in the condition") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    sql(
+      s"""BEGIN
+         |  DECLARE local_dep STRING DEFAULT 'hr';
+         |  UPDATE $tableNameAsString SET salary = 999 WHERE dep = local_dep;
+         |END
+         |""".stripMargin)
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, 999, "hr") :: Row(2, 200, "software") :: Nil)
+  }
+
 }

@@ -14,38 +14,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import collections
+import io
 import math
+import pickle
 import sys
 import unittest
+from unittest.mock import MagicMock
 
 from pyspark import serializers
 from pyspark.serializers import (
-    CloudPickleSerializer,
-    CompressedSerializer,
     AutoBatchedSerializer,
     BatchedSerializer,
-    AutoSerializer,
+    CartesianDeserializer,
+    CloudPickleSerializer,
+    CompressedSerializer,
+    CPickleSerializer,
+    FlattenedValuesSerializer,
+    MarshalSerializer,
     NoOpSerializer,
     PairDeserializer,
-    FlattenedValuesSerializer,
-    CartesianDeserializer,
-    CPickleSerializer,
     UTF8Deserializer,
-    MarshalSerializer,
 )
 from pyspark.testing.utils import (
-    PySparkTestCase,
-    read_int,
-    write_int,
     ByteArrayOutput,
+    PySparkTestCase,
     have_numpy,
     have_scipy,
+    read_int,
+    write_int,
 )
 
 
 class SerializationTestCase(unittest.TestCase):
     def test_namedtuple(self):
         from collections import namedtuple
+
         from pyspark.cloudpickle import dumps, loads
 
         P = namedtuple("P", "x y")
@@ -150,7 +154,6 @@ class SerializationTestCase(unittest.TestCase):
         hash(UTF8Deserializer())
         hash(CPickleSerializer())
         hash(MarshalSerializer())
-        hash(AutoSerializer())
         hash(BatchedSerializer(CPickleSerializer()))
         hash(AutoBatchedSerializer(MarshalSerializer()))
         hash(PairDeserializer(NoOpSerializer(), UTF8Deserializer()))
@@ -158,10 +161,18 @@ class SerializationTestCase(unittest.TestCase):
         hash(CompressedSerializer(CPickleSerializer()))
         hash(FlattenedValuesSerializer(CPickleSerializer()))
 
+    def test_restricted_unpickler(self):
+        ser = CloudPickleSerializer(allowed_names=[("collections", "deque")])
+        q = collections.deque([1, 2, 3])
+        q2 = ser.loads(ser.dumps(q))
+        self.assertEqual(q, q2)
+
+        with self.assertRaises(pickle.UnpicklingError):
+            ser.loads(ser.dumps(collections.defaultdict(int)))
+
 
 @unittest.skipIf(not have_scipy, "SciPy not installed")
 class SciPyTests(PySparkTestCase):
-
     """General PySpark tests that depend on scipy"""
 
     def test_serialize(self):
@@ -175,7 +186,6 @@ class SciPyTests(PySparkTestCase):
 
 @unittest.skipIf(not have_numpy, "NumPy not installed")
 class NumPyTests(PySparkTestCase):
-
     """General PySpark tests that depend on numpy"""
 
     def test_statcounter_array(self):
@@ -212,6 +222,26 @@ class NumPyTests(PySparkTestCase):
 
 
 class SerializersTest(unittest.TestCase):
+    def test_framed_serializer_length_limit(self):
+        ser = NoOpSerializer()
+        for length in [(1 << 31) - 1, 1 << 31, (1 << 31) + 1]:
+            with self.subTest(length=length):
+                payload = MagicMock()
+                payload.__len__.return_value = length
+                stream = MagicMock()
+                if length < 1 << 31:
+                    ser.dump_stream([payload], stream)
+                    self.assertEqual(stream.write.call_count, 2)
+                    header = io.BytesIO(stream.write.call_args_list[0].args[0])
+                    self.assertEqual(serializers.read_int(header), length)
+                    stream.write.assert_called_with(payload)
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError, "can not serialize object larger than 2G"
+                    ):
+                        ser.dump_stream([payload], stream)
+                    stream.write.assert_not_called()
+
     def test_chunked_stream(self):
         original_bytes = bytearray(range(100))
         for data_length in [1, 10, 100]:
@@ -246,12 +276,6 @@ class SerializersTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.tests.test_serializers import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -21,17 +20,20 @@ import unittest
 
 import numpy as np
 
-from pyspark.util import is_remote_only
-from pyspark.testing.connectutils import should_test_connect, connect_requirement_message
-from pyspark.testing.utils import have_torch, torch_requirement_message
+from pyspark.testing.connectutils import connect_requirement_message, should_test_connect
 from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import have_torch, torch_requirement_message
+from pyspark.util import is_remote_only
 
 if should_test_connect:
+    import pandas as pd
+
     from pyspark.ml.connect.classification import (
         LogisticRegression as LORV2,
+    )
+    from pyspark.ml.connect.classification import (
         LogisticRegressionModel as LORV2Model,
     )
-    import pandas as pd
 
 
 class ClassificationTestsMixin:
@@ -248,12 +250,6 @@ class ClassificationTests(ClassificationTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.connect.test_legacy_mode_classification import *  # noqa: F401,F403
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

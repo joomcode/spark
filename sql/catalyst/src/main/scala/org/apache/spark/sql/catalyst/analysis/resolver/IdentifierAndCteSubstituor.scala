@@ -42,7 +42,9 @@ import org.apache.spark.sql.catalyst.trees.TreePattern.{
  * We only recurse into the plan if [[IdentifierAndCteSubstitutor.NODES_OF_INTEREST]] are present.
  * This is done so that [[IdentifierAndCteSubstitutor]] is fast and not invasive.
  */
-class IdentifierAndCteSubstitutor {
+class IdentifierAndCteSubstitutor
+    extends ResolverMetricTracker
+    {
   private var cteRegistry = new CteRegistry
 
   /**
@@ -54,9 +56,11 @@ class IdentifierAndCteSubstitutor {
    * in isolation.
    */
   def substitutePlan(unresolvedPlan: LogicalPlan): LogicalPlan = {
-    cteRegistry = new CteRegistry
+    recordProfile("substitutePlan") {
+      cteRegistry = new CteRegistry
 
-    substitute(unresolvedPlan)
+      substitute(unresolvedPlan)
+    }
   }
 
   private def substitute(unresolvedPlan: LogicalPlan): LogicalPlan = {
@@ -94,19 +98,17 @@ class IdentifierAndCteSubstitutor {
    */
   private def handleWith(unresolvedWith: UnresolvedWith): LogicalPlan = {
     val cteRelationsAfterSubstitution = unresolvedWith.cteRelations.map { cteRelation =>
-      val (cteName, ctePlan, maxDepth) = cteRelation
-
       cteRegistry.pushScope()
 
       val ctePlanAfter = try {
-        substitute(ctePlan).asInstanceOf[SubqueryAlias]
+        substitute(cteRelation.plan).asInstanceOf[SubqueryAlias]
       } finally {
         cteRegistry.popScope()
       }
 
-      cteRegistry.currentScope.registerCte(cteName, CTERelationDef(ctePlanAfter))
+      cteRegistry.currentScope.registerCte(cteRelation.name, CTERelationDef(ctePlanAfter))
 
-      (cteName, ctePlanAfter, maxDepth)
+      cteRelation.copy(plan = ctePlanAfter)
     }
 
     cteRegistry.pushScope()

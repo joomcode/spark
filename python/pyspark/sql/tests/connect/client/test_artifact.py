@@ -15,21 +15,22 @@
 # limitations under the License.
 #
 import hashlib
+import os
 import shutil
 import tempfile
 import unittest
-import os
+import zipfile
+import zlib
 
-from pyspark.util import is_remote_only
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import assert_true, lit, udf
 from pyspark.testing.connectutils import ReusedConnectTestCase, should_test_connect
-from pyspark.testing.sqlutils import SPARK_HOME
-from pyspark.sql.functions import udf, assert_true, lit
+from pyspark.util import is_remote_only
 
 if should_test_connect:
-    from pyspark.sql.connect.client.artifact import ArtifactManager
-    from pyspark.sql.connect.client import DefaultChannelBuilder
     from pyspark.errors import SparkRuntimeException
+    from pyspark.sql.connect.client import DefaultChannelBuilder
+    from pyspark.sql.connect.client.artifact import ArtifactManager
 
 
 class ArtifactTestsMixin:
@@ -177,9 +178,91 @@ class ArtifactTestsMixin:
             ).create()
         )
 
+    def check_list_files_and_archives(self, spark_session):
+        with tempfile.TemporaryDirectory(prefix="check_list_files_and_archives") as d:
+            file_path = os.path.join(d, "my_listed_file.txt")
+            with open(file_path, "w") as f:
+                f.write("listed")
+            pyfile_path = os.path.join(d, "my_listed_pyfile.py")
+            with open(pyfile_path, "w") as f:
+                f.write("my_func = lambda: 1")
+            archive_dir = os.path.join(d, "my_listed_archive")
+            os.mkdir(archive_dir)
+            with open(os.path.join(archive_dir, "my_file.txt"), "w") as f:
+                f.write("listed")
+            archive_path = shutil.make_archive(archive_dir, "zip", d, "my_listed_archive")
+
+            spark_session.addArtifacts(file_path, file=True)
+            spark_session.addArtifacts(pyfile_path, pyfile=True)
+            spark_session.addArtifacts(f"{archive_path}#my_listed_files", archive=True)
+            # Adding a file again does not list it twice.
+            spark_session.addArtifacts(file_path, file=True)
+
+            files = spark_session.listFiles()
+            archives = spark_session.listArchives()
+            # Python files are files, and archives are not.
+            self.assertEqual(
+                sorted(os.path.basename(p) for p in files if "my_listed_" in p),
+                ["my_listed_file.txt", "my_listed_pyfile.py"],
+            )
+            listed_archives = [p for p in archives if "my_listed_" in p]
+            self.assertEqual(len(listed_archives), 1)
+            # The fragment that names the directory of the unpacked archive is kept.
+            self.assertTrue(
+                listed_archives[0].endswith("/my_listed_archive.zip#my_listed_files"),
+                listed_archives[0],
+            )
+
+    def test_list_files_and_archives(self):
+        self.check_list_files_and_archives(self.spark)
+
+        # A session does not list the files and archives of the other sessions, and can add the
+        # same ones.
+        other_session = SparkSession.builder.remote(
+            f"sc://localhost:{DefaultChannelBuilder.default_port()}"
+        ).create()
+        self.assertFalse(any("my_listed_" in p for p in other_session.listFiles()))
+        self.assertFalse(any("my_listed_" in p for p in other_session.listArchives()))
+        # With the legacy flag, as before Spark 4.5, it lists those of every session.
+        other_session.conf.set("spark.sql.legacy.listAllSessionsResources", "true")
+        try:
+            self.assertTrue(any("my_listed_file" in p for p in other_session.listFiles()))
+            self.assertTrue(any("my_listed_archive" in p for p in other_session.listArchives()))
+        finally:
+            other_session.conf.unset("spark.sql.legacy.listAllSessionsResources")
+        self.check_list_files_and_archives(other_session)
+
+    def test_list_files_and_archives_added_with_sql(self):
+        spark_session = SparkSession.builder.remote(
+            f"sc://localhost:{DefaultChannelBuilder.default_port()}"
+        ).create()
+        with tempfile.TemporaryDirectory(prefix="test_list_files_added_with_sql") as d:
+            file_path = os.path.join(d, "my_sql_file.txt")
+            with open(file_path, "w") as f:
+                f.write("listed")
+            archive_dir = os.path.join(d, "my_sql_archive")
+            os.mkdir(archive_dir)
+            with open(os.path.join(archive_dir, "my_file.txt"), "w") as f:
+                f.write("listed")
+            archive_path = shutil.make_archive(archive_dir, "zip", d, "my_sql_archive")
+
+            spark_session.sql(f"ADD FILE '{file_path}'")
+            spark_session.sql(f"ADD ARCHIVE '{archive_path}'")
+
+            self.assertEqual(
+                [os.path.basename(p) for p in spark_session.listFiles() if "my_sql_" in p],
+                ["my_sql_file.txt"],
+            )
+            self.assertEqual(
+                [os.path.basename(p) for p in spark_session.listArchives() if "my_sql_" in p],
+                ["my_sql_archive.zip"],
+            )
+            self.assertFalse(any("my_sql_" in p for p in self.spark.listFiles()))
+            self.assertFalse(any("my_sql_" in p for p in self.spark.listArchives()))
+
 
 @unittest.skipIf(is_remote_only(), "Requires JVM access")
-class ArtifactTests(ReusedConnectTestCase, ArtifactTestsMixin):
+class ArtifactTests(ArtifactTestsMixin, ReusedConnectTestCase):
     @classmethod
     def root(cls):
         from pyspark.core.files import SparkFiles
@@ -205,15 +288,37 @@ class ArtifactTests(ReusedConnectTestCase, ArtifactTestsMixin):
     def setUpClass(cls):
         super().setUpClass()
         cls.artifact_manager: ArtifactManager = cls.spark._client._artifact_manager
-        cls.base_resource_dir = os.path.join(SPARK_HOME, "data")
-        cls.artifact_file_path = os.path.join(
-            cls.base_resource_dir,
-            "artifact-tests",
-        )
-        cls.artifact_crc_path = os.path.join(
-            cls.artifact_file_path,
-            "crc",
-        )
+        cls.artifact_file_path = tempfile.mkdtemp(prefix="artifact_tests_")
+
+        # Generate test artifacts as ZIP files with .jar extension.
+        # These are not valid JAR files (no MANIFEST.MF), but the tests only verify
+        # byte-level transfer protocol (chunking, CRC), so the .jar extension alone
+        # is sufficient to trigger the correct artifact routing (jars/ prefix).
+
+        # Generate smallJar.jar
+        small_jar_path = os.path.join(cls.artifact_file_path, "smallJar.jar")
+        with zipfile.ZipFile(small_jar_path, "w") as zf:
+            zf.writestr("dummy.txt", "hello")
+
+        # Generate largeJar.jar (>32KB for multi-chunk tests)
+        large_jar_path = os.path.join(cls.artifact_file_path, "largeJar.jar")
+        with zipfile.ZipFile(large_jar_path, "w", zipfile.ZIP_STORED) as zf:
+            for i in range(50):
+                zf.writestr(f"entry_{i}.txt", f"data_{i}" * 1000)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.artifact_file_path, ignore_errors=True)
+        super().tearDownClass()
+
+    @staticmethod
+    def _compute_crc(data):
+        """Compute per-chunk CRC32 values matching Java's CRC32."""
+        chunk_size = ArtifactManager.CHUNK_SIZE
+        crcs = []
+        for i in range(0, len(data), chunk_size):
+            crcs.append(zlib.crc32(data[i : i + chunk_size]) & 0xFFFFFFFF)
+        return crcs
 
     @classmethod
     def conf(cls):
@@ -224,8 +329,6 @@ class ArtifactTests(ReusedConnectTestCase, ArtifactTestsMixin):
     def test_basic_requests(self):
         file_name = "smallJar"
         small_jar_path = os.path.join(self.artifact_file_path, f"{file_name}.jar")
-        if not os.path.isfile(small_jar_path):
-            raise unittest.SkipTest(f"Skipped as {small_jar_path} does not exist.")
         response = self.artifact_manager._retrieve_responses(
             self.artifact_manager._create_requests(
                 small_jar_path, pyfile=False, archive=False, file=False
@@ -236,9 +339,6 @@ class ArtifactTests(ReusedConnectTestCase, ArtifactTestsMixin):
     def test_single_chunk_artifact(self):
         file_name = "smallJar"
         small_jar_path = os.path.join(self.artifact_file_path, f"{file_name}.jar")
-        small_jar_crc_path = os.path.join(self.artifact_crc_path, f"{file_name}.txt")
-        if not os.path.isfile(small_jar_path):
-            raise unittest.SkipTest(f"Skipped as {small_jar_path} does not exist.")
 
         requests = list(
             self.artifact_manager._create_requests(
@@ -257,24 +357,21 @@ class ArtifactTests(ReusedConnectTestCase, ArtifactTestsMixin):
         self.assertTrue(single_artifact.name.endswith(".jar"))
 
         self.assertEqual(os.path.join("jars", f"{file_name}.jar"), single_artifact.name)
-        with open(small_jar_crc_path) as f1, open(small_jar_path, "rb") as f2:
-            self.assertEqual(single_artifact.data.crc, int(f1.readline()))
-            self.assertEqual(single_artifact.data.data, f2.read())
+        with open(small_jar_path, "rb") as f:
+            data = f.read()
+            expected_crc = self._compute_crc(data)[0]
+            self.assertEqual(single_artifact.data.crc, expected_crc)
+            self.assertEqual(single_artifact.data.data, data)
 
     def test_chunked_artifacts(self):
-        file_name = "junitLargeJar"
+        file_name = "largeJar"
         large_jar_path = os.path.join(self.artifact_file_path, f"{file_name}.jar")
-        large_jar_crc_path = os.path.join(self.artifact_crc_path, f"{file_name}.txt")
-        if not os.path.isfile(large_jar_path):
-            raise unittest.SkipTest(f"Skipped as {large_jar_path} does not exist.")
 
         requests = list(
             self.artifact_manager._create_requests(
                 large_jar_path, pyfile=False, archive=False, file=False
             )
         )
-        # Expected chunks = roundUp( file_size / chunk_size) = 12
-        # File size of `junitLargeJar.jar` is 384581 bytes.
         large_jar_size = os.path.getsize(large_jar_path)
         expected_chunks = int(
             (large_jar_size + (ArtifactManager.CHUNK_SIZE - 1)) / ArtifactManager.CHUNK_SIZE
@@ -289,21 +386,22 @@ class ArtifactTests(ReusedConnectTestCase, ArtifactTestsMixin):
         other_requests = requests[1:]
         data_chunks = [begin_chunk.initial_chunk] + [req.chunk for req in other_requests]
 
-        with open(large_jar_crc_path) as f1, open(large_jar_path, "rb") as f2:
+        with open(large_jar_path, "rb") as f:
+            data = f.read()
+            expected_cscs = self._compute_crc(data)
             cscs = [chunk.crc for chunk in data_chunks]
-            expected_cscs = [int(line.rstrip()) for line in f1]
             self.assertEqual(cscs, expected_cscs)
 
             binaries = [chunk.data for chunk in data_chunks]
-            expected_binaries = list(iter(lambda: f2.read(ArtifactManager.CHUNK_SIZE), b""))
+            expected_binaries = [
+                data[i : i + ArtifactManager.CHUNK_SIZE]
+                for i in range(0, len(data), ArtifactManager.CHUNK_SIZE)
+            ]
             self.assertEqual(binaries, expected_binaries)
 
     def test_batched_artifacts(self):
         file_name = "smallJar"
         small_jar_path = os.path.join(self.artifact_file_path, f"{file_name}.jar")
-        small_jar_crc_path = os.path.join(self.artifact_crc_path, f"{file_name}.txt")
-        if not os.path.isfile(small_jar_path):
-            raise unittest.SkipTest(f"Skipped as {small_jar_path} does not exist.")
 
         requests = list(
             self.artifact_manager._create_requests(
@@ -325,9 +423,9 @@ class ArtifactTests(ReusedConnectTestCase, ArtifactTestsMixin):
         self.assertTrue(artifact2.name.endswith(".jar"))
 
         self.assertEqual(os.path.join("jars", f"{file_name}.jar"), artifact1.name)
-        with open(small_jar_crc_path) as f1, open(small_jar_path, "rb") as f2:
-            crc = int(f1.readline())
-            data = f2.read()
+        with open(small_jar_path, "rb") as f:
+            data = f.read()
+            crc = self._compute_crc(data)[0]
             self.assertEqual(artifact1.data.crc, crc)
             self.assertEqual(artifact1.data.data, data)
             self.assertEqual(artifact2.data.crc, crc)
@@ -335,16 +433,13 @@ class ArtifactTests(ReusedConnectTestCase, ArtifactTestsMixin):
 
     def test_single_chunked_and_chunked_artifact(self):
         file_name1 = "smallJar"
-        file_name2 = "junitLargeJar"
+        file_name2 = "largeJar"
         small_jar_path = os.path.join(self.artifact_file_path, f"{file_name1}.jar")
-        small_jar_crc_path = os.path.join(self.artifact_crc_path, f"{file_name1}.txt")
         large_jar_path = os.path.join(self.artifact_file_path, f"{file_name2}.jar")
-        large_jar_crc_path = os.path.join(self.artifact_crc_path, f"{file_name2}.txt")
         large_jar_size = os.path.getsize(large_jar_path)
-        if not os.path.isfile(small_jar_path):
-            raise unittest.SkipTest(f"Skipped as {small_jar_path} does not exist.")
-        if not os.path.isfile(large_jar_path):
-            raise unittest.SkipTest(f"Skipped as {large_jar_path} does not exist.")
+        expected_chunks = int(
+            (large_jar_size + (ArtifactManager.CHUNK_SIZE - 1)) / ArtifactManager.CHUNK_SIZE
+        )
 
         requests = list(
             self.artifact_manager._create_requests(
@@ -357,38 +452,40 @@ class ArtifactTests(ReusedConnectTestCase, ArtifactTestsMixin):
                 file=False,
             )
         )
-        # There are a total of 14 requests.
-        # The 1st request contains a single artifact - smallJar.jar (There are no
-        # other artifacts batched with it since the next one is large multi-chunk artifact)
-        # Requests 2-13 (1-indexed) belong to the transfer of junitLargeJar.jar. This includes
-        # the first "beginning chunk" and the subsequent data chunks.
-        # The last request (14) contains two smallJar.jar batched
-        # together.
-        self.assertEqual(len(requests), 1 + 12 + 1)
+        # 1st request: batch with smallJar.jar
+        # Next expected_chunks requests: chunked transfer of largeJar.jar
+        # Last request: batch with two smallJar.jar
+        self.assertEqual(len(requests), 1 + expected_chunks + 1)
 
         first_req_batch = requests[0].batch.artifacts
         self.assertEqual(len(first_req_batch), 1)
         self.assertEqual(first_req_batch[0].name, os.path.join("jars", f"{file_name1}.jar"))
-        with open(small_jar_crc_path) as f1, open(small_jar_path, "rb") as f2:
-            self.assertEqual(first_req_batch[0].data.crc, int(f1.readline()))
-            self.assertEqual(first_req_batch[0].data.data, f2.read())
+        with open(small_jar_path, "rb") as f:
+            small_data = f.read()
+            small_crc = self._compute_crc(small_data)[0]
+            self.assertEqual(first_req_batch[0].data.crc, small_crc)
+            self.assertEqual(first_req_batch[0].data.data, small_data)
 
         second_req_batch = requests[1]
         self.assertIsNotNone(second_req_batch.begin_chunk)
         begin_chunk = second_req_batch.begin_chunk
         self.assertEqual(begin_chunk.name, os.path.join("jars", f"{file_name2}.jar"))
         self.assertEqual(begin_chunk.total_bytes, large_jar_size)
-        self.assertEqual(begin_chunk.num_chunks, 12)
+        self.assertEqual(begin_chunk.num_chunks, expected_chunks)
         other_requests = requests[2:-1]
         data_chunks = [begin_chunk.initial_chunk] + [req.chunk for req in other_requests]
 
-        with open(large_jar_crc_path) as f1, open(large_jar_path, "rb") as f2:
+        with open(large_jar_path, "rb") as f:
+            large_data = f.read()
+            expected_cscs = self._compute_crc(large_data)
             cscs = [chunk.crc for chunk in data_chunks]
-            expected_cscs = [int(line.rstrip()) for line in f1]
             self.assertEqual(cscs, expected_cscs)
 
             binaries = [chunk.data for chunk in data_chunks]
-            expected_binaries = list(iter(lambda: f2.read(ArtifactManager.CHUNK_SIZE), b""))
+            expected_binaries = [
+                large_data[i : i + ArtifactManager.CHUNK_SIZE]
+                for i in range(0, len(large_data), ArtifactManager.CHUNK_SIZE)
+            ]
             self.assertEqual(binaries, expected_binaries)
 
         last_request = requests[-1]
@@ -403,13 +500,10 @@ class ArtifactTests(ReusedConnectTestCase, ArtifactTestsMixin):
         self.assertTrue(artifact2.name.endswith(".jar"))
 
         self.assertEqual(os.path.join("jars", f"{file_name1}.jar"), artifact1.name)
-        with open(small_jar_crc_path) as f1, open(small_jar_path, "rb") as f2:
-            crc = int(f1.readline())
-            data = f2.read()
-            self.assertEqual(artifact1.data.crc, crc)
-            self.assertEqual(artifact1.data.data, data)
-            self.assertEqual(artifact2.data.crc, crc)
-            self.assertEqual(artifact2.data.data, data)
+        self.assertEqual(artifact1.data.crc, small_crc)
+        self.assertEqual(artifact1.data.data, small_data)
+        self.assertEqual(artifact2.data.crc, small_crc)
+        self.assertEqual(artifact2.data.data, small_data)
 
     def test_copy_from_local_to_fs(self):
         with tempfile.TemporaryDirectory(prefix="test_copy_from_local_to_fs1") as d:
@@ -435,9 +529,30 @@ class ArtifactTests(ReusedConnectTestCase, ArtifactTestsMixin):
         self.assertEqual(actualHash, expected_hash)
         self.assertEqual(self.artifact_manager.is_cached_artifact(expected_hash), True)
 
+    def test_native_data_source_package(self):
+        with tempfile.TemporaryDirectory(prefix="test_native_data_source_package") as d:
+            package_path = os.path.join(d, "my_source.sparkpkg")
+            with open(package_path, "wb") as f:
+                f.write(b"package")
+            requests = list(
+                self.artifact_manager._create_requests(
+                    package_path, pyfile=False, archive=False, file=False
+                )
+            )
+            self.assertEqual(len(requests), 1)
+            artifacts = requests[0].batch.artifacts
+            self.assertEqual(len(artifacts), 1)
+            self.assertEqual(artifacts[0].name, os.path.join("files", "my_source.sparkpkg"))
+
     def test_add_not_existing_artifact(self):
         with tempfile.TemporaryDirectory(prefix="test_add_not_existing_artifact") as d:
             with self.assertRaises(FileNotFoundError):
                 self.artifact_manager.add_artifacts(
                     os.path.join(d, "not_existing"), file=True, pyfile=False, archive=False
                 )
+
+
+if __name__ == "__main__":
+    from pyspark.testing import main
+
+    main()

@@ -51,6 +51,11 @@ case class XmlFileFormat() extends TextBasedFileFormat with DataSourceRegister {
       options: Map[String, String],
       path: Path): Boolean = {
     val xmlOptions = getXmlOptions(sparkSession, options)
+    if (xmlOptions.archiveFormatEnabled && SupportsArchiveFormat.isArchivePath(path)) {
+      SupportsArchiveFormat.checkNoDecompressionCodec(path, xmlOptions.decompressionCodec)
+      // A tar archive is read as one sequential stream (entry by entry), so it is never split.
+      return false
+    }
     XmlDataSource(xmlOptions).isSplitable && super.isSplitable(sparkSession, options, path)
   }
 
@@ -116,14 +121,26 @@ case class XmlFileFormat() extends TextBasedFileFormat with DataSourceRegister {
     }
 
     (file: PartitionedFile) => {
-      val parser = new StaxXmlParser(
+      def parser() = new StaxXmlParser(
         actualRequiredSchema,
         xmlOptions)
-      XmlDataSource(xmlOptions).readFile(
-        broadcastedHadoopConf.value.value,
-        file,
-        parser,
-        requiredSchema)
+      // A tar archive (always a single split, see `isSplitable`) is streamed entry by entry when
+      // archive reads are enabled; otherwise the file is parsed directly. XML has no DSv2 reader,
+      // so this dispatch lives here rather than inside the shared `readFile`.
+      if (xmlOptions.archiveFormatEnabled && SupportsArchiveFormat.isArchivePath(file.toPath)) {
+        XmlDataSource(xmlOptions).readArchive(
+          broadcastedHadoopConf.value.value,
+          file,
+          () => parser(),
+          requiredSchema,
+          xmlOptions.archivePathFilterPattern)
+      } else {
+        XmlDataSource(xmlOptions).readFile(
+          broadcastedHadoopConf.value.value,
+          file,
+          parser(),
+          requiredSchema)
+      }
     }
   }
 
@@ -131,6 +148,9 @@ case class XmlFileFormat() extends TextBasedFileFormat with DataSourceRegister {
 
   override def supportDataType(dataType: DataType): Boolean = dataType match {
     case _: VariantType => true
+
+    case _: GeometryType | _: GeographyType => false
+
     case _: AtomicType => true
 
     case st: StructType => st.forall { f => supportDataType(f.dataType) }

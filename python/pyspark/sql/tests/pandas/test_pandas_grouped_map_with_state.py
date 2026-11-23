@@ -20,28 +20,27 @@ import shutil
 import string
 import sys
 import tempfile
-
 import unittest
-from typing import cast
 from decimal import Decimal
 
-from pyspark.sql.streaming.state import GroupStateTimeout, GroupState
+from pyspark.sql.streaming.state import GroupState, GroupStateTimeout
 from pyspark.sql.types import (
-    LongType,
-    StringType,
-    StructType,
-    StructField,
-    Row,
     DecimalType,
+    LongType,
+    Row,
+    StringType,
+    StructField,
+    StructType,
 )
-from pyspark.testing.sqlutils import (
-    ReusedSQLTestCase,
+from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import (
+    assertDataFrameEqual,
+    eventually,
     have_pandas,
     have_pyarrow,
     pandas_requirement_message,
     pyarrow_requirement_message,
 )
-from pyspark.testing.utils import eventually
 
 if have_pandas:
     import pandas as pd
@@ -52,7 +51,7 @@ if have_pyarrow:
 
 @unittest.skipIf(
     not have_pandas or not have_pyarrow,
-    cast(str, pandas_requirement_message or pyarrow_requirement_message),
+    pandas_requirement_message or pyarrow_requirement_message,
 )
 class GroupedApplyInPandasWithStateTestsMixin:
     @classmethod
@@ -95,10 +94,14 @@ class GroupedApplyInPandasWithStateTestsMixin:
             .start()
         )
 
-        self.assertEqual(q.name, "this_query")
-        self.assertTrue(q.isActive)
-        q.processAllAvailable()
-        self.assertTrue(q.exception() is None)
+        try:
+            self.assertEqual(q.name, "this_query")
+            self.assertTrue(q.isActive)
+            q.processAllAvailable()
+            self.assertTrue(q.exception() is None)
+        finally:
+            q.stop()
+            shutil.rmtree(input_path, ignore_errors=True)
 
     def test_apply_in_pandas_with_state_basic(self):
         def func(key, pdf_iter, state):
@@ -195,6 +198,30 @@ class GroupedApplyInPandasWithStateTestsMixin:
             assert set(batch_df.sort("key").collect()) == {Row(key=None, countAsString="1")}
 
         self._test_apply_in_pandas_with_state_basic(func, check_results)
+
+    def test_apply_in_pandas_with_state_output_batch_slicing(self):
+        # The worker packs the data rows (5 per group) and state rows (1 per group) of the groups
+        # in a partition into one output batch. Its data and state counts cover the whole batch,
+        # so it must not be sliced by the configs below.
+        def func(key, pdf_iter, state):
+            state.update((1,))
+            yield pd.DataFrame(
+                {"key": [f"{key[0]}_{i}" for i in range(5)], "countAsString": list("01234")}
+            )
+
+        expected = [
+            Row(key=f"{k}_{i}", countAsString=str(i)) for k in ["hello", "this"] for i in range(5)
+        ]
+
+        def check_results(batch_df, _):
+            assertDataFrameEqual(batch_df, expected)
+
+        for conf in [
+            {"spark.sql.execution.arrow.maxRecordsPerOutputBatch": "3"},
+            {"spark.sql.execution.arrow.maxBytesPerOutputBatch": "3"},
+        ]:
+            with self.subTest(conf=conf), self.sql_conf(conf):
+                self._test_apply_in_pandas_with_state_basic(func, check_results)
 
     def test_apply_in_pandas_with_state_python_worker_random_failure(self):
         input_path = tempfile.mkdtemp()
@@ -346,12 +373,6 @@ class GroupedApplyInPandasWithStateTests(
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.pandas.test_pandas_grouped_map_with_state import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

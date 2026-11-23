@@ -15,11 +15,11 @@
 # limitations under the License.
 #
 
-from typing import Iterator
 import itertools
 import unittest
+from typing import Iterator
 
-from pyspark.sql.functions import udf, arrow_udf, pandas_udf
+from pyspark.sql.functions import arrow_udf, pandas_udf, udf
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 from pyspark.testing.utils import (
     have_pandas,
@@ -197,12 +197,6 @@ class UDFCombinationsTests(UDFCombinationsTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.test_udf_combinations import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -20,13 +20,14 @@ package org.apache.spark.ui
 import java.util.Date
 
 import jakarta.servlet.http.{HttpServlet, HttpServletRequest, HttpServletResponse}
-import org.eclipse.jetty.servlet.ServletContextHandler
+import org.eclipse.jetty.ee10.servlet.ServletContextHandler
 
 import org.apache.spark.{SecurityManager, SparkConf, SparkContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{CLASS_NAME, WEB_URL}
 import org.apache.spark.internal.config.DRIVER_LOG_LOCAL_DIR
 import org.apache.spark.internal.config.UI._
+import org.apache.spark.launcher.SparkLauncher
 import org.apache.spark.scheduler._
 import org.apache.spark.status.AppStatusStore
 import org.apache.spark.status.api.v1._
@@ -54,6 +55,10 @@ private[spark] class SparkUI private (
   with UIRoot {
 
   val killEnabled = sc.map(_.conf.get(UI_KILL_ENABLED)).getOrElse(false)
+
+  val actionsViaGetEnabled = SparkUI.actionsViaGetEnabled(conf)
+
+  val holdEnabled = sc.map(_.conf.get(UI_HOLD_ENABLED)).getOrElse(false)
 
   var appId: String = _
 
@@ -94,9 +99,11 @@ private[spark] class SparkUI private (
     }
   }
 
+  private var jobsTab: JobsTab = _
+
   /** Initialize all components of the server. */
   def initialize(): Unit = {
-    val jobsTab = new JobsTab(this, store)
+    jobsTab = new JobsTab(this, store)
     attachTab(jobsTab)
     val stagesTab = new StagesTab(this, store)
     attachTab(stagesTab)
@@ -117,12 +124,24 @@ private[spark] class SparkUI private (
       attachHandler(PrometheusResource.getServletHandler(this))
     }
 
-    // These should be POST only, but, the YARN AM proxy won't proxy POSTs
+    // These endpoints change state, so they require the per-UI CSRF token and reject
+    // prefetch requests (see JettyUtils.createRedirectHandler). They also accept GET
+    // where a proxy in front of the UI cannot forward POST -- the token rides in the
+    // request parameters, which such proxies do forward. See SparkUI.actionsViaGetEnabled.
+    val actionHttpMethods: Set[String] =
+      if (actionsViaGetEnabled) Set("GET", "POST") else Set("POST")
     attachHandler(createRedirectHandler(
-      "/jobs/job/kill", "/jobs/", jobsTab.handleKillRequest, httpMethods = Set("GET", "POST")))
+      "/jobs/job/kill", "/jobs/", jobsTab.handleKillRequest, basePath = basePath,
+      httpMethods = actionHttpMethods, csrfToken = Some(csrfToken)))
     attachHandler(createRedirectHandler(
-      "/stages/stage/kill", "/stages/", stagesTab.handleKillRequest,
-      httpMethods = Set("GET", "POST")))
+      "/stages/stage/kill", "/stages/", stagesTab.handleKillRequest, basePath = basePath,
+      httpMethods = actionHttpMethods, csrfToken = Some(csrfToken)))
+    attachHandler(createRedirectHandler(
+      "/jobs/hold", "/jobs/", jobsTab.handleHoldRequest, basePath = basePath,
+      httpMethods = actionHttpMethods, csrfToken = Some(csrfToken)))
+    attachHandler(createRedirectHandler(
+      "/jobs/resume", "/jobs/", jobsTab.handleResumeRequest, basePath = basePath,
+      httpMethods = actionHttpMethods, csrfToken = Some(csrfToken)))
   }
 
   initialize()
@@ -164,6 +183,7 @@ private[spark] class SparkUI private (
   /** Stop the server behind this web interface. Only valid after bind(). */
   override def stop(): Unit = {
     super.stop()
+    Option(jobsTab).foreach(_.stop())
     logInfo(log"Stopped Spark web UI at ${MDC(WEB_URL, webUrl)}")
   }
 
@@ -227,6 +247,16 @@ private[spark] abstract class SparkUITab(parent: SparkUI, prefix: String)
   def appName: String = parent.appName
 
   def appSparkVersion: String = parent.appSparkVersion
+
+  def sparkUser: String = parent.getSparkUser
+
+  def appStartTime: Long = {
+    try {
+      parent.store.applicationInfo().attempts.head.startTime.getTime
+    } catch {
+      case _: Exception => System.currentTimeMillis()
+    }
+  }
 }
 
 private[spark] object SparkUI {
@@ -235,6 +265,16 @@ private[spark] object SparkUI {
 
   def getUIPort(conf: SparkConf): Int = {
     conf.get(UI_PORT)
+  }
+
+  /**
+   * Whether the state-changing endpoints (kill, hold, resume) accept GET as well as POST.
+   * Unset, this follows the cluster manager: on for YARN, whose ResourceManager/AM proxy
+   * does not forward POST (SPARK-6846), and off everywhere else.
+   */
+  def actionsViaGetEnabled(conf: SparkConf): Boolean = {
+    conf.get(UI_ACTIONS_VIA_GET_ENABLED)
+      .getOrElse(conf.get(SparkLauncher.SPARK_MASTER, null) == "yarn")
   }
 
   /**

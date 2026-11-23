@@ -20,17 +20,17 @@ import uuid
 from datetime import datetime
 
 from pyspark import Row
+from pyspark.sql.functions import col, count, lit
 from pyspark.sql.streaming import StreamingQueryListener
 from pyspark.sql.streaming.listener import (
-    QueryStartedEvent,
     QueryProgressEvent,
+    QueryStartedEvent,
     QueryTerminatedEvent,
     SinkProgress,
     SourceProgress,
     StateOperatorProgress,
     StreamingQueryProgress,
 )
-from pyspark.sql.functions import count, col, lit
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 
 
@@ -312,7 +312,12 @@ class StreamingListenerTests(StreamingListenerTestsMixin, ReusedSQLTestCase):
         )
         self.assertEqual(
             get_number_of_public_methods("org.apache.spark.sql.streaming.StateOperatorProgress"),
-            27,
+            # SPARK-56537: bumped from 27 to 30 due to the new snapshotCustomMetricNames
+            # constructor parameter (getter + synthetic default) and the new internal
+            # copyForNoExecution() method on StateOperatorProgress. Both are non-public
+            # API (private[spark] / private[sql]) so they are not mirrored on the
+            # Python side; only the count needs updating.
+            30,
             msg,
         )
         self.assertEqual(
@@ -370,6 +375,7 @@ class StreamingListenerTests(StreamingListenerTestsMixin, ReusedSQLTestCase):
 
             try:
                 self.spark.streams.addListener(test_listener)
+                self.spark.sparkContext.addJobTag("listener-job-tag")
 
                 df = self.spark.readStream.format("rate").option("rowsPerSecond", 10).load()
 
@@ -394,6 +400,7 @@ class StreamingListenerTests(StreamingListenerTestsMixin, ReusedSQLTestCase):
                 self.spark.sparkContext._jsc.sc().listenerBus().waitUntilEmpty()
 
                 self.check_start_event(start_event)
+                self.assertIn("listener-job-tag", start_event.jobTags)
                 self.check_progress_event(progress_event, True)
                 self.check_terminated_event(terminated_event)
 
@@ -413,9 +420,12 @@ class StreamingListenerTests(StreamingListenerTestsMixin, ReusedSQLTestCase):
                         self.fail("Not getting terminated event after 50 seconds")
                 q.stop()
                 self.spark.sparkContext._jsc.sc().listenerBus().waitUntilEmpty()
-                self.check_terminated_event(terminated_event, "ZeroDivisionError")
+                self.check_terminated_event(
+                    terminated_event, "ZeroDivisionError", errorClass="PYTHON_EXCEPTION"
+                )
 
             finally:
+                self.spark.sparkContext.clearJobTags()
                 self.spark.streams.removeListener(test_listener)
 
         verify(TestListenerV1())
@@ -669,14 +679,6 @@ class StreamingListenerTests(StreamingListenerTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
+    from pyspark.testing import main
 
-    from pyspark.sql.tests.streaming.test_streaming_listener import *  # noqa: F401
-
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -14,43 +14,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import contextlib
+import functools
+import os
 import shutil
 import tempfile
-import os
-import functools
 import unittest
 import uuid
-import contextlib
 from typing import Callable, Optional
 
 from pyspark import Row, SparkConf
 from pyspark.loose_version import LooseVersion
-from pyspark.util import is_remote_only
-from pyspark.testing.utils import (
-    have_pandas,
-    pandas_requirement_message,
-    pyarrow_requirement_message,
-    have_graphviz,
-    graphviz_requirement_message,
-    grpc_requirement_message,
-    have_grpc,
-    grpc_status_requirement_message,
-    have_grpc_status,
-    googleapis_common_protos_requirement_message,
-    have_googleapis_common_protos,
-    connect_requirement_message,
-    should_test_connect,
-    PySparkErrorTestUtils,
-)
-from pyspark.testing.sqlutils import SQLTestUtils
 from pyspark.sql.session import SparkSession as PySparkSession
-
+from pyspark.testing.sqlutils import SQLTestUtils
+from pyspark.testing.utils import (
+    PySparkBaseTestCase,
+    PySparkErrorTestUtils,
+    connect_requirement_message,
+    have_pandas,
+    should_test_connect,
+)
+from pyspark.util import is_remote_only
 
 if should_test_connect:
-    from pyspark.sql.connect.dataframe import DataFrame
-    from pyspark.sql.connect.plan import Read, Range, SQL, LogicalPlan
-    from pyspark.sql.connect.session import SparkSession
     import pyspark.sql.connect.proto as pb2
+    from pyspark.sql.connect.dataframe import DataFrame
+    from pyspark.sql.connect.plan import SQL, LogicalPlan, Range, Read
+    from pyspark.sql.connect.session import SparkSession
 
 
 class MockRemoteSession:
@@ -72,7 +62,7 @@ class MockRemoteSession:
 
 
 @unittest.skipIf(not should_test_connect, connect_requirement_message)
-class PlanOnlyTestFixture(unittest.TestCase, PySparkErrorTestUtils):
+class PlanOnlyTestFixture(PySparkBaseTestCase, PySparkErrorTestUtils):
     if should_test_connect:
 
         class MockDF(DataFrame):
@@ -149,7 +139,7 @@ class PlanOnlyTestFixture(unittest.TestCase, PySparkErrorTestUtils):
 
 
 @unittest.skipIf(not should_test_connect, connect_requirement_message)
-class ReusedConnectTestCase(unittest.TestCase, SQLTestUtils, PySparkErrorTestUtils):
+class ReusedConnectTestCase(PySparkBaseTestCase, SQLTestUtils, PySparkErrorTestUtils):
     """
     Spark Connect version of :class:`pyspark.testing.sqlutils.ReusedSQLTestCase`.
     """
@@ -177,6 +167,8 @@ class ReusedConnectTestCase(unittest.TestCase, SQLTestUtils, PySparkErrorTestUti
 
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
+
         # This environment variable is for interrupting hanging ML-handler and making the
         # tests fail fast.
         os.environ["SPARK_CONNECT_ML_HANDLER_INTERRUPTION_TIMEOUT_MINUTES"] = "5"
@@ -197,8 +189,11 @@ class ReusedConnectTestCase(unittest.TestCase, SQLTestUtils, PySparkErrorTestUti
 
     @classmethod
     def tearDownClass(cls):
-        shutil.rmtree(cls.tempdir.name, ignore_errors=True)
-        cls.spark.stop()
+        try:
+            shutil.rmtree(cls.tempdir.name, ignore_errors=True)
+            cls.spark.stop()
+        finally:
+            super().tearDownClass()
 
     def setUp(self) -> None:
         # force to clean up the ML cache before each test
@@ -231,7 +226,7 @@ class ReusedConnectTestCase(unittest.TestCase, SQLTestUtils, PySparkErrorTestUti
     not should_test_connect or is_remote_only(),
     connect_requirement_message or "Requires JVM access",
 )
-class ReusedMixedTestCase(ReusedConnectTestCase, SQLTestUtils):
+class ReusedMixedTestCase(ReusedConnectTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()

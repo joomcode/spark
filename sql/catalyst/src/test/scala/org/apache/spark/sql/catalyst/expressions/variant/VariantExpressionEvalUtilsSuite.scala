@@ -140,6 +140,52 @@ class VariantExpressionEvalUtilsSuite extends SparkFunSuite {
     }
   }
 
+  test("SPARK-56654: reject unpaired UTF-16 surrogates in JSON strings") {
+    val invalidJsonInputs = Seq(
+      "\"\\uD835\"",                  // lone high surrogate (string value)
+      "\"\\uDC00\"",                  // lone low surrogate (string value)
+      "\"\\uD835x\\uDC00\"",          // surrogates separated by non-surrogate
+      "\"\\uD835\\uD835\"",           // two high surrogates in a row
+      "\"prefix \\uD835\"",           // trailing lone high surrogate
+      "{\"\\uD835\":1}",              // lone surrogate in an object key
+      "[\"ok\", \"\\uDC00\"]"         // lone surrogate inside an array element
+    )
+    for (json <- invalidJsonInputs) {
+      checkError(
+        exception = intercept[SparkThrowable] {
+          VariantExpressionEvalUtils.parseJson(UTF8String.fromString(json),
+            allowDuplicateKeys = false)
+        },
+        condition = "MALFORMED_RECORD_IN_PARSING.WITHOUT_SUGGESTION",
+        parameters = Map("badRecord" -> json, "failFastMode" -> "FAILFAST")
+      )
+      val tryResult = VariantExpressionEvalUtils.parseJson(UTF8String.fromString(json),
+        allowDuplicateKeys = false, failOnError = false)
+      assert(tryResult === null)
+    }
+    val validJsonInputs = Seq(
+      "\"\\uD83D\\uDE05\"",           // U+1F605 GRINNING FACE WITH SWEAT
+      "\"\\uD835\\uDC00\"",           // U+1D400 MATHEMATICAL BOLD CAPITAL A
+      "{\"\\uD83D\\uDE05\":1}",       // surrogate pair in an object key
+      "[\"\\uD835\\uDC00\"]"          // surrogate pair inside an array
+    )
+    for (json <- validJsonInputs) {
+      val parsed = VariantExpressionEvalUtils.parseJson(UTF8String.fromString(json),
+        allowDuplicateKeys = false)
+      assert(parsed != null, s"expected non-null variant for $json")
+    }
+  }
+
+  test("SPARK-56654: legacy mode accepts unpaired surrogates") {
+    val json = "\"\\uD835\""
+    val parsed = VariantExpressionEvalUtils.parseJson(UTF8String.fromString(json),
+      allowDuplicateKeys = false, validateUnicodeInJsonParsing = false)
+    assert(parsed != null)
+    val tryParsed = VariantExpressionEvalUtils.parseJson(UTF8String.fromString(json),
+      allowDuplicateKeys = false, failOnError = false, validateUnicodeInJsonParsing = false)
+    assert(tryParsed != null)
+  }
+
   test("isVariantNull") {
     def check(json: String, expected: Boolean): Unit = {
       if (json != null) {
@@ -176,5 +222,39 @@ class VariantExpressionEvalUtilsSuite extends SparkFunSuite {
     check("[{\"a\" : 13}, \"spark\"]", expected = false)
     // Object
     check("[{\"a\" : 13, \"b\" : null}]", expected = false)
+  }
+
+  test("canonicalizeVariant reuses canonical input") {
+    val inputs = Seq(
+      new VariantVal(Array(primitiveHeader(NULL)), Array[Byte](VERSION, 0, 0)),
+      new VariantVal(Array(primitiveHeader(INT1), 1), Array[Byte](VERSION, 0, 0)),
+      new VariantVal(
+        Array(objectHeader(false, 1, 1), 2, 0, 1, 0, 2, 4,
+          primitiveHeader(INT1), 1, primitiveHeader(INT1), 2),
+        Array[Byte](VERSION, 2, 0, 1, 2, 'a', 'b')))
+
+    inputs.foreach { input =>
+      assert(VariantExpressionEvalUtils.canonicalizeVariant(input) eq input)
+    }
+  }
+
+  test("canonicalizeVariant rebuilds without mutating input") {
+    val input = new VariantVal(
+      Array(objectHeader(false, 1, 1), 2, 1, 0, 2, 0, 4,
+        primitiveHeader(INT1), 2, primitiveHeader(INT1), 1),
+      Array[Byte](VERSION, 2, 0, 1, 2, 'b', 'a'))
+    val originalValue = input.getValue.clone()
+    val originalMetadata = input.getMetadata.clone()
+    val expected = new VariantVal(
+      Array(objectHeader(false, 1, 1), 2, 0, 1, 0, 2, 4,
+        primitiveHeader(INT1), 1, primitiveHeader(INT1), 2),
+      Array[Byte](VERSION, 2, 0, 1, 2, 'a', 'b'))
+
+    val result = VariantExpressionEvalUtils.canonicalizeVariant(input)
+    assert(result ne input)
+    assert(result === expected)
+    assert(input.getValue === originalValue)
+    assert(input.getMetadata === originalMetadata)
+    assert(VariantExpressionEvalUtils.canonicalizeVariant(result) eq result)
   }
 }

@@ -27,11 +27,13 @@ import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.SecureRandom
-import java.util.{HexFormat, Locale, Properties, Random, UUID}
+import java.util.{Collections, HexFormat, Locale, Properties, Random, UUID}
 import java.util.concurrent._
 import java.util.concurrent.TimeUnit.NANOSECONDS
 import java.util.zip.{GZIPInputStream, ZipInputStream}
+import javax.management.ObjectName
 
 import scala.annotation.tailrec
 import scala.collection.Map
@@ -59,8 +61,7 @@ import org.apache.hadoop.util.RunJar
 import org.apache.hadoop.yarn.conf.YarnConfiguration
 import org.apache.logging.log4j.{Level, LogManager}
 import org.apache.logging.log4j.core.LoggerContext
-import org.apache.logging.log4j.core.config.LoggerConfig
-import org.eclipse.jetty.util.MultiException
+import org.apache.logging.log4j.core.config.{Configurator, LoggerConfig}
 import org.slf4j.Logger
 
 import org.apache.spark.{SPARK_VERSION, _}
@@ -223,19 +224,53 @@ private[spark] object Utils
     writeByteBufferImpl(bb, out.write)
   }
 
+  // fromString returns a mutable set; wrap it so no future caller can mutate the shared set.
+  private val chmod700Perms =
+    Collections.unmodifiableSet(PosixFilePermissions.fromString("rwx------"))
+
   /**
    * JDK equivalent of `chmod 700 file`.
+   *
+   * On POSIX filesystems this is a single `chmod` call, which is atomic: concurrent calls on
+   * the same path cannot interleave into a broken permission set, unlike the `File.set*`
+   * fallback below, each call of which is a non-atomic stat-then-chmod. The POSIX call writes
+   * exactly the nine rwx bits, so it also clears setuid, setgid, and sticky bits, which the
+   * previous `File.set*` implementation kept.
    *
    * @param file the file whose permissions will be modified
    * @return true if the permissions were successfully changed, false otherwise.
    */
   def chmod700(file: File): Boolean = {
-    file.setReadable(false, false) &&
-    file.setReadable(true, true) &&
-    file.setWritable(false, false) &&
-    file.setWritable(true, true) &&
-    file.setExecutable(false, false) &&
-    file.setExecutable(true, true)
+    if (file.getPath.isEmpty) {
+      // The NIO empty path resolves to the process working directory; the File.set* sequence
+      // returned false for it, so keep that behavior rather than chmod-ing the cwd.
+      return false
+    }
+    try {
+      Files.setPosixFilePermissions(file.toPath, chmod700Perms)
+      true
+    } catch {
+      case _: UnsupportedOperationException =>
+        // Non-POSIX filesystems use this best-effort, non-atomic fallback. On Windows, these
+        // calls change nothing for a directory and return false. Attempt every operation even
+        // after a failure, and never grant group/other access.
+        val succeeded =
+          file.setReadable(false, false) &
+          file.setWritable(false, false) &
+          file.setExecutable(false, false) &
+          file.setReadable(true, true) &
+          file.setWritable(true, true) &
+          file.setExecutable(true, true)
+        if (!succeeded) {
+          // Structural on Windows: File.setReadable(false, false) always fails there (the
+          // filesystem has no read permission to revoke), so do not warn on every call.
+          logDebug(log"Failed to set permissions to 700 on ${MDC(PATH, file.getAbsolutePath)}")
+        }
+        succeeded
+      case NonFatal(e) =>
+        logWarning(log"Failed to set permissions to 700 on ${MDC(PATH, file.getAbsolutePath)}", e)
+        false
+    }
   }
 
   /**
@@ -455,38 +490,13 @@ private[spark] object Utils
     } else if (lowerSrc.endsWith(".zip")) {
       // After issue HADOOP-18145, unzip could keep file permissions.
       FileUtil.unZip(source, dest)
-    } else if (lowerSrc.endsWith(".tar.gz") || lowerSrc.endsWith(".tgz")) {
+    } else if (
+      lowerSrc.endsWith(".tar.gz") || lowerSrc.endsWith(".tgz") || lowerSrc.endsWith(".tar")) {
       FileUtil.unTar(source, dest)
-    } else if (lowerSrc.endsWith(".tar")) {
-      // TODO(SPARK-38632): should keep file permissions. Java implementation doesn't.
-      unTarUsingJava(source, dest)
     } else {
       logWarning(log"Cannot unpack ${MDC(LogKeys.FILE_NAME, source)}, " +
         log"just copying it to ${MDC(FILE_NAME2, dest)}.")
       copyRecursive(source, dest)
-    }
-  }
-
-  /**
-   * The method below was copied from `FileUtil.unTar` but uses Java-based implementation
-   * to work around a security issue, see also SPARK-38631.
-   */
-  private def unTarUsingJava(source: File, dest: File): Unit = {
-    if (!Utils.createDirectory(dest) && !dest.isDirectory) {
-      throw new IOException(s"Mkdirs failed to create $dest")
-    } else {
-      try {
-        // Should not fail because all Hadoop 2.1+ (from HADOOP-9264)
-        // have 'unTarUsingJava'.
-        val mth = classOf[FileUtil].getDeclaredMethod(
-          "unTarUsingJava", classOf[File], classOf[File], classOf[Boolean])
-        mth.setAccessible(true)
-        mth.invoke(null, source, dest, java.lang.Boolean.FALSE)
-      } catch {
-        // Re-throw the original exception.
-        case e: java.lang.reflect.InvocationTargetException if e.getCause != null =>
-          throw e.getCause
-      }
     }
   }
 
@@ -517,18 +527,22 @@ private[spark] object Utils
       in: InputStream,
       destFile: File,
       fileOverwrite: Boolean): Unit = {
-    val tempFile = File.createTempFile("fetchFileTemp", null,
-      new File(destFile.getParentFile.getAbsolutePath))
-    logInfo(log"Fetching ${MDC(LogKeys.URL, url)} to ${MDC(FILE_ABSOLUTE_PATH, tempFile)}")
-
+    var tempFile: File = null
     try {
+      tempFile = Files.createTempFile(
+        new File(destFile.getParentFile.getAbsolutePath).toPath, "fetchFileTemp", null).toFile
+      logInfo(log"Fetching ${MDC(LogKeys.URL, url)} to ${MDC(FILE_ABSOLUTE_PATH, tempFile)}")
       val out = new FileOutputStream(tempFile)
       Utils.copyStream(in, out, closeStreams = true)
       copyFile(url, tempFile, destFile, fileOverwrite, removeSourceFile = true)
     } finally {
+      // Close `in` on every path, including when creating the temp file fails. For a `spark://`
+      // URL it wraps an RPC download channel, and an unclosed channel blocks the single
+      // file-download thread once its pipe fills. Closing an already-closed stream is a no-op.
+      Utils.closeQuietly(in)
       // Catch-all for the couple of cases where for some reason we didn't move `tempFile` to
       // `destFile`.
-      if (tempFile.exists()) {
+      if (tempFile != null && tempFile.exists()) {
         tempFile.delete()
       }
     }
@@ -971,17 +985,24 @@ private[spark] object Utils
    */
   private[spark] def normalizeIpIfNeeded(host: String): String = {
     // Is this a v6 address. We ask users to add [] around v6 addresses as strs but
-    // there not always there. If it's just 0-9 and : and [] we treat it as a v6 address.
+    // they're not always there. If it's just hexadecimal digits, :, and [] we treat it as a
+    // v6 address.
     // This means some invalid addresses are treated as v6 addresses, but since they are
     // not valid hostnames it doesn't matter.
     // See https://www.rfc-editor.org/rfc/rfc1123#page-13 for context around valid hostnames.
-    val addressRe = """^\[{0,1}([0-9:]+?:[0-9]*)\]{0,1}$""".r
+    val addressRe = """^\[{0,1}([0-9a-fA-F:]+?:[0-9a-fA-F]*)\]{0,1}$""".r
     host match {
       case addressRe(unbracketed) =>
         addBracketsIfNeeded(InetAddresses.toAddrString(InetAddresses.forString(unbracketed)))
       case _ =>
         host
     }
+  }
+
+  /** Returns whether a literal IPv4 or IPv6 address binds to every local interface. */
+  private[spark] def isAnyLocalAddress(host: String): Boolean = {
+    val address = host.stripPrefix("[").stripSuffix("]")
+    InetAddresses.isInetAddress(address) && InetAddresses.forString(address).isAnyLocalAddress
   }
 
   /**
@@ -1369,10 +1390,26 @@ private[spark] object Utils
   val TRY_WITH_CALLER_STACKTRACE_FULL_STACKTRACE =
     "Full stacktrace of original doTryWithCallerStacktrace caller"
 
+  /**
+   * Exception used to preserve the original stacktrace before stitching. On subsequent accesses
+   * (not the first), this is added as a suppressed exception to show where the error originally
+   * occurred.
+   */
   class OriginalTryStackTraceException()
-    extends Exception(TRY_WITH_CALLER_STACKTRACE_FULL_STACKTRACE) {
-    var doTryWithCallerStacktraceDepth: Int = 0
-  }
+    extends Exception(TRY_WITH_CALLER_STACKTRACE_FULL_STACKTRACE)
+
+  /**
+   * Internal wrapper used to carry the original exception along with metadata needed for
+   * stacktrace stitching. This wrapper is never exposed to users.
+   *
+   * @param originalException The original exception
+   * @param depth The number of stacktrace frames below doTryWithCallerStacktrace to preserve
+   * @param originalStacktraceEx Exception holding the original stacktrace (for suppressed display)
+   */
+  class TryStackTraceWrapper(
+      val originalException: Throwable,
+      val depth: Int,
+      val originalStacktraceEx: OriginalTryStackTraceException) extends Exception(originalException)
 
   /**
    * Use Try with stacktrace substitution for the caller retrieving the error.
@@ -1380,9 +1417,8 @@ private[spark] object Utils
    * Normally in case of failure, the exception would have the stacktrace of the caller that
    * originally called doTryWithCallerStacktrace. However, we want to replace the part above
    * this function with the stacktrace of the caller who calls getTryWithCallerStacktrace.
-   * So here we save the part of the stacktrace below doTryWithCallerStacktrace, and
-   * getTryWithCallerStacktrace will stitch it with the new stack trace of the caller.
-   * The full original stack trace is kept in ex.getSuppressed.
+   * So here we wrap the exception with metadata, and getTryWithCallerStacktrace will
+   * unwrap it and stitch the stacktrace with the new caller's stack trace.
    *
    * @param f Code block to be wrapped in Try
    * @return Try with Success or Failure of the code block. Use with getTryWithCallerStacktrace.
@@ -1393,6 +1429,10 @@ private[spark] object Utils
     }
     t match {
       case Failure(ex) =>
+        // If already wrapped, return as-is (nested call)
+        if (ex.isInstanceOf[TryStackTraceWrapper]) {
+          return t
+        }
         // Note: we remove the common suffix instead of e.g. finding the call to this function, to
         // account for recursive calls with multiple doTryWithCallerStacktrace on the stack trace.
         val origStackTrace = ex.getStackTrace
@@ -1400,22 +1440,16 @@ private[spark] object Utils
         val commonSuffixLen = origStackTrace.reverse.zip(currentStackTrace.reverse).takeWhile {
           case (exElem, currentElem) => exElem == currentElem
         }.length
-        // Add the full stack trace of the original caller as the suppressed exception.
-        // It may already be there if it's a nested call to doTryWithCallerStacktrace.
-        val origEx = ex.getSuppressed.find { e =>
-          e.isInstanceOf[OriginalTryStackTraceException]
-        }.getOrElse {
-          val fullEx = new OriginalTryStackTraceException()
-          fullEx.setStackTrace(origStackTrace)
-          ex.addSuppressed(fullEx)
-          fullEx
-        }.asInstanceOf[OriginalTryStackTraceException]
-        // Update the depth of the stack of the current doTryWithCallerStacktrace, for stitching
-        // it with the stack of getTryWithCallerStacktrace.
-        origEx.doTryWithCallerStacktraceDepth = origStackTrace.size - commonSuffixLen
-      case Success(_) => // nothing
+        // Compute the depth of the "below" portion to preserve during stitching
+        val depth = origStackTrace.size - commonSuffixLen
+        // Create exception to hold original stacktrace (for suppressed on subsequent access)
+        val originalStacktraceEx = new OriginalTryStackTraceException()
+        originalStacktraceEx.setStackTrace(origStackTrace)
+        // Wrap everything
+        val wrapper = new TryStackTraceWrapper(ex, depth, originalStacktraceEx)
+        Failure(wrapper)
+      case Success(_) => t
     }
-    t
   }
 
   /**
@@ -1425,32 +1459,34 @@ private[spark] object Utils
    * below the original doTryWithCallerStacktrace which triggered it, with the caller stack trace
    * of the current caller of getTryWithCallerStacktrace.
    *
-   * Full stack trace of the original doTryWithCallerStacktrace caller can be retrieved with
-   * ```
-   * ex.getSuppressed.find { e =>
-   *   e.isInstanceOf[Utils.OriginalTryStackTraceException]
-   * }
-   * ```
-   *
+   * On subsequent accesses (not the first), the original stacktrace is added as a suppressed
+   * exception to help with debugging.
    *
    * @param t Try from doTryWithCallerStacktrace
+   * @param isFirstAccess Whether this is the first access to the Try value
    * @return Result of the Try or rethrows the failure exception with modified stacktrace.
    */
-  def getTryWithCallerStacktrace[T](t: Try[T]): T = t match {
-    case Failure(ex) =>
-      val originalStacktraceEx = ex.getSuppressed.find { e =>
-        // added in doTryWithCallerStacktrace
-        e.isInstanceOf[OriginalTryStackTraceException]
-      }.getOrElse {
-        // If we don't have the expected stacktrace information, just rethrow
-        throw ex
-      }.asInstanceOf[OriginalTryStackTraceException]
-      val belowStacktrace = originalStacktraceEx.getStackTrace
-        .take(originalStacktraceEx.doTryWithCallerStacktraceDepth)
+  def getTryWithCallerStacktrace[T](t: Try[T], isFirstAccess: Boolean = true): T = t match {
+    case Failure(wrapper: TryStackTraceWrapper) =>
+      val originalEx = wrapper.originalException
+      // Stitch the stacktrace: keep the first `depth` frames, replace the rest with current caller
+      val belowStacktrace = originalEx.getStackTrace.take(wrapper.depth)
       // We are modifying and throwing the original exception. It would be better if we could
       // return a copy, but we can't easily clone it and preserve. If this is accessed from
       // multiple threads that then look at the stack trace, this could break.
-      ex.setStackTrace(belowStacktrace ++ Thread.currentThread().getStackTrace.drop(1))
+      originalEx.setStackTrace(
+        belowStacktrace ++ Thread.currentThread().getStackTrace.drop(1))
+      // On subsequent accesses, add suppressed exception showing original stacktrace
+      if (!isFirstAccess) {
+        val alreadyAdded = originalEx.getSuppressed.exists(
+          _.isInstanceOf[OriginalTryStackTraceException])
+        if (!alreadyAdded) {
+          originalEx.addSuppressed(wrapper.originalStacktraceEx)
+        }
+      }
+      throw originalEx
+    case Failure(ex) =>
+      // Not wrapped (shouldn't happen if used correctly), just rethrow
       throw ex
     case Success(s) => s
   }
@@ -1624,7 +1660,7 @@ private[spark] object Utils
 
     logDebug("Log files: \n" + fileToLength.mkString("\n"))
 
-    val stringBuffer = new StringBuffer((endIndex - startIndex).toInt)
+    val stringBuilder = new StringBuilder((endIndex - startIndex).toInt)
     var sum = 0L
     files.zip(fileLengths).foreach { case (file, fileLength) =>
       val startIndexOfFile = sum
@@ -1645,24 +1681,24 @@ private[spark] object Utils
 
       if (startIndex <= startIndexOfFile  && endIndex >= endIndexOfFile) {
         // Case C: read the whole file
-        stringBuffer.append(offsetBytes(file.getAbsolutePath, fileLength, 0, fileToLength(file)))
+        stringBuilder.append(offsetBytes(file.getAbsolutePath, fileLength, 0, fileToLength(file)))
       } else if (startIndex > startIndexOfFile && startIndex < endIndexOfFile) {
         // Case A and B: read from [start of required range] to [end of file / end of range]
         val effectiveStartIndex = startIndex - startIndexOfFile
         val effectiveEndIndex = math.min(endIndex - startIndexOfFile, fileToLength(file))
-        stringBuffer.append(Utils.offsetBytes(
+        stringBuilder.append(Utils.offsetBytes(
           file.getAbsolutePath, fileLength, effectiveStartIndex, effectiveEndIndex))
       } else if (endIndex > startIndexOfFile && endIndex < endIndexOfFile) {
         // Case D: read from [start of file] to [end of require range]
         val effectiveStartIndex = math.max(startIndex - startIndexOfFile, 0)
         val effectiveEndIndex = endIndex - startIndexOfFile
-        stringBuffer.append(Utils.offsetBytes(
+        stringBuilder.append(Utils.offsetBytes(
           file.getAbsolutePath, fileLength, effectiveStartIndex, effectiveEndIndex))
       }
       sum += fileToLength(file)
-      logDebug(s"After processing file $file, string built is ${stringBuffer.toString}")
+      logDebug(s"After processing file $file, string built is ${stringBuilder.toString}")
     }
-    stringBuffer.toString
+    stringBuilder.toString
   }
 
   /**
@@ -1872,6 +1908,23 @@ private[spark] object Utils
   }
 
   /**
+   * Upload a file to a Hadoop-compatible filesystem.
+   */
+  def uploadFileToHadoopCompatibleFS(
+      src: Path,
+      dest: Path,
+      fs: FileSystem,
+      delSrc: Boolean = false,
+      overwrite: Boolean = true): Unit = {
+    try {
+      fs.copyFromLocalFile(delSrc, overwrite, src, dest)
+    } catch {
+      case e: IOException =>
+        throw new SparkException(s"Error uploading file ${src.getName}", e)
+    }
+  }
+
+  /**
    * Whether the underlying JVM prefer IPv6 addresses.
    */
   val preferIPv6 = "true".equals(System.getProperty("java.net.preferIPv6Addresses"))
@@ -1966,6 +2019,25 @@ private[spark] object Utils
       case _ =>
         true
     }
+  }
+
+  /**
+   * Detects the distinct messages used by supported JDKs when an array cannot grow any further.
+   * There are two known patterns:
+   *
+   *  - `Required array length 2147483639 + 626 is too large`
+   *  - `Requested array size exceeds VM limit`
+   *
+   * Unlike a heap-space OOM, this failure can be handled because retrying the same operation can
+   * never succeed.
+   */
+  def isJavaArraySizeLimitExceeded(error: Throwable): Boolean = error match {
+    case oom: OutOfMemoryError =>
+      Option(oom.getMessage).exists { message =>
+        (message.startsWith("Required array length") && message.endsWith("is too large")) ||
+          message.contains("Requested array size exceeds VM limit")
+      }
+    case _ => false
   }
 
   /** Resolve a comma-separated list of paths. */
@@ -2130,19 +2202,18 @@ private[spark] object Utils
 
   /** Return a heap dump. Used to capture dumps for the web UI */
   def getHeapHistogram(): Array[String] = {
-    val pid = String.valueOf(ProcessHandle.current().pid())
-    val jmap = System.getProperty("java.home") + "/bin/jmap"
-    val builder = new ProcessBuilder(jmap, "-histo:live", pid)
-    val p = builder.start()
-    val rows = ArrayBuffer.empty[String]
-    Utils.tryWithResource(new BufferedReader(new InputStreamReader(p.getInputStream()))) { r =>
-      var line = ""
-      while (line != null) {
-        if (line.nonEmpty) rows += line
-        line = r.readLine()
-      }
-    }
-    rows.toArray
+    // SPARK-55809: Use DiagnosticCommandMBean in-process instead of spawning jmap as
+    // a subprocess.
+    // JDK 25 (JDK-8354460) changed `jmap -histo` to use streaming output. When jmap is
+    // spawned as a subprocess, its stdout must be drained continuously; if the caller
+    // blocks on waitFor() without reading, the pipe buffer fills up and jmap hangs.
+    // DiagnosticCommandMBean runs gcClassHistogram in-process and coordinates with GC
+    // through internal JVM APIs, avoiding the subprocess pipe-buffer issue entirely.
+    val server = ManagementFactory.getPlatformMBeanServer
+    val on = new ObjectName("com.sun.management:type=DiagnosticCommand")
+    val result = server.invoke(on, "gcClassHistogram",
+      Array[AnyRef](Array[String]()), Array[String]("[Ljava.lang.String;"))
+    result.asInstanceOf[String].split("\n").filter(_.nonEmpty)
   }
 
   def getThreadDumpForThread(threadId: Long): Option[ThreadStackTrace] = {
@@ -2318,8 +2389,6 @@ private[spark] object Utils
           return true
         }
         isBindCollision(e.getCause)
-      case e: MultiException =>
-        e.getThrowables.asScala.exists(isBindCollision)
       case e: NativeIoException =>
         (e.getMessage != null && e.getMessage.matches("bind.*failed.*")) ||
           isBindCollision(e.getCause)
@@ -2347,6 +2416,23 @@ private[spark] object Utils
   def setLogLevelIfNeeded(newLogLevel: String): Unit = {
     if (newLogLevel != Utils.getLogLevel) {
       Utils.setLogLevel(Level.toLevel(newLogLevel))
+    }
+  }
+
+  /**
+   * Set the level of the loggers named by the `spark.log.level.<logger>` configs. Applied after the
+   * root level from `spark.log.level`, so it wins for those loggers.
+   */
+  def setLoggerLevels(conf: SparkConf): Unit = {
+    val levels = conf.getAllWithPrefix(SPARK_LOG_LEVEL_PREFIX).map { case (logger, level) =>
+      val upperCased = level.toUpperCase(Locale.ROOT)
+      require(SparkContext.VALID_LOG_LEVELS.contains(upperCased),
+        s"Invalid value for '$SPARK_LOG_LEVEL_PREFIX$logger'. Valid values are " +
+          SparkContext.VALID_LOG_LEVELS.mkString(","))
+      logger -> Level.toLevel(upperCased)
+    }.toMap
+    if (levels.nonEmpty) {
+      Configurator.setLevel(levels.asJava)
     }
   }
 
@@ -3062,7 +3148,8 @@ private[spark] object Utils
   def checkOffHeapEnabled(sparkConf: ReadOnlySparkConf, offHeapSize: Long): Long = {
     if (sparkConf.get(MEMORY_OFFHEAP_ENABLED)) {
       require(offHeapSize > 0,
-        s"${MEMORY_OFFHEAP_SIZE.key} must be > 0 when ${MEMORY_OFFHEAP_ENABLED.key} == true")
+        s"${MEMORY_OFFHEAP_SIZE.key} must be at least 1MiB when " +
+          s"${MEMORY_OFFHEAP_ENABLED.key} == true")
       offHeapSize
     } else {
       0
@@ -3081,8 +3168,19 @@ private[spark] object Utils
    * addressing the directory here. Also, we rely on the caller side to address any exceptions.
    */
   def unzipFilesFromFile(fs: FileSystem, dfsZipFile: Path, localDir: File): Seq[File] = {
+    val files = unzipFilesFromInputStream(fs.open(dfsZipFile), localDir)
+    logDebug(log"Unzipped from ${MDC(PATH, dfsZipFile)}\n\t${MDC(PATHS, files.mkString("\n\t"))}")
+    files
+  }
+
+  /**
+   * Decompress a zip input stream into a local dir. File names are read from the zip entries.
+   * Note, we skip addressing the directory here. Also, we rely on the caller side to address
+   * any exceptions.
+   */
+  def unzipFilesFromInputStream(inputStream: InputStream, localDir: File): Seq[File] = {
     val files = new ArrayBuffer[File]()
-    val in = new ZipInputStream(fs.open(dfsZipFile))
+    val in = new ZipInputStream(inputStream)
     var out: OutputStream = null
     try {
       var entry = in.getNextEntry()
@@ -3099,7 +3197,6 @@ private[spark] object Utils
         entry = in.getNextEntry()
       }
       in.close() // so that any error in closing does not get ignored
-      logDebug(log"Unzipped from ${MDC(PATH, dfsZipFile)}\n\t${MDC(PATHS, files.mkString("\n\t"))}")
     } finally {
       // Close everything no matter what happened
       Utils.closeQuietly(in)
@@ -3134,6 +3231,85 @@ private[spark] object Utils
       case _ if (len % 2 == 0) =>
         math.max((sortedSize(len / 2) + sortedSize(len / 2 - 1)) / 2, 1)
       case _ => math.max(sortedSize(len / 2), 1)
+    }
+  }
+
+  /**
+   * Return the n-th smallest element (0-indexed) of a long array, reordering `sizes` in place.
+   *
+   * This is an introselect: a quickselect that gives up and sorts the range still under
+   * consideration once the ranges have stopped shrinking quickly enough, so it runs in
+   * O(sizes.length) on average and in O(sizes.length * log(sizes.length)) in the worst case.
+   * Callers that only need a few order statistics should prefer it over sorting the whole array.
+   * They must not rely on the element order of `sizes` afterwards, other than that no element
+   * before index n is larger and no element after it is smaller than the returned value.
+   */
+  def nthSmallest(sizes: Array[Long], n: Int): Long = {
+    require(n >= 0 && n < sizes.length, s"n must be in [0, ${sizes.length}) but was $n")
+    var low = 0
+    var high = sizes.length - 1
+    // A well chosen pivot roughly halves the range, so a good run takes about log2(sizes.length)
+    // rounds. Inputs such as an organ pipe distribution defeat any fixed pivot choice and would
+    // make plain quickselect quadratic, so stop partitioning after twice that many rounds.
+    var remainingRounds = 2 * (32 - Integer.numberOfLeadingZeros(sizes.length))
+    while (low < high) {
+      if (remainingRounds == 0) {
+        java.util.Arrays.sort(sizes, low, high + 1)
+        low = n
+        high = n
+      } else {
+        remainingRounds -= 1
+        // The median of the first, middle and last element keeps already sorted and reverse
+        // sorted inputs, which are both common for shuffle block sizes, on the linear path.
+        val pivot = medianOfThree(sizes, low, low + (high - low) / 2, high)
+        var i = low
+        var j = high
+        while (i <= j) {
+          while (sizes(i) < pivot) i += 1
+          while (sizes(j) > pivot) j -= 1
+          if (i <= j) {
+            val tmp = sizes(i)
+            sizes(i) = sizes(j)
+            sizes(j) = tmp
+            i += 1
+            j -= 1
+          }
+        }
+        if (n <= j) {
+          high = j
+        } else if (n >= i) {
+          low = i
+        } else {
+          // The n-th element sits between the two partitions, so it is in its final position.
+          low = n
+          high = n
+        }
+      }
+    }
+    sizes(n)
+  }
+
+  /** Return the median of the elements of `sizes` at the three given positions. */
+  private def medianOfThree(sizes: Array[Long], i: Int, j: Int, k: Int): Long = {
+    val a = sizes(i)
+    val b = sizes(j)
+    val c = sizes(k)
+    if (a < b) {
+      if (b < c) b else if (a < c) c else a
+    } else {
+      if (a < c) a else if (b < c) c else b
+    }
+  }
+
+  /**
+   * Same as `median(sizes, false)`, but reorders `sizes` in place instead of sorting a copy of it.
+   */
+  def medianInPlace(sizes: Array[Long]): Long = {
+    val len = sizes.length
+    len match {
+      case _ if (len % 2 == 0) =>
+        math.max((nthSmallest(sizes, len / 2) + nthSmallest(sizes, len / 2 - 1)) / 2, 1)
+      case _ => math.max(nthSmallest(sizes, len / 2), 1)
     }
   }
 
@@ -3180,19 +3356,25 @@ private[spark] object Utils
   lazy val isShenandoahGC: Boolean = checkUseGC("UseShenandoahGC")
 
   def checkUseGC(useGCObjectStr: String): Boolean = {
-    Try {
-      val clazz = Utils.classForName("com.sun.management.HotSpotDiagnosticMXBean")
-        .asInstanceOf[Class[_ <: PlatformManagedObject]]
-      val vmOptionClazz = Utils.classForName("com.sun.management.VMOption")
-      val hotSpotDiagnosticMXBean = ManagementFactory.getPlatformMXBean(clazz)
-      val vmOptionMethod = clazz.getMethod("getVMOption", classOf[String])
-      val valueMethod = vmOptionClazz.getMethod("getValue")
-
-      val useGCObject = vmOptionMethod.invoke(hotSpotDiagnosticMXBean, useGCObjectStr)
-      val useGC = valueMethod.invoke(useGCObject).asInstanceOf[String]
-      "true".equals(useGC)
-    }.getOrElse(false)
+    getVMOptionValue(useGCObjectStr).contains("true")
   }
+
+  /**
+   * Retrieves the value of a HotSpot VM option via the HotSpotDiagnosticMXBean.
+   * Returns Some with the option value string on success, or None if the option
+   * cannot be read (e.g. on non-HotSpot JVMs or when the option does not exist).
+   */
+  def getVMOptionValue(option: String): Option[String] = Try {
+    val clazz = Utils.classForName("com.sun.management.HotSpotDiagnosticMXBean")
+      .asInstanceOf[Class[_ <: PlatformManagedObject]]
+    val vmOptionClazz = Utils.classForName("com.sun.management.VMOption")
+    val hotSpotDiagnosticMXBean = ManagementFactory.getPlatformMXBean(clazz)
+    val vmOptionMethod = clazz.getMethod("getVMOption", classOf[String])
+    val valueMethod = vmOptionClazz.getMethod("getValue")
+
+    val useGCObject = vmOptionMethod.invoke(hotSpotDiagnosticMXBean, option)
+    valueMethod.invoke(useGCObject).asInstanceOf[String]
+  }.toOption
 
   /**
    * Return a string of printStackTrace result.

@@ -22,7 +22,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 
 /** These tests exercise passing constant but non-literal OPTIONS lists, and folding them. */
-class TableOptionsConstantFoldingSuite extends QueryTest with SharedSparkSession {
+class TableOptionsConstantFoldingSuite extends SharedSparkSession {
   val prefix = "create table t (col int) using json options "
 
   /** Helper method to create a table with a OPTIONS list and then check the resulting value. */
@@ -111,5 +111,32 @@ class TableOptionsConstantFoldingSuite extends QueryTest with SharedSparkSession
       parameters = Map(
         "key" -> "k",
         "supported" -> "constant expressions"))
+  }
+
+  test("SPARK-60780: Subquery in CREATE/REPLACE TABLE OPTIONS is not a constant expression") {
+    Seq(
+      s"$prefix ('k' = (select 1))",
+      "replace table t (col int) using json options ('k' = (select 1))",
+      "create table t using json options ('k' = (select 1)) as select 1 as col",
+      "replace table t using json options ('k' = (select 1)) as select 1 as col"
+    ).foreach { statement =>
+      checkError(
+        exception = intercept[AnalysisException](sql(statement)),
+        condition = "INVALID_SQL_SYNTAX.OPTION_IS_INVALID",
+        parameters = Map(
+          "key" -> "k",
+          "supported" -> "constant expressions"))
+    }
+  }
+
+  test("SPARK-60780: Unresolved column in CREATE TABLE AS SELECT OPTIONS") {
+    checkError(
+      exception = intercept[AnalysisException](
+        sql("create table t using json options ('k' = unresolvedAttribute) as select 1 as col")),
+      condition = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
+      parameters = Map(
+        "objectName" -> "`unresolvedAttribute`",
+        "proposal" -> "`col`"),
+      queryContext = Array(ExpectedContext("", "", 41, 59, "unresolvedAttribute")))
   }
 }

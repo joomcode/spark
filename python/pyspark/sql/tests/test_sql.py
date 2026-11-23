@@ -15,7 +15,6 @@
 # limitations under the License.
 #
 
-import unittest
 
 from pyspark.sql import Row
 from pyspark.testing.sqlutils import ReusedSQLTestCase
@@ -28,7 +27,7 @@ class SQLTestsMixin:
         self.assertEqual(res[0][0], 2)
 
     def test_args_dict(self):
-        with self.tempView("test"):
+        with self.temp_view("test"):
             self.spark.range(10).createOrReplaceTempView("test")
             df = self.spark.sql(
                 "SELECT * FROM IDENTIFIER(:table_name)",
@@ -43,7 +42,7 @@ class SQLTestsMixin:
             self.assertEqual(df.tail(1), [Row(id=9)])
 
     def test_args_list(self):
-        with self.tempView("test"):
+        with self.temp_view("test"):
             self.spark.range(10).createOrReplaceTempView("test")
             df = self.spark.sql(
                 "SELECT * FROM test WHERE ? < id AND id < ?",
@@ -58,7 +57,7 @@ class SQLTestsMixin:
             self.assertEqual(df.tail(1), [Row(id=5)])
 
     def test_kwargs_literal(self):
-        with self.tempView("test"):
+        with self.temp_view("test"):
             self.spark.range(10).createOrReplaceTempView("test")
 
             df = self.spark.sql(
@@ -75,7 +74,7 @@ class SQLTestsMixin:
             self.assertEqual(df.tail(1), [Row(id=9)])
 
     def test_kwargs_literal_multiple_ref(self):
-        with self.tempView("test"):
+        with self.temp_view("test"):
             self.spark.range(10).createOrReplaceTempView("test")
 
             df = self.spark.sql(
@@ -114,8 +113,60 @@ class SQLTestsMixin:
         self.assertEqual(df1.take(1), [Row(id=5)])
         self.assertEqual(df1.tail(1), [Row(id=8)])
 
+    def test_kwargs_string_literal(self):
+        # String values are converted to SQL string literals with quotes and
+        # backslashes escaped, so they round-trip unchanged.
+        for s in [
+            "abc",
+            "",
+            "it's",
+            'say "hi"',
+            "back\\slash",
+            "C:\\new",
+            "end\\",
+            "\\'",
+            "x' OR '1'='1",
+            "line1\nline2\ttab",
+            "{not_a_field}",
+        ]:
+            with self.subTest(s=s):
+                self.assertEqual(self.spark.sql("SELECT {s} AS v", s=s).first(), Row(v=s))
+
+        df = self.spark.sql(
+            "SELECT * FROM VALUES ('a'), ('b'), ('it''s') AS t(name) WHERE name = {name}",
+            name="it's",
+        )
+        self.assertEqual(df.collect(), [Row(name="it's")])
+
+    def test_kwargs_dataframe_referenced_twice(self):
+        df = self.spark.range(3)
+        expected = [Row(a=0, b=0), Row(a=1, b=1), Row(a=2, b=2)]
+
+        # The same DataFrame referenced twice by the same name.
+        df1 = self.spark.sql(
+            "SELECT l.id AS a, r.id AS b FROM {df} l JOIN {df} r ON l.id = r.id ORDER BY a",
+            df=df,
+        )
+        self.assertEqual(df1.collect(), expected)
+
+        # The same DataFrame passed under two different names.
+        df2 = self.spark.sql(
+            "SELECT l.id AS a, r.id AS b FROM {x} l JOIN {y} r ON l.id = r.id ORDER BY a",
+            x=df,
+            y=df,
+        )
+        self.assertEqual(df2.collect(), expected)
+
+        # Different DataFrames must not share a name.
+        df3 = self.spark.sql(
+            "SELECT l.id AS a, r.id AS b FROM {x} l JOIN {y} r ON l.id + 1 = r.id ORDER BY a",
+            x=df,
+            y=self.spark.range(1, 3),
+        )
+        self.assertEqual(df3.collect(), [Row(a=0, b=1), Row(a=1, b=2)])
+
     def test_nested_view(self):
-        with self.tempView("v1", "v2", "v3", "v4"):
+        with self.temp_view("v1", "v2", "v3", "v4"):
             self.spark.range(10).createOrReplaceTempView("v1")
             self.spark.sql(
                 "SELECT * FROM IDENTIFIER(:view) WHERE id > :m",
@@ -180,12 +231,6 @@ class SQLTests(SQLTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.test_sql import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

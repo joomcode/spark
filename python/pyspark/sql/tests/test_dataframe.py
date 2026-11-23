@@ -16,55 +16,317 @@
 #
 
 import glob
+import io
 import os
 import pydoc
 import shutil
 import tempfile
-import warnings
 import unittest
-from typing import cast
-import io
+import warnings
 from contextlib import redirect_stdout
 
-from pyspark.sql import Row, functions, DataFrame
-from pyspark.sql.functions import (
-    col,
-    lit,
-    count,
-    struct,
-    date_format,
-    to_date,
-    array,
-    explode,
-    when,
-    concat,
-)
-from pyspark.sql.types import (
-    StringType,
-    IntegerType,
-    LongType,
-    StructType,
-    StructField,
-)
-from pyspark.storagelevel import StorageLevel
 from pyspark.errors import (
     AnalysisException,
     IllegalArgumentException,
     PySparkTypeError,
     PySparkValueError,
+    QueryContextType,
 )
+from pyspark.sql import DataFrame, Row, functions, is_remote
+from pyspark.sql.functions import (
+    array,
+    col,
+    count,
+    date_format,
+    explode,
+    lit,
+    struct,
+    to_date,
+)
+from pyspark.sql.types import (
+    IntegerType,
+    LongType,
+    StringType,
+    StructField,
+    StructType,
+)
+from pyspark.storagelevel import StorageLevel
 from pyspark.testing import assertDataFrameEqual
 from pyspark.testing.sqlutils import (
-    ReusedSQLTestCase,
     SPARK_HOME,
-    have_pyarrow,
+    ReusedSQLTestCase,
+)
+from pyspark.testing.utils import (
     have_pandas,
+    have_pyarrow,
     pandas_requirement_message,
     pyarrow_requirement_message,
 )
 
 
 class DataFrameTestsMixin:
+    def test_bin_by(self):
+        with self.sql_conf({"spark.sql.binByRelationOperator.enabled": "true"}):
+            df = self.spark.sql(
+                "SELECT TIMESTAMP_NTZ '2024-01-01 00:00:00' AS start, "
+                "TIMESTAMP_NTZ '2024-01-01 00:10:00' AS end, 100.0D AS value, 20.0F AS value2"
+            )
+            with self.temp_view("bin_by_input"):
+                df.createOrReplaceTempView("bin_by_input")
+                expected = self.spark.sql(
+                    "SELECT * FROM bin_by_input BIN BY (RANGE start TO end "
+                    "BIN WIDTH INTERVAL 5 MINUTES DISTRIBUTE UNIFORM (value, value2))"
+                )
+                for bound in [False, True]:
+                    with self.subTest(bound_columns=bound):
+                        result = df.binBy(
+                            df["start"] if bound else "start",
+                            df["end"] if bound else "end",
+                            functions.expr("INTERVAL 5 MINUTES"),
+                            (df["value"], df["value2"]) if bound else ["value", "value2"],
+                        )
+                        assertDataFrameEqual(result, expected)
+
+    def test_bin_by_origin_and_quoted_names(self):
+        with self.sql_conf({"spark.sql.binByRelationOperator.enabled": "true"}):
+            df = self.spark.sql(
+                "SELECT TIMESTAMP_NTZ '2024-01-01 00:00:00' AS `range.start`, "
+                "TIMESTAMP_NTZ '2024-01-01 00:10:00' AS `range``end`, 100.0D AS `v``.x`"
+            ).alias("metrics")
+            result = df.binBy(
+                "metrics.`range.start`",
+                col("metrics.`range``end`"),
+                functions.expr("INTERVAL 5 MINUTES"),
+                [df["`v``.x`"]],
+                alignTo=functions.expr("TIMESTAMP_NTZ '2024-01-01 00:02:00'"),
+                binStartName="bin.start",
+                binEndName="bin`end",
+                binDistributeRatioName="",
+            )
+            self.assertEqual(
+                result.columns, ["range.start", "range`end", "v`.x", "bin.start", "bin`end", ""]
+            )
+            self.assertEqual(
+                result.orderBy("`bin.start`").select("`v``.x`", "``").collect(),
+                [Row(20.0, 0.2), Row(50.0, 0.5), Row(30.0, 0.3)],
+            )
+
+    def test_bin_by_after_unpivot(self):
+        with self.sql_conf(
+            {
+                "spark.sql.binByRelationOperator.enabled": "true",
+                "spark.sql.analyzer.strictDataFrameColumnResolution": "false",
+            }
+        ):
+            df = self.spark.sql(
+                "SELECT TIMESTAMP_NTZ '2024-01-01 00:00:00' AS start, "
+                "TIMESTAMP_NTZ '2024-01-01 00:10:00' AS end, 100.0D AS value"
+            ).unpivot(["start", "end"], ["value"], "metric", "value")
+            result = df.binBy(
+                df["start"], df["end"], functions.expr("INTERVAL 5 MINUTES"), [df["value"]]
+            )
+            self.assertEqual(
+                result.select("metric", "value").collect(),
+                [Row("value", 50.0), Row("value", 50.0)],
+            )
+            unrelated = self.spark.sql("SELECT 200.0D AS value")
+            with self.assertRaises(AnalysisException) as error:
+                df.binBy(
+                    df["start"],
+                    df["end"],
+                    functions.expr("INTERVAL 5 MINUTES"),
+                    [unrelated["value"]],
+                ).collect()
+            self.assertEqual(
+                error.exception.getCondition(),
+                "CANNOT_RESOLVE_DATAFRAME_COLUMN"
+                if is_remote()
+                else "MISSING_ATTRIBUTES.RESOLVED_ATTRIBUTE_APPEAR_IN_OPERATION",
+            )
+
+    def test_bin_by_rejects_replaced_bound_columns(self):
+        with self.sql_conf(
+            {
+                "spark.sql.binByRelationOperator.enabled": "true",
+                "spark.sql.analyzer.strictDataFrameColumnResolution": "true",
+            }
+        ):
+            df = self.spark.sql(
+                "SELECT TIMESTAMP_NTZ '2024-01-01 00:00:00' AS start, "
+                "TIMESTAMP_NTZ '2024-01-01 00:10:00' AS end, 100.0D AS value"
+            )
+            width = functions.expr("INTERVAL 5 MINUTES")
+            condition = (
+                "CANNOT_RESOLVE_DATAFRAME_COLUMN"
+                if is_remote()
+                else "MISSING_ATTRIBUTES.RESOLVED_ATTRIBUTE_APPEAR_IN_OPERATION"
+            )
+            cases = [
+                ("start", functions.expr("TIMESTAMP_NTZ '2024-01-01 00:02:00'")),
+                ("end", functions.expr("TIMESTAMP_NTZ '2024-01-01 00:08:00'")),
+                ("value", lit(200.0)),
+            ]
+            changed = df.withColumns(dict(cases))
+            self.assertEqual(changed.binBy("start", "end", width, ["value"]).count(), 2)
+            self.assertEqual(
+                changed.binBy(changed["start"], changed["end"], width, [changed["value"]]).count(),
+                2,
+            )
+            for name, replacement in cases:
+                with self.subTest(column=name):
+                    changed = df.withColumn(name, replacement)
+                    with self.assertRaises(AnalysisException) as error:
+                        changed.binBy(df["start"], df["end"], width, [df["value"]]).collect()
+                    self.assertEqual(error.exception.getCondition(), condition)
+
+    def test_bin_by_analysis_errors(self):
+        with self.sql_conf({"spark.sql.binByRelationOperator.enabled": "true"}):
+            df = self.spark.sql(
+                "SELECT TIMESTAMP_NTZ '2024-01-01 00:00:00' AS start, "
+                "TIMESTAMP_NTZ '2024-01-01 00:10:00' AS end, 100.0D AS value"
+            )
+            cases = [
+                ({"distributeUniform": []}, "BIN_BY_MISSING_DISTRIBUTE"),
+                (
+                    {"distributeUniform": ["value", df["value"]]},
+                    "BIN_BY_DUPLICATE_DISTRIBUTE_COLUMN",
+                ),
+                (
+                    {"distributeUniform": [col("value") + 1]},
+                    "BIN_BY_REQUIRES_TOP_LEVEL_COLUMN",
+                ),
+                (
+                    {"distributeUniform": [col("missing") + 1]},
+                    "UNRESOLVED_COLUMN.WITH_SUGGESTION",
+                ),
+                (
+                    {"rangeStart": col("start").cast("timestamp")},
+                    "BIN_BY_REQUIRES_TOP_LEVEL_COLUMN",
+                ),
+                (
+                    {"alignTo": lit(None).cast("timestamp_ntz")},
+                    "BIN_BY_NULL_ARGUMENT",
+                ),
+                (
+                    {"binWidth": functions.expr("INTERVAL 0 MINUTES")},
+                    "BIN_BY_NON_POSITIVE_BIN_WIDTH",
+                ),
+            ]
+            for overrides, condition in cases:
+                with self.subTest(condition=condition, overrides=overrides):
+                    args = dict(
+                        rangeStart="start",
+                        rangeEnd="end",
+                        binWidth=functions.expr("INTERVAL 5 MINUTES"),
+                        distributeUniform=["value"],
+                    )
+                    args.update(overrides)
+                    with self.assertRaises(AnalysisException) as error:
+                        df.binBy(**args).collect()
+                    self.assertEqual(error.exception.getCondition(), condition)
+
+    def test_bin_by_result_column_handles(self):
+        for strict in ["true", "false"]:
+            with (
+                self.subTest(strict=strict),
+                self.sql_conf(
+                    {
+                        "spark.sql.binByRelationOperator.enabled": "true",
+                        "spark.sql.analyzer.strictDataFrameColumnResolution": strict,
+                    }
+                ),
+            ):
+                df = self.spark.sql(
+                    "SELECT TIMESTAMP_NTZ '2024-01-01 00:00:00' AS start, "
+                    "TIMESTAMP_NTZ '2024-01-01 00:10:00' AS end, 100.0D AS value"
+                )
+                result = df.binBy("start", "end", functions.expr("INTERVAL 5 MINUTES"), ["value"])
+                assertDataFrameEqual(
+                    result.select(result["bin_start"], result["value"]),
+                    result.select("bin_start", "value"),
+                )
+                if is_remote() and strict == "false":
+                    self.assertEqual(result.select(df["value"]).collect(), [Row(50.0), Row(50.0)])
+                else:
+                    with self.assertRaises(AnalysisException) as error:
+                        result.select(df["value"]).collect()
+                    self.assertEqual(
+                        error.exception.getCondition(),
+                        "CANNOT_RESOLVE_DATAFRAME_COLUMN"
+                        if is_remote()
+                        else "MISSING_ATTRIBUTES.RESOLVED_ATTRIBUTE_APPEAR_IN_OPERATION",
+                    )
+
+    def test_bin_by_rejects_nested_column(self):
+        with self.sql_conf(
+            {
+                "spark.sql.binByRelationOperator.enabled": "true",
+                "spark.sql.analyzer.strictDataFrameColumnResolution": "true",
+            }
+        ):
+            df = self.spark.sql(
+                "SELECT TIMESTAMP_NTZ '2024-01-01 00:00:00' AS start, "
+                "TIMESTAMP_NTZ '2024-01-01 00:10:00' AS end, 100.0D AS value"
+            ).select(struct("start").alias("s"), "end", "value")
+            for after_unpivot in [False, True]:
+                input_df = (
+                    df.unpivot(["s", "end"], ["value"], "metric", "value") if after_unpivot else df
+                )
+                for bound in [False, True]:
+                    with self.subTest(after_unpivot=after_unpivot, bound=bound):
+                        with self.assertRaises(AnalysisException) as error:
+                            input_df.binBy(
+                                input_df["s.start"] if bound else "s.start",
+                                "end",
+                                functions.expr("INTERVAL 5 MINUTES"),
+                                ["value"],
+                            ).collect()
+                        self.check_error(
+                            exception=error.exception,
+                            errorClass="BIN_BY_REQUIRES_TOP_LEVEL_COLUMN",
+                            messageParameters={"columnName": '"s.start"'},
+                        )
+
+    def test_bin_by_argument_types(self):
+        df = self.spark.range(1)
+        cases = [
+            ({"distributeUniform": "id"}, "distributeUniform", "list or tuple", "str"),
+            ({"distributeUniform": [["value"]]}, "col", "Column or str", "list"),
+            ({"distributeUniform": [("value",)]}, "col", "Column or str", "tuple"),
+            ({"binWidth": "INTERVAL 5 MINUTES"}, "binWidth", "Column", "str"),
+            ({"binWidth": None}, "binWidth", "Column", "NoneType"),
+            ({"alignTo": "origin"}, "alignTo", "Column", "str"),
+        ]
+        cases += [
+            ({name: 1}, name, "str", "int")
+            for name in ("binStartName", "binEndName", "binDistributeRatioName")
+        ]
+        for overrides, arg_name, expected_type, arg_type in cases:
+            with self.subTest(overrides=overrides):
+                args = dict(
+                    binWidth=functions.expr("INTERVAL 5 MINUTES"), distributeUniform=["value"]
+                )
+                args.update(overrides)
+                with self.assertRaises(PySparkTypeError) as error:
+                    df.binBy("start", "end", **args)
+                self.check_error(
+                    exception=error.exception,
+                    errorClass="NOT_EXPECTED_TYPE",
+                    messageParameters={
+                        "arg_name": arg_name,
+                        "expected_type": expected_type,
+                        "arg_type": arg_type,
+                    },
+                )
+
+    def test_bin_by_disabled(self):
+        with self.sql_conf({"spark.sql.binByRelationOperator.enabled": "false"}):
+            with self.assertRaises(AnalysisException) as error:
+                self.spark.range(1).binBy(
+                    "id", "id", functions.expr("INTERVAL 5 MINUTES"), ["id"]
+                ).collect()
+            self.assertEqual(error.exception.getCondition(), "UNSUPPORTED_FEATURE.BIN_BY")
+
     def test_range(self):
         self.assertEqual(self.spark.range(1, 1).count(), 0)
         self.assertEqual(self.spark.range(1, 0, -1).count(), 1)
@@ -78,8 +340,12 @@ class DataFrameTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_STR",
-            messageParameters={"arg_name": "tableName", "arg_type": "NoneType"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "str",
+                "arg_name": "tableName",
+                "arg_type": "NoneType",
+            },
         )
 
     def test_dataframe_star(self):
@@ -131,43 +397,14 @@ class DataFrameTestsMixin:
         self.assertEqual(df3.select(count(df3["*"])).columns, ["count(1)"])
         self.assertEqual(df3.select(count(col("*"))).columns, ["count(1)"])
 
-    def test_self_join(self):
-        df1 = self.spark.range(10).withColumn("a", lit(0))
-        df2 = df1.withColumnRenamed("a", "b")
-        df = df1.join(df2, df1["a"] == df2["b"])
-        self.assertTrue(df.count() == 100)
-        df = df2.join(df1, df2["b"] == df1["a"])
-        self.assertTrue(df.count() == 100)
-
-    def test_self_join_II(self):
-        df = self.spark.createDataFrame([(1, 2), (3, 4)], schema=["a", "b"])
-        df2 = df.select(df.a.alias("aa"), df.b)
-        df3 = df2.join(df, df2.b == df.b)
-        self.assertTrue(df3.columns, ["aa", "b", "a", "b"])
-        self.assertTrue(df3.count() == 2)
-
-    def test_self_join_III(self):
-        df1 = self.spark.range(10).withColumn("value", lit(1))
-        df2 = df1.union(df1)
-        df3 = df1.join(df2, df1.id == df2.id, "left")
-        self.assertTrue(df3.columns, ["id", "value", "id", "value"])
-        self.assertTrue(df3.count() == 20)
-
-    def test_self_join_IV(self):
-        df1 = self.spark.range(10).withColumn("value", lit(1))
-        df2 = df1.withColumn("value", lit(2)).union(df1.withColumn("value", lit(3)))
-        df3 = df1.join(df2, df1.id == df2.id, "right")
-        self.assertTrue(df3.columns, ["id", "value", "id", "value"])
-        self.assertTrue(df3.count() == 20)
-
     def test_lateral_column_alias(self):
         df1 = self.spark.range(10).select(
             (col("id") + lit(1)).alias("x"), (col("x") + lit(1)).alias("y")
         )
         df2 = self.spark.range(10).select(col("id").alias("x"))
         df3 = df1.join(df2, df1.x == df2.x).select(df1.y)
-        self.assertTrue(df3.columns, ["y"])
-        self.assertTrue(df3.count() == 9)
+        self.assertEqual(df3.columns, ["y"])
+        self.assertEqual(df3.count(), 9)
 
     def test_duplicated_column_names(self):
         df = self.spark.createDataFrame([(1, 2)], ["c", "c"])
@@ -200,26 +437,6 @@ class DataFrameTestsMixin:
         self.assertEqual(df.drop(col("name")).columns, ["age", "active"])
         self.assertEqual(df.drop(col("name"), col("age")).columns, ["active"])
         self.assertEqual(df.drop(col("name"), col("age"), col("random")).columns, ["active"])
-
-    def test_drop_notexistent_col(self):
-        df1 = self.spark.createDataFrame(
-            [("a", "b", "c")],
-            schema="colA string, colB string, colC string",
-        )
-        df2 = self.spark.createDataFrame(
-            [("c", "d", "e")],
-            schema="colC string, colD string, colE string",
-        )
-        df3 = df1.join(df2, df1["colC"] == df2["colC"]).withColumn(
-            "colB",
-            when(df1["colB"] == "b", concat(df1["colB"].cast("string"), lit("x"))).otherwise(
-                df1["colB"]
-            ),
-        )
-        df4 = df3.drop(df1["colB"])
-
-        self.assertEqual(df4.columns, ["colA", "colB", "colC", "colC", "colD", "colE"])
-        self.assertEqual(df4.count(), 1)
 
     def test_drop_col_from_different_dataframe(self):
         df1 = self.spark.range(10)
@@ -303,8 +520,22 @@ class DataFrameTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_DICT",
-            messageParameters={"arg_name": "colsMap", "arg_type": "tuple"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={"expected_type": "dict", "arg_name": "colsMap", "arg_type": "tuple"},
+        )
+
+    def test_sort_ascending_invalid_type(self):
+        df = self.spark.createDataFrame([("Alice", 10)], ["name", "age"])
+        with self.assertRaises(PySparkTypeError) as pe:
+            df.sort("age", ascending="asc")
+        self.check_error(
+            exception=pe.exception,
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "bool, int or list",
+                "arg_name": "ascending",
+                "arg_type": "str",
+            },
         )
 
     def test_with_columns_renamed_with_duplicated_names(self):
@@ -354,8 +585,12 @@ class DataFrameTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_LIST_OR_TUPLE",
-            messageParameters={"arg_name": "subset", "arg_type": "str"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "list or tuple",
+                "arg_name": "subset",
+                "arg_type": "str",
+            },
         )
 
         # Should raise proper error when taking non-string values
@@ -364,8 +599,12 @@ class DataFrameTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_STR",
-            messageParameters={"arg_name": "subset", "arg_type": "NoneType"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "str",
+                "arg_name": "subset",
+                "arg_type": "NoneType",
+            },
         )
 
         with self.assertRaises(PySparkTypeError) as pe:
@@ -373,8 +612,8 @@ class DataFrameTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_STR",
-            messageParameters={"arg_name": "subset", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={"expected_type": "str", "arg_name": "subset", "arg_type": "int"},
         )
 
     def test_drop_duplicates_with_ambiguous_reference(self):
@@ -449,6 +688,43 @@ class DataFrameTestsMixin:
         self.assertRaises(TypeError, self.df.withColumns, ["key"])
         self.assertRaises(Exception, self.df.withColumns)
 
+        # SPARK-60761: an empty dict returns the DataFrame unchanged
+        assertDataFrameEqual(self.df.withColumns({}), self.df)
+
+    def test_with_columns_with_dependencies(self):
+        df = self.spark.range(3).withColumns(
+            {
+                "a": col("id") + 1,
+                "b": col("a") + 1,
+                "c": col("a") + col("b"),
+                "d": col("a") + col("b") + col("c"),
+            }
+        )
+
+        assertDataFrameEqual(
+            df,
+            [
+                Row(id=0, a=1, b=2, c=3, d=6),
+                Row(id=1, a=2, b=3, c=5, d=10),
+                Row(id=2, a=3, b=4, c=7, d=14),
+            ],
+        )
+
+        with self.assertRaises(AnalysisException) as pe:
+            self.spark.range(1).withColumns(
+                {
+                    "a": col("b") - 1,
+                    "b": col("id") + 1,
+                }
+            ).collect()
+        self.check_error(
+            exception=pe.exception,
+            errorClass="UNRESOLVED_COLUMN.WITH_SUGGESTION",
+            messageParameters={"objectName": "`b`", "proposal": "`id`"},
+            query_context_type=QueryContextType.DataFrame,
+            fragment="col",
+        )
+
     def test_generic_hints(self):
         df1 = self.spark.range(10e10).toDF("id")
         df2 = self.spark.range(10e10).toDF("id")
@@ -521,8 +797,9 @@ class DataFrameTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_BOOL_OR_FLOAT_OR_INT",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "bool, float or int",
                 "arg_name": "withReplacement (optional), fraction (required) and seed (optional)",
                 "arg_type": "NoneType, NoneType, NoneType",
             },
@@ -554,8 +831,12 @@ class DataFrameTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_LIST_OF_STR",
-            messageParameters={"arg_name": "cols", "arg_type": "NoneType"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "list[str]",
+                "arg_name": "cols",
+                "arg_type": "NoneType",
+            },
         )
 
     def test_toDF_with_schema_string(self):
@@ -679,7 +960,7 @@ class DataFrameTestsMixin:
     def test_cache_table(self):
         spark = self.spark
         tables = ["tab1", "tab2", "tab3"]
-        with self.tempView(*tables):
+        with self.temp_view(*tables):
             for i, tab in enumerate(tables):
                 spark.createDataFrame([(2, i), (3, i)]).createOrReplaceTempView(tab)
                 self.assertFalse(spark.catalog.isCached(tab))
@@ -792,8 +1073,12 @@ class DataFrameTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_DATAFRAME",
-            messageParameters={"arg_name": "other", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "DataFrame",
+                "arg_name": "other",
+                "arg_type": "int",
+            },
         )
 
     def test_input_files(self):
@@ -828,8 +1113,8 @@ class DataFrameTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_INT",
-            messageParameters={"arg_name": "n", "arg_type": "bool"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={"expected_type": "int", "arg_name": "n", "arg_type": "bool"},
         )
 
         with self.assertRaises(PySparkTypeError) as pe:
@@ -837,8 +1122,8 @@ class DataFrameTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_BOOL",
-            messageParameters={"arg_name": "vertical", "arg_type": "str"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={"expected_type": "bool", "arg_name": "vertical", "arg_type": "str"},
         )
 
         with self.assertRaises(PySparkTypeError) as pe:
@@ -846,8 +1131,8 @@ class DataFrameTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_BOOL",
-            messageParameters={"arg_name": "truncate", "arg_type": "str"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={"expected_type": "bool", "arg_name": "truncate", "arg_type": "str"},
         )
 
     def test_df_merge_into(self):
@@ -877,9 +1162,7 @@ class DataFrameTestsMixin:
                         [(1, "Alice"), (2, "Bob")], ["id", "name"]
                     ).write.mode("overwrite").saveAsTable("testcat.ns1.target")
 
-                source = self.spark.createDataFrame(
-                    [(1, "Charlie"), (3, "David")], ["id", "name"]
-                )  # type: DataFrame
+                source = self.spark.createDataFrame([(1, "Charlie"), (3, "David")], ["id", "name"])  # type: DataFrame
 
                 from pyspark.sql.functions import col
 
@@ -935,7 +1218,7 @@ class DataFrameTestsMixin:
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
-        cast(str, pandas_requirement_message or pyarrow_requirement_message),
+        pandas_requirement_message or pyarrow_requirement_message,
     )
     def test_pandas_api(self):
         import pandas as pd
@@ -989,8 +1272,8 @@ class DataFrameTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_STR",
-            messageParameters={"arg_name": "colName", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={"expected_type": "str", "arg_name": "colName", "arg_type": "int"},
         )
 
     def test_where(self):
@@ -999,8 +1282,12 @@ class DataFrameTestsMixin:
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_STR",
-            messageParameters={"arg_name": "condition", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "Column or str",
+                "arg_name": "condition",
+                "arg_type": "int",
+            },
         )
 
     def test_duplicate_field_names(self):
@@ -1143,12 +1430,10 @@ class DataFrameTestsMixin:
         ):
             tbl = "testcat.t"
             with self.table(tbl):
-                self.spark.sql(
-                    f"""
+                self.spark.sql(f"""
                     CREATE TABLE {tbl} (index bigint, data string)
                     PARTITIONED BY (bucket(4, index), index)
-                    """
-                )
+                    """)
                 self.spark.sql(f"""INSERT INTO {tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')""")
 
                 df = self.spark.sql(f"""SELECT * FROM {tbl}""")
@@ -1183,8 +1468,6 @@ class DataFrameTestsMixin:
             [Row(dt="08/01/2017", month_y=i) for i in range(12)],
         )
 
-
-class DataFrameTests(DataFrameTestsMixin, ReusedSQLTestCase):
     def test_query_execution_unsupported_in_classic(self):
         with self.assertRaises(PySparkValueError) as pe:
             self.spark.range(1).executionInfo
@@ -1195,14 +1478,88 @@ class DataFrameTests(DataFrameTestsMixin, ReusedSQLTestCase):
             messageParameters={"member": "queryExecution"},
         )
 
+    def test_to_json(self):
+        df = self.spark.range(10)
+
+        with self.sql_conf({"spark.sql.pyspark.toJSON.returnDataFrame": False}):
+            from pyspark import RDD
+
+            rdd = df.toJSON()
+            self.assertIsInstance(rdd, RDD)
+            self.assertEqual(rdd.count(), 10)
+
+        with self.sql_conf({"spark.sql.pyspark.toJSON.returnDataFrame": True}):
+            df = df.toJSON()
+            self.assertIsInstance(df, DataFrame)
+            self.assertEqual(df.select("value").count(), 10)
+
+    def test_rdd_conversion_propagates_sql_conf(self):
+        # Converting a DataFrame to an RDD must run under a tracked SQL execution so
+        # that session SQLConfs are propagated to the executors, mirroring the classic
+        # Scala Dataset.rdd behavior (SPARK-50994). Otherwise the non-vectorized parquet
+        # reader on the executor side would not see spark.sql.caseSensitive and would
+        # resolve the two same-named but differently-cased columns wrongly, failing to
+        # read the file. Accessing `.rdd` eagerly materializes the shuffle map stage
+        # (the parquet scan) under adaptive execution; disabling shuffle-file cleanup
+        # (off by default outside of tests) lets `collect` reuse that materialized
+        # output instead of recomputing the scan without the propagated conf.
+        with self.sql_conf(
+            {
+                "spark.sql.caseSensitive": True,
+                "spark.sql.parquet.enableVectorizedReader": False,
+                "spark.sql.classic.shuffleDependency.fileCleanup.enabled": False,
+            }
+        ):
+            with tempfile.TemporaryDirectory(prefix="test_rdd_conversion_sql_conf") as d:
+                self.spark.createDataFrame(
+                    [(1, 1.0), (2, 2.0), (3, 3.0), (1, 1.0)], ["a", "A"]
+                ).write.format("parquet").mode("overwrite").save(d)
+
+                deduplicated = self.spark.read.parquet(d).dropDuplicates(["a"])
+
+                rows = deduplicated.rdd.collect()
+
+                self.assertEqual(
+                    sorted((row[0], row[1]) for row in rows),
+                    [(1, 1.0), (2, 2.0), (3, 3.0)],
+                )
+
+    def test_zip_with_index(self):
+        df = self.spark.createDataFrame([("a", 1), ("b", 2), ("c", 3)], ["letter", "number"])
+
+        # Default column name "index"
+        result = df.zipWithIndex()
+        self.assertEqual(result.columns, ["letter", "number", "index"])
+        rows = result.collect()
+        self.assertEqual(len(rows), 3)
+        indices = [row["index"] for row in rows]
+        self.assertEqual(sorted(indices), [0, 1, 2])
+
+        # Custom column name
+        result = df.zipWithIndex("row_id")
+        self.assertEqual(result.columns, ["letter", "number", "row_id"])
+        rows = result.collect()
+        indices = [row["row_id"] for row in rows]
+        self.assertEqual(sorted(indices), [0, 1, 2])
+
+        # Duplicate column name causes AMBIGUOUS_REFERENCE on select
+        result = df.zipWithIndex("letter")
+        with self.assertRaises(AnalysisException) as ctx:
+            result.select("letter").collect()
+        self.assertEqual(ctx.exception.getCondition(), "AMBIGUOUS_REFERENCE")
+
+        # Duplicate column name causes COLUMN_ALREADY_EXISTS on write
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(AnalysisException) as ctx:
+                result.write.parquet(d)
+            self.assertEqual(ctx.exception.getCondition(), "COLUMN_ALREADY_EXISTS")
+
+
+class DataFrameTests(DataFrameTestsMixin, ReusedSQLTestCase):
+    pass
+
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.test_dataframe import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

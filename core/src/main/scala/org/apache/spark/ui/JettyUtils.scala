@@ -18,22 +18,27 @@
 package org.apache.spark.ui
 
 import java.net.{URI, URL, URLDecoder}
-import java.util.EnumSet
+import java.nio.charset.StandardCharsets.UTF_8
+import java.security.{MessageDigest, SecureRandom}
+import java.util.{EnumSet, HexFormat, List => JList, Locale}
 
+import scala.jdk.CollectionConverters._
 import scala.language.implicitConversions
 import scala.util.Try
 import scala.xml.Node
 
-import jakarta.servlet.DispatcherType
+import jakarta.servlet.{DispatcherType, Filter, FilterChain, ServletRequest, ServletResponse}
 import jakarta.servlet.http._
+import org.eclipse.jetty.client.{Request => CRequest, Response => CResponse}
 import org.eclipse.jetty.client.HttpClient
-import org.eclipse.jetty.client.api.Response
-import org.eclipse.jetty.client.http.HttpClientTransportOverHTTP
-import org.eclipse.jetty.proxy.ProxyServlet
+import org.eclipse.jetty.client.transport.HttpClientTransportOverHTTP
+import org.eclipse.jetty.compression.server.CompressionHandler
+import org.eclipse.jetty.ee10.proxy.ProxyServlet
+import org.eclipse.jetty.ee10.servlet._
+import org.eclipse.jetty.http.{HttpField, HttpFields, HttpHeader}
 import org.eclipse.jetty.server._
-import org.eclipse.jetty.server.handler._
-import org.eclipse.jetty.server.handler.gzip.GzipHandler
-import org.eclipse.jetty.servlet._
+import org.eclipse.jetty.server.handler.{ContextHandler, ContextHandlerCollection, ErrorHandler}
+import org.eclipse.jetty.util.{Callback, URIUtil}
 import org.eclipse.jetty.util.component.LifeCycle
 import org.eclipse.jetty.util.thread.{QueuedThreadPool, ScheduledExecutorScheduler}
 import org.json4s.JValue
@@ -124,13 +129,25 @@ private[spark] object JettyUtils extends Logging {
     contextHandler
   }
 
-  /** Create a handler that always redirects the user to the given path */
+  /**
+   * Create a handler that always redirects the user to the given path.
+   *
+   * @param csrfToken when defined, mark the handler as state-changing and guard it:
+   *                  requests must carry the token as the "csrfToken" parameter or they
+   *                  are rejected with 403 (see isValidCsrfToken), prefetch requests are
+   *                  rejected with 403 (see isPrefetchRequest), and HEAD is refused with
+   *                  405 instead of being delegated to doGet. A cross-site page can
+   *                  neither read the token out of the UI's pages (same-origin policy)
+   *                  nor guess it, so it cannot forge a request. Set this for handlers
+   *                  that change state (e.g. the job/stage kill endpoints).
+   */
   def createRedirectHandler(
       srcPath: String,
       destPath: String,
       beforeRedirect: HttpServletRequest => Unit = x => (),
       basePath: String = "",
-      httpMethods: Set[String] = Set("GET")): ServletContextHandler = {
+      httpMethods: Set[String] = Set("GET"),
+      csrfToken: Option[String] = None): ServletContextHandler = {
     val prefixedDestPath = basePath + destPath
     val servlet = new HttpServlet {
       override def doGet(request: HttpServletRequest, response: HttpServletResponse): Unit = {
@@ -147,7 +164,26 @@ private[spark] object JettyUtils extends Logging {
           response.sendError(HttpServletResponse.SC_METHOD_NOT_ALLOWED)
         }
       }
+      // HEAD must be safe (RFC 9110) but HttpServlet.doHead delegates to doGet, which would
+      // run beforeRedirect; refuse to route HEAD to a state-changing handler at all.
+      protected override def doHead(req: HttpServletRequest, res: HttpServletResponse): Unit = {
+        if (csrfToken.isDefined) {
+          res.sendError(HttpServletResponse.SC_METHOD_NOT_ALLOWED)
+        } else {
+          super.doHead(req, res)
+        }
+      }
       private def doRequest(request: HttpServletRequest, response: HttpServletResponse): Unit = {
+        if (csrfToken.isDefined && isPrefetchRequest(request)) {
+          response.sendError(HttpServletResponse.SC_FORBIDDEN,
+            "Prefetch request rejected on a state-changing endpoint.")
+          return
+        }
+        if (!csrfToken.forall(isValidCsrfToken(request, _))) {
+          response.sendError(HttpServletResponse.SC_FORBIDDEN,
+            "Missing or invalid CSRF token on a state-changing endpoint.")
+          return
+        }
         beforeRedirect(request)
         // Make sure we don't end up with "//" in the middle
         val requestURL = new URI(request.getRequestURL.toString).toURL
@@ -164,6 +200,44 @@ private[spark] object JettyUtils extends Logging {
     createServletHandler(srcPath, servlet, basePath)
   }
 
+  /**
+   * True when the request identifies itself as a prefetch rather than a deliberate user
+   * navigation: Chrome and derivatives send "Sec-Purpose: prefetch" (or the older
+   * "Purpose: prefetch", and compound values such as "prefetch;prerender"), and Firefox
+   * sends "X-Moz: prefetch". State-changing endpoints reject these so that a prefetcher
+   * cannot trigger the action: in GET mode (spark.ui.actionsViaGetEnabled) the token
+   * rides in a URL the browser has seen, and a prefetch of that URL must not kill.
+   */
+  private[spark] def isPrefetchRequest(request: HttpServletRequest): Boolean = {
+    Seq("Sec-Purpose", "Purpose", "X-Moz")
+      .flatMap(h => Option(request.getHeader(h)))
+      .exists(_.toLowerCase(Locale.ROOT).contains("prefetch"))
+  }
+
+  /**
+   * A fresh token for guarding a UI's state-changing endpoints. 128 random bits, which a
+   * cross-site page cannot guess; see createRedirectHandler and isValidCsrfToken.
+   */
+  private[spark] def newCsrfToken(): String = {
+    val bytes = new Array[Byte](16)
+    new SecureRandom().nextBytes(bytes)
+    HexFormat.of().formatHex(bytes)
+  }
+
+  /**
+   * Synchronizer-token check for state-changing endpoints: the request must carry the
+   * per-UI random token (embedded in the forms the UI renders) as the
+   * "csrfToken" parameter. A cross-site page cannot read the token out of the UI's pages
+   * (same-origin policy) and cannot guess it, so forged kill/hold requests fail here
+   * regardless of which headers the browser sends or suppresses. Constant-time
+   * comparison, though the token is not exactly timing-sensitive at 128 bits.
+   */
+  private[spark] def isValidCsrfToken(request: HttpServletRequest, expected: String): Boolean = {
+    Option(request.getParameter("csrfToken")).exists { provided =>
+      MessageDigest.isEqual(provided.getBytes(UTF_8), expected.getBytes(UTF_8))
+    }
+  }
+
   /** Create a handler for serving files from a static directory */
   def createStaticHandler(resourceBase: String, path: String): ServletContextHandler = {
     val contextHandler = new ServletContextHandler
@@ -172,7 +246,7 @@ private[spark] object JettyUtils extends Logging {
     val holder = new ServletHolder(staticHandler)
     Option(Utils.getSparkClassLoader.getResource(resourceBase)) match {
       case Some(res) =>
-        holder.setInitParameter("resourceBase", res.toString)
+        holder.setInitParameter("baseResource", res.toString)
       case None =>
         throw new Exception("Could not find resource path for Web UI: " + resourceBase)
     }
@@ -206,6 +280,25 @@ private[spark] object JettyUtils extends Logging {
           .orNull
       }
 
+      override def addProxyHeaders(
+          clientRequest: HttpServletRequest,
+          proxyRequest: CRequest): Unit = {
+        super.addProxyHeaders(clientRequest, proxyRequest)
+        val path = clientRequest.getPathInfo
+        if (path != null) {
+          val prefixTrailingSlashIndex = path.indexOf('/', 1)
+          val prefix = if (prefixTrailingSlashIndex == -1) {
+            path
+          } else {
+            path.substring(0, prefixTrailingSlashIndex)
+          }
+          val existingContext = Option(clientRequest.getHeader("X-Forwarded-Context")).getOrElse("")
+          val contextPath = Option(clientRequest.getContextPath).getOrElse("")
+          val proxyContext = existingContext + contextPath + prefix
+          proxyRequest.headers(headers => headers.put("X-Forwarded-Context", proxyContext))
+        }
+      }
+
       override def newHttpClient(): HttpClient = {
         // SPARK-21176: Use the Jetty logic to calculate the number of selector threads (#CPUs/2),
         // but limit it to 8 max.
@@ -215,7 +308,7 @@ private[spark] object JettyUtils extends Logging {
 
       override def filterServerResponseHeader(
           clientRequest: HttpServletRequest,
-          serverResponse: Response,
+          serverResponse: CResponse,
           headerName: String,
           headerValue: String): String = {
         if (headerName.equalsIgnoreCase("location")) {
@@ -265,9 +358,8 @@ private[spark] object JettyUtils extends Logging {
     val server = new Server(pool)
 
     val errorHandler = new ErrorHandler()
-    errorHandler.setShowStacks(true)
-    errorHandler.setServer(server)
-    server.addBean(errorHandler)
+    errorHandler.setShowStacks(conf.get(UI_SHOW_ERROR_STACKS))
+    server.setErrorHandler(errorHandler)
 
     val collection = new ContextHandlerCollection
     conf.get(PROXY_REDIRECT_URI) match {
@@ -333,9 +425,11 @@ private[spark] object JettyUtils extends Logging {
       val securePort = sslOptions.createJettySslContextFactoryServer().map { factory =>
 
         // SPARK-45522: SniHostCheck defaulted to true since Jetty 10,
-        // this will affect the standalone deployment.
+        // this will affect the standalone deployment. Exposed via
+        // spark.ui.jetty.sniHostCheckEnabled so operators can enable
+        // it when stricter host checking is desired.
         val src = new SecureRequestCustomizer()
-        src.setSniHostCheck(false)
+        src.setSniHostCheck(conf.get(UI_JETTY_SNI_HOST_CHECK))
         httpConfig.addCustomizer(src)
 
         val securePort = sslOptions.port.getOrElse(if (port > 0) Utils.userPort(port, 400) else 0)
@@ -392,24 +486,11 @@ private[spark] object JettyUtils extends Logging {
   }
 
   private def createRedirectHttpsHandler(securePort: Int, scheme: String): ContextHandler = {
-    val redirectHandler: ContextHandler = new ContextHandler
+    val redirectHandler = new ServletContextHandler
     redirectHandler.setContextPath("/")
     redirectHandler.setVirtualHosts(toVirtualHosts(REDIRECT_CONNECTOR_NAME))
-    redirectHandler.setHandler(new AbstractHandler {
-      override def handle(
-          target: String,
-          baseRequest: Request,
-          request: HttpServletRequest,
-          response: HttpServletResponse): Unit = {
-        if (baseRequest.isSecure) {
-          return
-        }
-        val httpsURI = createRedirectURI(scheme, securePort, baseRequest)
-        response.setContentLength(0)
-        response.sendRedirect(response.encodeRedirectURL(httpsURI))
-        baseRequest.setHandled(true)
-      }
-    })
+    redirectHandler.addFilter(
+      new FilterHolder(new HttpsRedirectFilter(scheme, securePort)), "/*", null)
     redirectHandler
   }
 
@@ -441,14 +522,20 @@ private[spark] object JettyUtils extends Logging {
       headerValue: String,
       clientRequest: HttpServletRequest,
       targetUri: URI): String = {
-    val toReplace = targetUri.getScheme() + "://" + targetUri.getAuthority()
-    if (headerValue.startsWith(toReplace)) {
-      val id = clientRequest.getPathInfo.substring("/proxy/".length).takeWhile(_ != '/')
-      val headerPath = headerValue.substring(toReplace.length)
-
-      s"${clientRequest.getScheme}://${clientRequest.getHeader("host")}/proxy/$id$headerPath"
+    // As of Jetty 12, the value returned from getPathInfo doesn't contain the servlet context
+    // root, which complies with the Servlet specification.
+    val id = clientRequest.getPathInfo.substring(1).takeWhile(_ != '/')
+    val urlToId = s"${clientRequest.getScheme}://${clientRequest.getHeader("host")}/proxy/$id"
+    if (new URI(headerValue).getScheme != null) {
+      val toReplace = targetUri.getScheme() + "://" + targetUri.getAuthority()
+      if (headerValue.startsWith(toReplace)) {
+        val headerPath = headerValue.substring(toReplace.length)
+        urlToId + headerPath
+      } else {
+        null
+      }
     } else {
-      null
+      urlToId + headerValue
     }
   }
 
@@ -462,37 +549,8 @@ private[spark] object JettyUtils extends Logging {
     handler.addFilter(holder, "/*", EnumSet.allOf(classOf[DispatcherType]))
   }
 
-  private def decodeURL(url: String, encoding: String): String = {
-    if (url == null) {
-      null
-    } else {
-      URLDecoder.decode(url, encoding)
-    }
-  }
-
-  // Create a new URI from the arguments, handling IPv6 host encoding and default ports.
-  private def createRedirectURI(scheme: String, port: Int, request: Request): String = {
-    val server = request.getServerName
-    val redirectServer = if (server.contains(":") && !server.startsWith("[")) {
-      s"[${server}]"
-    } else {
-      server
-    }
-    val authority = s"$redirectServer:$port"
-    val queryEncoding = if (request.getQueryEncoding != null) {
-      request.getQueryEncoding
-    } else {
-      // By default decoding the URI as "UTF-8" should be enough for SparkUI
-      "UTF-8"
-    }
-    // The request URL can be raw or encoded here. To avoid the request URL being
-    // encoded twice, let's decode it here.
-    val requestURI = decodeURL(request.getRequestURI, queryEncoding)
-    val queryString = decodeURL(request.getQueryString, queryEncoding)
-    new URI(scheme, authority, requestURI, queryString, null).toString
-  }
-
-  def toVirtualHosts(connectors: String*): Array[String] = connectors.map("@" + _).toArray
+  def toVirtualHosts(connectors: String*): JList[String] =
+    JList.of(connectors.map("@" + _).toArray: _*)
 
 }
 
@@ -509,22 +567,23 @@ private[spark] case class ServerInfo(
     handler.setVirtualHosts(JettyUtils.toVirtualHosts(JettyUtils.SPARK_CONNECTOR_NAME))
     addFilters(handler, securityMgr)
 
-    val gzipHandler = new GzipHandler()
-    gzipHandler.setHandler(handler)
-    rootHandler.addHandler(gzipHandler)
+    val compressionHandler = new CompressionHandler()
+    compressionHandler.setHandler(handler)
+    rootHandler.addHandler(compressionHandler)
 
     if (!handler.isStarted()) {
       handler.start()
     }
-    gzipHandler.start()
+    compressionHandler.start()
   }
 
   def removeHandler(handler: ServletContextHandler): Unit = synchronized {
     // Since addHandler() always adds a wrapping gzip handler, find the container handler
     // and remove it.
-    rootHandler.getHandlers()
+    rootHandler.getHandlers.asScala
       .find { h =>
-        h.isInstanceOf[GzipHandler] && h.asInstanceOf[GzipHandler].getHandler() == handler
+        h.isInstanceOf[CompressionHandler] &&
+          h.asInstanceOf[CompressionHandler].getHandler() == handler
       }
       .foreach { h =>
         rootHandler.removeHandler(h)
@@ -597,36 +656,85 @@ private[spark] case class ServerInfo(
  * a servlet context without the trailing slash (e.g. "/jobs") - Jetty will send a redirect to the
  * same URL, but with a trailing slash.
  */
-private class ProxyRedirectHandler(_proxyUri: String) extends HandlerWrapper {
+private class ProxyRedirectHandler(_proxyUri: String) extends Handler.Wrapper {
 
   private val proxyUri = _proxyUri.stripSuffix("/")
 
-  override def handle(
-      target: String,
-      baseRequest: Request,
-      request: HttpServletRequest,
-      response: HttpServletResponse): Unit = {
-    super.handle(target, baseRequest, request, new ResponseWrapper(request, response))
+  override def handle(request: Request, response: Response, callback: Callback): Boolean = {
+    super.handle(request, new ResponseWrapper(request, response), callback)
   }
 
-  private class ResponseWrapper(
-      req: HttpServletRequest,
-      res: HttpServletResponse)
-    extends HttpServletResponseWrapper(res) {
+  private class ResponseWrapper(req: Request, res: Response) extends Response.Wrapper(req, res) {
+    override def getHeaders(): HttpFields.Mutable = {
+      new MutableFieldsWrapper(req, super.getHeaders())
+    }
+  }
 
-    override def sendRedirect(location: String): Unit = {
-      val newTarget = if (location != null) {
+  private class MutableFieldsWrapper(
+      req: Request,
+      wrapped: HttpFields.Mutable) extends HttpFields.Mutable.Wrapper(wrapped) {
+    override def onAddField(field: HttpField): HttpField = {
+      if (field.is(HttpHeader.LOCATION.asString())) {
+        val location = field.getValue
+        // null check should be done by Jetty before adding Location header.
+        assert(location != null)
         val target = new URI(location)
         // The target path should already be encoded, so don't re-encode it, just the
         // proxy address part.
         val proxyBase = UIUtils.uiRoot(req)
         val proxyPrefix = if (proxyBase.nonEmpty) s"$proxyUri$proxyBase" else proxyUri
-        s"${res.encodeURL(proxyPrefix)}${target.getPath()}"
+        val newTarget = URIUtil.encodePath(proxyPrefix) + target.getPath()
+        new HttpField(field.getName(), newTarget)
       } else {
-        null
+        field
       }
-      super.sendRedirect(newTarget)
     }
   }
+}
 
+private class HttpsRedirectFilter(scheme: String, securePort: Int) extends Filter {
+
+  override def doFilter(
+      request: ServletRequest,
+      response: ServletResponse,
+      chain: FilterChain): Unit = {
+    if (request.isSecure) {
+      return
+    }
+    val httpRequest = request.asInstanceOf[HttpServletRequest]
+    val httpResponse = response.asInstanceOf[HttpServletResponse]
+    val httpsURI = createRedirectURI(scheme, securePort, httpRequest)
+    httpResponse.setContentLength(0)
+    httpResponse.sendRedirect(httpResponse.encodeRedirectURL(httpsURI))
+  }
+
+  // Create a new URI from the arguments, handling IPv6 host encoding and default ports.
+  private def createRedirectURI(scheme: String, port: Int, request: HttpServletRequest): String = {
+    val server = request.getServerName
+    val redirectServer = if (server.contains(":") && !server.startsWith("[")) {
+      s"[$server]"
+    } else {
+      server
+    }
+    val authority = s"$redirectServer:$port"
+    val characterEncoding = if (request.getCharacterEncoding != null) {
+      request.getCharacterEncoding
+    } else {
+      // By default decoding the URI as "UTF-8" should be enough for SparkUI
+      "UTF-8"
+    }
+    // The request URL can be raw or encoded here. To avoid the request URL being
+    // encoded twice, let's decode it here.
+    val requestURI = decodeURL(request.getRequestURI, characterEncoding)
+    val queryString = decodeURL(request.getQueryString, characterEncoding)
+    new URI(scheme, authority, requestURI, queryString, null).toString
+  }
+
+  private def decodeURL(url: String, encoding: String): String = {
+    if (url == null) {
+      null
+    } else {
+      URLDecoder.decode(url, encoding)
+    }
+  }
 }

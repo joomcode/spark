@@ -20,10 +20,30 @@ package org.apache.spark.ui
 import scala.xml.{Node, Text}
 import scala.xml.Utility.trim
 
+import jakarta.servlet.http.HttpServletRequest
+import org.mockito.Mockito.{mock, when}
+
 import org.apache.spark.{ErrorMessageFormat, SparkException, SparkFunSuite, SparkThrowableHelper}
 
 class UIUtilsSuite extends SparkFunSuite {
   import UIUtils._
+
+  test("SPARK-33552: Spark UI pages declare their document language") {
+    val request = mock(classOf[HttpServletRequest])
+    val tab = mock(classOf[SparkUITab])
+    when(tab.appName).thenReturn("test")
+    when(tab.basePath).thenReturn("")
+    when(tab.headerTabs).thenReturn(Seq.empty)
+
+    val pages = Seq(
+      headerSparkPage(request, "test", Seq.empty, tab),
+      basicSparkPage(request, Seq.empty, "test"))
+
+    pages.foreach { page =>
+      assert(page.head.label === "html")
+      assert((page.head \@ "lang") === "en")
+    }
+  }
 
   test("makeDescription(plainText = false)") {
     verify(
@@ -126,10 +146,17 @@ class UIUtilsSuite extends SparkFunSuite {
 
   test("SPARK-11906: Progress bar should not overflow because of speculative tasks") {
     val generated = makeProgressBar(2, 3, 0, 0, Map.empty, 4).head.child.filter(_.label == "div")
+    // BS5 progress-stacked: each segment is a .progress wrapper with a .progress-bar
+    // scalastyle:off line.size.limit
     val expected = Seq(
-      <div class="progress-bar progress-completed" style="width: 75.0%"></div>,
-      <div class="progress-bar progress-started" style="width: 25.0%"></div>
+      <div class="progress" role="progressbar" aria-label="Completed" aria-valuenow="75" aria-valuemin="0" aria-valuemax="100" style="width: 75.0%">
+        <div class="progress-bar progress-completed"></div>
+      </div>,
+      <div class="progress" role="progressbar" aria-label="Running" aria-valuenow="25" aria-valuemin="0" aria-valuemax="100" style="width: 25.0%">
+        <div class="progress-bar progress-started"></div>
+      </div>
     )
+    // scalastyle:on line.size.limit
     assert(generated.sameElements(expected),
       s"\nRunning progress bar should round down\n\nExpected:\n$expected\nGenerated:\n$generated")
   }
@@ -154,11 +181,12 @@ class UIUtilsSuite extends SparkFunSuite {
     val generated = listingTable(header, generateDataRowValue, data, tooltipHeaders = tooltip)
 
     val expected: Node =
-      <table class="table table-bordered table-sm table-striped sortable">
+      <div class="table-responsive">
+      <table class="table table-bordered table-hover table-sm table-striped sortable">
         <thead>
           <th width="" class="">{header(0)}</th>
           <th width="" class="">
-              <span data-toggle="tooltip" title="tooltip">
+              <span data-bs-toggle="tooltip" title="tooltip">
                 {header(1)}
               </span>
           </th>
@@ -167,6 +195,7 @@ class UIUtilsSuite extends SparkFunSuite {
         {data.map(generateDataRowValue)}
       </tbody>
     </table>
+      </div>
 
     assert(trim(generated(0)) == trim(expected))
   }
@@ -180,7 +209,8 @@ class UIUtilsSuite extends SparkFunSuite {
     val generated = listingTable(header, generateDataRowValue, data)
 
     val expected =
-      <table class="table table-bordered table-sm table-striped sortable">
+      <div class="table-responsive">
+      <table class="table table-bordered table-hover table-sm table-striped sortable">
         <thead>
           <th width="" class="">{header(0)}</th>
           <th width="" class="">{header(1)}</th>
@@ -189,6 +219,7 @@ class UIUtilsSuite extends SparkFunSuite {
           {data.map(generateDataRowValue)}
         </tbody>
       </table>
+      </div>
 
     assert(trim(generated(0)) == trim(expected))
   }
@@ -225,4 +256,26 @@ class UIUtilsSuite extends SparkFunSuite {
     assert(cell4 === <td>{"java.lang.RuntimeException"}{UIUtils.detailsUINode(isMultiline = true, e4)}</td>)
   }
   // scalastyle:on line.size.limit
+
+  test("detailsUINode uses data-toggle-details instead of onclick") {
+    val result = UIUtils.detailsUINode(isMultiline = true, "error\nmessage")
+    val html = result.toString
+    assert(!html.contains("onclick"), "detailsUINode should not contain inline onclick handler")
+    assert(html.contains("data-toggle-details"), "detailsUINode should use data-toggle-details")
+    assert(html.contains("stacktrace-details"), "detailsUINode should contain stacktrace-details")
+  }
+
+  test("makeHref only renders http(s) or relative URLs as hyperlinks") {
+    // appUiUrl and webUiAddress come from external registrants.
+    assert(UIUtils.makeHref(proxy = false, "app-1", "http://host:4040") === "http://host:4040")
+    assert(UIUtils.makeHref(proxy = false, "app-1", "https://host:4040") === "https://host:4040")
+    assert(UIUtils.makeHref(proxy = false, "app-1", "/relative/path") === "/relative/path")
+    assert(UIUtils.makeHref(proxy = false, "app-1", null) === "#")
+    // A non-http(s) scheme or a malformed URI renders as a dead link.
+    assert(UIUtils.makeHref(proxy = false, "app-1", "javascript:alert(1)") === "#")
+    assert(UIUtils.makeHref(proxy = false, "app-1", "ht tp://bad url") === "#")
+    assert(UIUtils.makeHref(proxy = false, "app-1", "http://host:4040/a b") === "#")
+    // Reverse-proxy mode is unaffected: the href is generated by the master itself.
+    assert(UIUtils.makeHref(proxy = true, "app-1", "javascript:alert(1)").endsWith("/proxy/app-1"))
+  }
 }

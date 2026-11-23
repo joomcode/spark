@@ -16,17 +16,23 @@
 #
 
 import tempfile
-import unittest
 from shutil import rmtree
 
 import numpy as np
 
 from pyspark.errors import PySparkException
-from pyspark.ml.linalg import Vectors, Matrices
-from pyspark.sql import DataFrame, Row
 from pyspark.ml.classification import (
-    NaiveBayes,
-    NaiveBayesModel,
+    BinaryLogisticRegressionSummary,
+    BinaryRandomForestClassificationSummary,
+    BinaryRandomForestClassificationTrainingSummary,
+    DecisionTreeClassificationModel,
+    DecisionTreeClassifier,
+    FMClassificationModel,
+    FMClassificationSummary,
+    FMClassificationTrainingSummary,
+    FMClassifier,
+    GBTClassificationModel,
+    GBTClassifier,
     LinearSVC,
     LinearSVCModel,
     LinearSVCSummary,
@@ -34,32 +40,47 @@ from pyspark.ml.classification import (
     LogisticRegression,
     LogisticRegressionModel,
     LogisticRegressionSummary,
-    BinaryLogisticRegressionSummary,
-    FMClassifier,
-    FMClassificationModel,
-    FMClassificationSummary,
-    FMClassificationTrainingSummary,
-    DecisionTreeClassifier,
-    DecisionTreeClassificationModel,
-    RandomForestClassifier,
-    RandomForestClassificationModel,
-    RandomForestClassificationSummary,
-    RandomForestClassificationTrainingSummary,
-    BinaryRandomForestClassificationSummary,
-    BinaryRandomForestClassificationTrainingSummary,
-    GBTClassifier,
-    GBTClassificationModel,
-    MultilayerPerceptronClassifier,
     MultilayerPerceptronClassificationModel,
     MultilayerPerceptronClassificationSummary,
     MultilayerPerceptronClassificationTrainingSummary,
+    MultilayerPerceptronClassifier,
+    NaiveBayes,
+    NaiveBayesModel,
+    RandomForestClassificationModel,
+    RandomForestClassificationSummary,
+    RandomForestClassificationTrainingSummary,
+    RandomForestClassifier,
 )
+from pyspark.ml.linalg import Matrices, Vectors
 from pyspark.ml.regression import DecisionTreeRegressionModel
-from pyspark.sql import is_remote
+from pyspark.sql import DataFrame, Row
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 
 
 class ClassificationTestsMixin:
+    def test_intermediate_storage_level(self):
+        dataset = self.spark.createDataFrame(
+            [(0.0, Vectors.dense(0.0, 1.0)), (1.0, Vectors.dense(1.0, 0.0))],
+            ["label", "features"],
+        )
+        classifiers = [
+            LogisticRegression(maxIter=2, intermediateStorageLevel="DISK_ONLY"),
+            LinearSVC(maxIter=2, intermediateStorageLevel="DISK_ONLY"),
+            FMClassifier(maxIter=2, seed=42, intermediateStorageLevel="DISK_ONLY"),
+        ]
+        for classifier in classifiers:
+            with self.subTest(classifier=type(classifier).__name__):
+                self.assertEqual(
+                    type(classifier)().getIntermediateStorageLevel(), "MEMORY_AND_DISK"
+                )
+                self.assertEqual(classifier.getIntermediateStorageLevel(), "DISK_ONLY")
+                classifier.setParams(intermediateStorageLevel="MEMORY_ONLY")
+                self.assertEqual(classifier.getIntermediateStorageLevel(), "MEMORY_ONLY")
+                classifier.setIntermediateStorageLevel("DISK_ONLY")
+                self.assertEqual(classifier.getIntermediateStorageLevel(), "DISK_ONLY")
+                model = classifier.fit(dataset)
+                self.assertEqual(model.getIntermediateStorageLevel(), "DISK_ONLY")
+
     def test_naive_bayes(self):
         spark = self.spark
         df = spark.createDataFrame(
@@ -276,9 +297,6 @@ class ClassificationTestsMixin:
             self.assertAlmostEqual(s.weightedFMeasure(1.0), 1.0, 2)
 
         check_summary()
-        if is_remote():
-            self.spark.client._delete_ml_cache([model._java_obj._ref_id], evict_only=True)
-            check_summary()
 
         s = model.summary
         # test evaluation (with training dataset) produces a summary with same values
@@ -329,9 +347,6 @@ class ClassificationTestsMixin:
             self.assertAlmostEqual(s.weightedFMeasure(1.0), 0.65, 2)
 
         check_summary()
-        if is_remote():
-            self.spark.client._delete_ml_cache([model._java_obj._ref_id], evict_only=True)
-            check_summary()
 
         s = model.summary
         # test evaluation (with training dataset) produces a summary with same values
@@ -455,9 +470,6 @@ class ClassificationTestsMixin:
             self.assertEqual(summary.predictions.columns, expected_cols)
 
         check_summary()
-        if is_remote():
-            self.spark.client._delete_ml_cache([model._java_obj._ref_id], evict_only=True)
-            check_summary()
 
         summary2 = model.evaluate(df)
         self.assertIsInstance(summary2, LinearSVCSummary)
@@ -560,9 +572,6 @@ class ClassificationTestsMixin:
             self.assertEqual(summary.predictions.columns, expected_cols)
 
         check_summary()
-        if is_remote():
-            self.spark.client._delete_ml_cache([model._java_obj._ref_id], evict_only=True)
-            check_summary()
 
         summary2 = model.evaluate(df)
         self.assertIsInstance(summary2, FMClassificationSummary)
@@ -597,18 +606,26 @@ class ClassificationTestsMixin:
             .sortWithinPartitions("weight")
         )
 
+        self.assertEqual(DecisionTreeClassifier().getIntermediateStorageLevel(), "MEMORY_AND_DISK")
         dt = DecisionTreeClassifier(
             maxDepth=2,
             labelCol="label",
             leafCol="leaf",
             seed=1,
+            intermediateStorageLevel="DISK_ONLY",
         )
+        self.assertEqual(dt.getIntermediateStorageLevel(), "DISK_ONLY")
+        dt.setParams(intermediateStorageLevel="MEMORY_ONLY")
+        self.assertEqual(dt.getIntermediateStorageLevel(), "MEMORY_ONLY")
+        dt.setIntermediateStorageLevel("DISK_ONLY")
+        self.assertEqual(dt.getIntermediateStorageLevel(), "DISK_ONLY")
         self.assertEqual(dt.getMaxDepth(), 2)
         self.assertEqual(dt.getSeed(), 1)
         self.assertEqual(dt.getLabelCol(), "label")
         self.assertEqual(dt.getLeafCol(), "leaf")
 
         model = dt.fit(df)
+        self.assertEqual(model.getIntermediateStorageLevel(), "DISK_ONLY")
         self.assertEqual(dt.uid, model.uid)
         self.assertEqual(model.numClasses, 2)
         self.assertEqual(model.numFeatures, 2)
@@ -663,13 +680,20 @@ class ClassificationTestsMixin:
             .sortWithinPartitions("weight")
         )
 
+        self.assertEqual(GBTClassifier().getIntermediateStorageLevel(), "MEMORY_AND_DISK")
         gbt = GBTClassifier(
             maxIter=3,
             maxDepth=2,
             labelCol="label",
             leafCol="leaf",
             seed=1,
+            intermediateStorageLevel="DISK_ONLY",
         )
+        self.assertEqual(gbt.getIntermediateStorageLevel(), "DISK_ONLY")
+        gbt.setParams(intermediateStorageLevel="MEMORY_ONLY")
+        self.assertEqual(gbt.getIntermediateStorageLevel(), "MEMORY_ONLY")
+        gbt.setIntermediateStorageLevel("DISK_ONLY")
+        self.assertEqual(gbt.getIntermediateStorageLevel(), "DISK_ONLY")
         self.assertEqual(gbt.getMaxIter(), 3)
         self.assertEqual(gbt.getMaxDepth(), 2)
         self.assertEqual(gbt.getSeed(), 1)
@@ -677,6 +701,7 @@ class ClassificationTestsMixin:
         self.assertEqual(gbt.getLeafCol(), "leaf")
 
         model = gbt.fit(df)
+        self.assertEqual(model.getIntermediateStorageLevel(), "DISK_ONLY")
         self.assertEqual(gbt.uid, model.uid)
         self.assertEqual(model.numClasses, 2)
         self.assertEqual(model.numFeatures, 2)
@@ -753,13 +778,20 @@ class ClassificationTestsMixin:
             .sortWithinPartitions("weight")
         )
 
+        self.assertEqual(RandomForestClassifier().getIntermediateStorageLevel(), "MEMORY_AND_DISK")
         rf = RandomForestClassifier(
             numTrees=3,
             maxDepth=2,
             labelCol="label",
             leafCol="leaf",
             seed=1,
+            intermediateStorageLevel="DISK_ONLY",
         )
+        self.assertEqual(rf.getIntermediateStorageLevel(), "DISK_ONLY")
+        rf.setParams(intermediateStorageLevel="MEMORY_ONLY")
+        self.assertEqual(rf.getIntermediateStorageLevel(), "MEMORY_ONLY")
+        rf.setIntermediateStorageLevel("DISK_ONLY")
+        self.assertEqual(rf.getIntermediateStorageLevel(), "DISK_ONLY")
         self.assertEqual(rf.getNumTrees(), 3)
         self.assertEqual(rf.getMaxDepth(), 2)
         self.assertEqual(rf.getSeed(), 1)
@@ -767,6 +799,7 @@ class ClassificationTestsMixin:
         self.assertEqual(rf.getLeafCol(), "leaf")
 
         model = rf.fit(df)
+        self.assertEqual(model.getIntermediateStorageLevel(), "DISK_ONLY")
         self.assertEqual(rf.uid, model.uid)
         self.assertEqual(model.numClasses, 2)
         self.assertEqual(model.numFeatures, 2)
@@ -814,9 +847,6 @@ class ClassificationTestsMixin:
             self.assertEqual(summary.predictions.columns, expected_cols)
 
         check_summary()
-        if is_remote():
-            self.spark.client._delete_ml_cache([model._java_obj._ref_id], evict_only=True)
-            check_summary()
 
         summary2 = model.evaluate(df)
         self.assertTrue(isinstance(summary2, BinaryRandomForestClassificationSummary))
@@ -905,9 +935,6 @@ class ClassificationTestsMixin:
             self.assertEqual(summary.predictions.columns, expected_cols)
 
         check_summary()
-        if is_remote():
-            self.spark.client._delete_ml_cache([model._java_obj._ref_id], evict_only=True)
-            check_summary()
 
         summary2 = model.evaluate(df)
         self.assertTrue(isinstance(summary2, RandomForestClassificationSummary))
@@ -1006,9 +1033,6 @@ class ClassificationTestsMixin:
             self.assertEqual(summary.predictions.columns, expected_cols)
 
         check_summary()
-        if is_remote():
-            self.spark.client._delete_ml_cache([model._java_obj._ref_id], evict_only=True)
-            check_summary()
 
         summary2 = model.evaluate(df)
         self.assertIsInstance(summary2, MultilayerPerceptronClassificationSummary)
@@ -1037,12 +1061,6 @@ class ClassificationTests(ClassificationTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.test_classification import *  # noqa: F401,F403
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

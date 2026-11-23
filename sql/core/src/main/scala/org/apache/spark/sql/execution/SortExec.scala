@@ -26,8 +26,8 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGenerator, ExprCode}
 import org.apache.spark.sql.catalyst.plans.physical._
-import org.apache.spark.sql.catalyst.util.DateTimeConstants.NANOS_PER_MILLIS
-import org.apache.spark.sql.execution.metric.SQLMetrics
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 
 /**
  * Performs (external) sorting.
@@ -62,19 +62,156 @@ case class SortExec(
     "peakMemory" -> SQLMetrics.createSizeMetric(sparkContext, "peak memory"),
     "spillSize" -> SQLMetrics.createSizeMetric(sparkContext, "spill size"))
 
-  // Each task has its own instance of UnsafeExternalRowSorter. It is created in the
-  // createSorter method and stored in a ThreadLocal variable.
-  private[sql] var rowSorter: ThreadLocal[UnsafeExternalRowSorter] = _
-
   /**
-   * This method gets invoked only once for each SortExec instance to initialize an
-   * UnsafeExternalRowSorter, both `plan.execute` and code generation are using it.
-   * In the code generation code path, we need to call this function outside the class so we
-   * should make it public.
+   * Creates the sorter of this node in a task and keeps it until it is released. Everything that
+   * runs in a task captures this holder rather than the node: the generated code, the closure of
+   * [[doExecute]], operators above that release the sorter early (through
+   * [[taskResourceCleaner]]) and the concurrent output writers of `FileFormatWriter`. So the node
+   * and its child subtree are not serialized into every task for the sorter, and in a task they
+   * all share the copy of the holder deserialized from the task binary.
+   *
+   * It is transient, so that a node that is still serialized into a task by another operator
+   * does not carry it. A deserialized node therefore has a fresh holder that nothing else uses:
+   * code that runs in a task must not create or release the sorter through the node.
    */
-  def createSorter(): UnsafeExternalRowSorter = {
-    rowSorter = new ThreadLocal[UnsafeExternalRowSorter]()
+  @transient private[sql] lazy val sorterHolder =
+    new SortExecSorterHolder(sortOrder, output, enableRadixSort, testSpillFrequency)
 
+  override protected[sql] def taskResourceCleaner: Option[TaskResourceCleaner] =
+    Some(sorterHolder)
+
+  protected override def doExecute(): RDD[InternalRow] = {
+    val peakMemory = longMetric("peakMemory")
+    val spillSize = longMetric("spillSize")
+    val sortTime = longMetric("sortTime")
+
+    val holder = sorterHolder
+    child.execute().mapPartitionsInternal { iter =>
+      val sorter = holder.createSorter()
+
+      val metrics = TaskContext.get().taskMetrics()
+      // Remember spill data size of this task before execute this operator so that we can
+      // figure out how many bytes we spilled for this operator.
+      val spillSizeBefore = metrics.memoryBytesSpilled
+      val sortedIterator = sorter.sort(iter.asInstanceOf[Iterator[UnsafeRow]])
+      SortExec.recordSortMetrics(sorter, metrics, spillSizeBefore, sortTime, peakMemory, spillSize)
+
+      sortedIterator
+    }
+  }
+
+  override def usedInputs: AttributeSet = AttributeSet(Seq.empty)
+
+  override def inputRDDs(): Seq[RDD[InternalRow]] = {
+    child.asInstanceOf[CodegenSupport].inputRDDs()
+  }
+
+  // Name of sorter variable used in codegen.
+  private var sorterVariable: String = _
+
+  override protected def doProduce(ctx: CodegenContext): String = {
+    val needToSort =
+      ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "needToSort", v => s"$v = true;")
+
+    // Initialize the class member variables. This includes the instance of the Sorter and
+    // the iterator to return sorted rows.
+    val holder = ctx.addReferenceObj("sorterHolder", sorterHolder)
+    // Inline mutable state since not many Sort operations in a task
+    sorterVariable = ctx.addMutableState(classOf[UnsafeExternalRowSorter].getName, "sorter",
+      v => s"$v = $holder.createSorter();", forceInline = true)
+    val metrics = ctx.addMutableState(classOf[TaskMetrics].getName, "metrics",
+      v => s"$v = org.apache.spark.TaskContext.get().taskMetrics();", forceInline = true)
+    val sortedIterator = ctx.addMutableState("scala.collection.Iterator<InternalRow>", "sortedIter",
+      forceInline = true)
+
+    val addToSorter = ctx.freshName("addToSorter")
+    // Pass `partitionIndex` as a parameter so bare references in the child's
+    // produce resolve to the local, not the protected superclass field.
+    // Required when `addNewFunction` spills this helper to a nested class.
+    val addToSorterFuncName = ctx.addNewFunction(addToSorter,
+      s"""
+        | private void $addToSorter(int partitionIndex) throws java.io.IOException {
+        |   ${child.asInstanceOf[CodegenSupport].produce(ctx, this)}
+        | }
+      """.stripMargin.trim)
+
+    val outputRow = ctx.freshName("outputRow")
+    val peakMemory = metricTerm(ctx, "peakMemory")
+    val spillSize = metricTerm(ctx, "spillSize")
+    val spillSizeBefore = ctx.freshName("spillSizeBefore")
+    val sortTime = metricTerm(ctx, "sortTime")
+    s"""
+       | if ($needToSort) {
+       |   long $spillSizeBefore = $metrics.memoryBytesSpilled();
+       |   $addToSorterFuncName(partitionIndex);
+       |   $sortedIterator = $sorterVariable.sort();
+       |   org.apache.spark.sql.execution.SortExec.recordSortMetrics(
+       |     $sorterVariable, $metrics, $spillSizeBefore, $sortTime, $peakMemory, $spillSize);
+       |   $needToSort = false;
+       | }
+       |
+       | while ($limitNotReachedCond $sortedIterator.hasNext()) {
+       |   UnsafeRow $outputRow = (UnsafeRow)$sortedIterator.next();
+       |   ${consume(ctx, null, outputRow)}
+       |   if (shouldStop()) return;
+       | }
+     """.stripMargin.trim
+  }
+
+  override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
+    s"""
+       |${row.code}
+       |$sorterVariable.insertRow((UnsafeRow)${row.value});
+     """.stripMargin
+  }
+
+  override protected def withNewChildInternal(newChild: SparkPlan): SortExec =
+    copy(child = newChild)
+}
+
+object SortExec {
+  /**
+   * Records the sort metrics (sort time, peak memory and spill size) for a completed sort. This
+   * is called both by the interpreted path ([[SortExec.doExecute]]) and by the generated code of
+   * [[SortExec]] (through the static forwarder), so the type-independent metric bookkeeping is
+   * compiled once per JVM instead of being re-emitted into every SortExec stage's generated code.
+   *
+   * `spillSizeBefore` is the task's spilled-bytes count captured before the rows were fed to the
+   * sorter, so that `spillSize` reflects only this operator's contribution.
+   */
+  def recordSortMetrics(
+      sorter: UnsafeExternalRowSorter,
+      metrics: TaskMetrics,
+      spillSizeBefore: Long,
+      sortTime: SQLMetric,
+      peakMemory: SQLMetric,
+      spillSize: SQLMetric): Unit = {
+    sortTime += NANOSECONDS.toMillis(sorter.getSortTimeNanos)
+    peakMemory += sorter.getPeakMemoryUsage
+    spillSize += metrics.memoryBytesSpilled - spillSizeBefore
+    metrics.incPeakExecutionMemory(sorter.getPeakMemoryUsage)
+  }
+}
+
+/**
+ * Creates the sorter of a [[SortExec]] in a task and holds it until [[cleanupResources]]. It
+ * holds only what the sorter needs, not the plan. See [[SortExec.sorterHolder]].
+ *
+ * WARNING: the sorter is per-task mutable state. Each task deserializes its own copy of the
+ * holder from the task binary, so it must not be shared across tasks or accessed from multiple
+ * threads concurrently.
+ */
+private[sql] class SortExecSorterHolder(
+    sortOrder: Seq[SortOrder],
+    output: Seq[Attribute],
+    enableRadixSort: Boolean,
+    testSpillFrequency: Int) extends TaskResourceCleaner {
+
+  @transient private var rowSorter: UnsafeExternalRowSorter = _
+
+  @transient private lazy val schema = DataTypeUtils.fromAttributes(output)
+
+  def createSorter(): UnsafeExternalRowSorter = {
     val ordering = RowOrdering.create(sortOrder, output)
 
     // The comparator for comparing prefix
@@ -99,115 +236,22 @@ case class SortExec(
     }
 
     val pageSize = SparkEnv.get.memoryManager.pageSizeBytes
-    val newRowSorter = UnsafeExternalRowSorter.create(
+    rowSorter = UnsafeExternalRowSorter.create(
       schema, ordering, prefixComparator, prefixComputer, pageSize, canUseRadixSort)
 
     if (testSpillFrequency > 0) {
-      newRowSorter.setTestSpillFrequency(testSpillFrequency)
+      rowSorter.setTestSpillFrequency(testSpillFrequency)
     }
-    rowSorter.set(newRowSorter)
-    rowSorter.get()
-  }
-
-  protected override def doExecute(): RDD[InternalRow] = {
-    val peakMemory = longMetric("peakMemory")
-    val spillSize = longMetric("spillSize")
-    val sortTime = longMetric("sortTime")
-
-    child.execute().mapPartitionsInternal { iter =>
-      val sorter = createSorter()
-
-      val metrics = TaskContext.get().taskMetrics()
-      // Remember spill data size of this task before execute this operator so that we can
-      // figure out how many bytes we spilled for this operator.
-      val spillSizeBefore = metrics.memoryBytesSpilled
-      val sortedIterator = sorter.sort(iter.asInstanceOf[Iterator[UnsafeRow]])
-      sortTime += NANOSECONDS.toMillis(sorter.getSortTimeNanos)
-      peakMemory += sorter.getPeakMemoryUsage
-      spillSize += metrics.memoryBytesSpilled - spillSizeBefore
-      metrics.incPeakExecutionMemory(sorter.getPeakMemoryUsage)
-
-      sortedIterator
-    }
-  }
-
-  override def usedInputs: AttributeSet = AttributeSet(Seq.empty)
-
-  override def inputRDDs(): Seq[RDD[InternalRow]] = {
-    child.asInstanceOf[CodegenSupport].inputRDDs()
-  }
-
-  // Name of sorter variable used in codegen.
-  private var sorterVariable: String = _
-
-  override protected def doProduce(ctx: CodegenContext): String = {
-    val needToSort =
-      ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "needToSort", v => s"$v = true;")
-
-    // Initialize the class member variables. This includes the instance of the Sorter and
-    // the iterator to return sorted rows.
-    val thisPlan = ctx.addReferenceObj("plan", this)
-    // Inline mutable state since not many Sort operations in a task
-    sorterVariable = ctx.addMutableState(classOf[UnsafeExternalRowSorter].getName, "sorter",
-      v => s"$v = $thisPlan.createSorter();", forceInline = true)
-    val metrics = ctx.addMutableState(classOf[TaskMetrics].getName, "metrics",
-      v => s"$v = org.apache.spark.TaskContext.get().taskMetrics();", forceInline = true)
-    val sortedIterator = ctx.addMutableState("scala.collection.Iterator<UnsafeRow>", "sortedIter",
-      forceInline = true)
-
-    val addToSorter = ctx.freshName("addToSorter")
-    val addToSorterFuncName = ctx.addNewFunction(addToSorter,
-      s"""
-        | private void $addToSorter() throws java.io.IOException {
-        |   ${child.asInstanceOf[CodegenSupport].produce(ctx, this)}
-        | }
-      """.stripMargin.trim)
-
-    val outputRow = ctx.freshName("outputRow")
-    val peakMemory = metricTerm(ctx, "peakMemory")
-    val spillSize = metricTerm(ctx, "spillSize")
-    val spillSizeBefore = ctx.freshName("spillSizeBefore")
-    val sortTime = metricTerm(ctx, "sortTime")
-    s"""
-       | if ($needToSort) {
-       |   long $spillSizeBefore = $metrics.memoryBytesSpilled();
-       |   $addToSorterFuncName();
-       |   $sortedIterator = $sorterVariable.sort();
-       |   $sortTime.add($sorterVariable.getSortTimeNanos() / $NANOS_PER_MILLIS);
-       |   $peakMemory.add($sorterVariable.getPeakMemoryUsage());
-       |   $spillSize.add($metrics.memoryBytesSpilled() - $spillSizeBefore);
-       |   $metrics.incPeakExecutionMemory($sorterVariable.getPeakMemoryUsage());
-       |   $needToSort = false;
-       | }
-       |
-       | while ($limitNotReachedCond $sortedIterator.hasNext()) {
-       |   UnsafeRow $outputRow = (UnsafeRow)$sortedIterator.next();
-       |   ${consume(ctx, null, outputRow)}
-       |   if (shouldStop()) return;
-       | }
-     """.stripMargin.trim
-  }
-
-  override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
-    s"""
-       |${row.code}
-       |$sorterVariable.insertRow((UnsafeRow)${row.value});
-     """.stripMargin
+    rowSorter
   }
 
   /**
-   * In SortExec, we overwrites cleanupResources to close UnsafeExternalRowSorter.
+   * Closes the sorter, if any. It can be null, e.g. when a join above releases the resources of
+   * its children before this sorter is created.
    */
-  override protected[sql] def cleanupResources(): Unit = {
-    if (rowSorter != null && rowSorter.get() != null) {
-      // There's possible for rowSorter is null here, for example, in the scenario of empty
-      // iterator in the current task, the downstream physical node(like SortMergeJoinExec) will
-      // trigger cleanupResources before rowSorter initialized in createSorter.
-      rowSorter.get().cleanupResources()
+  override def cleanupResources(): Unit = {
+    if (rowSorter != null) {
+      rowSorter.cleanupResources()
     }
-    super.cleanupResources()
   }
-
-  override protected def withNewChildInternal(newChild: SparkPlan): SortExec =
-    copy(child = newChild)
 }

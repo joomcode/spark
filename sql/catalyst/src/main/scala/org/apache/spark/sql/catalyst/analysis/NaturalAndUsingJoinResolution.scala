@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
+import scala.collection.mutable
+
 import org.apache.spark.sql.catalyst.SQLConfHelper
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
@@ -36,7 +38,8 @@ import org.apache.spark.sql.catalyst.plans.{
   LeftOuter,
   RightOuter
 }
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project}
+import org.apache.spark.sql.catalyst.util.MetadataColumnHelper
 import org.apache.spark.sql.errors.{
   DataTypeErrorsBase,
   QueryCompilationErrors,
@@ -80,6 +83,48 @@ object NaturalAndUsingJoinResolution extends DataTypeErrorsBase with SQLConfHelp
       joinType
     )
     (output, hiddenOutput, newCondition)
+  }
+
+  /**
+   * Wraps a NATURAL or USING join in a [[Project]] that hides `hiddenList` (the duplicate join
+   * keys). It also passes up the hidden columns of nested NATURAL and USING joins, taken from
+   * `joinHiddenOutput`.
+   */
+  def buildUsingJoinProject(
+      projectList: Seq[NamedExpression],
+      hiddenList: Seq[Attribute],
+      join: LogicalPlan,
+      joinHiddenOutput: Seq[Attribute]): Project = {
+    val project = Project(projectList, join)
+    project.setTagValue(
+      Project.hiddenOutputTag,
+      hiddenList.map(_.markAsQualifiedAccessOnly()) ++
+        joinHiddenOutput.filter(_.qualifiedAccessOnly))
+    project
+  }
+
+  /**
+   * Computes a multiset intersection of two name sequences, respecting case sensitivity.
+   * Preserves multiplicity: each name appears min(left count, right count) times.
+   */
+  def canonicalizedIntersect(
+      leftNames: Seq[String],
+      rightNames: Seq[String]): Seq[String] = {
+    val rightNameCounts = mutable.HashMap[String, Int]()
+    for (name <- rightNames) {
+      val key = conf.canonicalize(name)
+      rightNameCounts(key) = rightNameCounts.getOrElse(key, 0) + 1
+    }
+    leftNames.filter { leftName =>
+      val key = conf.canonicalize(leftName)
+      val count = rightNameCounts.getOrElse(key, 0)
+      if (count > 0) {
+        rightNameCounts(key) = count - 1
+        true
+      } else {
+        false
+      }
+    }
   }
 
   /**

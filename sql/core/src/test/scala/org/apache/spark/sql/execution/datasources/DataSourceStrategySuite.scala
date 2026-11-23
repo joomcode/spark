@@ -19,12 +19,11 @@ package org.apache.spark.sql.execution.datasources
 
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.PlanTest
 import org.apache.spark.sql.sources
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
 
-class DataSourceStrategySuite extends PlanTest with SharedSparkSession {
+class DataSourceStrategySuite extends SharedSparkSession {
   val attrInts = Seq(
     $"cint".int,
     $"`c.int`".int,
@@ -284,6 +283,14 @@ class DataSourceStrategySuite extends PlanTest with SharedSparkSession {
     assertResult(Seq(IsNotNull(attrInt))) {
       DataSourceStrategy.normalizeExprs(Seq(IsNotNull(attrInt.withName("CiNt"))), Seq(attrInt))
     }
+  }
+
+  test("normalizeExprs uses the first matching attribute") {
+    val attribute = AttributeReference("original", IntegerType)()
+    val attributes = Seq(attribute.withName("first"), attribute.withName("second"))
+
+    assert(DataSourceStrategy.normalizeExprs(Seq(attribute), attributes) ===
+      Seq(attribute.withName("first")))
   }
 
   test("SPARK-31027 test `PushableColumn.unapply` that finds the column name of " +

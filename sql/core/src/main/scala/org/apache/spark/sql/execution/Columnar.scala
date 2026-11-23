@@ -28,6 +28,7 @@ import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.errors.ExecutionErrors
 import org.apache.spark.sql.execution.command.DataWritingCommandExec
 import org.apache.spark.sql.execution.datasources.V1WriteCommand
+import org.apache.spark.sql.execution.datasources.v2.V2TableWriteExec
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.vectorized.WritableColumnVector
 import org.apache.spark.sql.types._
@@ -64,7 +65,8 @@ trait ColumnarToRowTransition extends UnaryExecNode
  * [[org.apache.spark.sql.execution.python.ArrowEvalPythonExec]] and
  * [[MapPartitionsInRWithArrowExec]]. Eventually this should replace those implementations.
  */
-case class ColumnarToRowExec(child: SparkPlan) extends ColumnarToRowTransition with CodegenSupport {
+case class ColumnarToRowExec(child: SparkPlan)
+    extends ColumnarToRowTransition with CodegenSupport with SafeForKWayMerge {
   override def output: Seq[Attribute] = child.output
 
   override def outputPartitioning: Partitioning = child.outputPartitioning
@@ -151,14 +153,19 @@ case class ColumnarToRowExec(child: SparkPlan) extends ColumnarToRowTransition w
         (name, s"$name = ($columnVectorClz) $batch.column($i);")
     }.unzip
 
+    // The type-independent advance machinery (releasing the current batch, fetching the next one
+    // and bumping the metrics) is a compiled helper; only the per-column vector casts are emitted.
+    // Exception-path note: if the helper throws after releasing the current batch (the input
+    // iterator failing mid-scan), the field briefly keeps referencing the released batch. That
+    // state is unobservable: the cleanup block below is not in a finally, a failed task's
+    // iterator is never pumped again, and reader-owned batches are not freeable to begin with.
     val nextBatch = ctx.freshName("nextBatch")
     val nextBatchFuncName = ctx.addNewFunction(nextBatch,
       s"""
          |private void $nextBatch() throws java.io.IOException {
-         |  if ($input.hasNext()) {
-         |    $batch = ($columnarBatchClz)$input.next();
-         |    $numInputBatches.add(1);
-         |    $numOutputRows.add($batch.numRows());
+         |  $batch = org.apache.spark.sql.execution.ColumnarToRowExec.advanceBatch(
+         |    $input, $batch, $numInputBatches, $numOutputRows);
+         |  if ($batch != null) {
          |    $idx = 0;
          |    ${columnAssigns.mkString("", "\n", "\n")}
          |  }
@@ -190,8 +197,6 @@ case class ColumnarToRowExec(child: SparkPlan) extends ColumnarToRowTransition w
        |    $shouldStop
        |  }
        |  $idx = $numRows;
-       |  $batch.closeIfFreeable();
-       |  $batch = null;
        |  $nextBatchFuncName();
        |}
        |// clean up resources
@@ -207,6 +212,33 @@ case class ColumnarToRowExec(child: SparkPlan) extends ColumnarToRowTransition w
 
   override protected def withNewChildInternal(newChild: SparkPlan): ColumnarToRowExec =
     copy(child = newChild)
+}
+
+object ColumnarToRowExec {
+  /**
+   * Releases the current batch (if any) and fetches the next one from the input iterator,
+   * bumping the batch/row metrics. Returns null when the input is exhausted. This is called by
+   * the generated code of [[ColumnarToRowExec]] (through the static forwarder), so the
+   * type-independent per-batch bookkeeping is compiled once per JVM instead of being re-emitted
+   * into every stage's generated `nextBatch` method.
+   */
+  def advanceBatch(
+      input: Iterator[ColumnarBatch],
+      current: ColumnarBatch,
+      numInputBatches: SQLMetric,
+      numOutputRows: SQLMetric): ColumnarBatch = {
+    if (current != null) {
+      current.closeIfFreeable()
+    }
+    if (input.hasNext) {
+      val batch = input.next()
+      numInputBatches.add(1)
+      numOutputRows.add(batch.numRows())
+      batch
+    } else {
+      null
+    }
+  }
 }
 
 /**
@@ -264,17 +296,22 @@ private object RowToColumnConverter {
       case ShortType => ShortConverter
       case IntegerType | DateType | _: YearMonthIntervalType => IntConverter
       case FloatType => FloatConverter
-      case LongType | TimestampType | TimestampNTZType | _: DayTimeIntervalType => LongConverter
+      case LongType | TimestampType | TimestampNTZType | _: DayTimeIntervalType | _: TimeType =>
+        LongConverter
       case DoubleType => DoubleConverter
-      case StringType => StringConverter
-      case _: GeographyType => GeographyConverter
-      case _: GeometryType => GeometryConverter
+      case _: StringType => StringConverter
+      case _: GeographyType | _: GeometryType => BinaryViewConverter
       case CalendarIntervalType => CalendarConverter
       case VariantType => VariantConverter
+      case _: TimestampNTZNanosType => TimestampNTZNanosConverter
+      case _: TimestampLTZNanosType => TimestampLTZNanosConverter
       case at: ArrayType => ArrayConverter(getConverterForType(at.elementType, at.containsNull))
       case st: StructType => new StructConverter(st.fields.map(
         (f) => getConverterForType(f.dataType, f.nullable)))
       case dt: DecimalType => new DecimalConverter(dt)
+      case NullType => NullConverter
+      // Rows and column vectors both hold a UDT in the form of its SQL type.
+      case udt: UserDefinedType[_] => getConverterForType(udt.sqlType, nullable)
       case mt: MapType => MapConverter(getConverterForType(mt.keyType, nullable = false),
         getConverterForType(mt.valueType, mt.valueContainsNull))
       case unknown => throw ExecutionErrors.unsupportedDataTypeError(unknown)
@@ -282,13 +319,24 @@ private object RowToColumnConverter {
 
     if (nullable) {
       dataType match {
+        // The converter of its SQL type handles the nulls.
+        case _: UserDefinedType[_] => core
+        // A NullType vector is all null by its type, so appending nulls to it is not needed.
+        case NullType => core
         case CalendarIntervalType | VariantType => new StructNullableTypeConverter(core)
+        case _: AnyTimestampNanoType =>
+          new StructNullableTypeConverter(core)
         case st: StructType => new StructNullableTypeConverter(core)
         case _ => new BasicNullableTypeConverter(core)
       }
     } else {
       core
     }
+  }
+
+  // A column vector of NullType is all null and stores nothing.
+  private object NullConverter extends TypeConverter {
+    override def append(row: SpecializedGetters, column: Int, cv: WritableColumnVector): Unit = {}
   }
 
   private object BinaryConverter extends TypeConverter {
@@ -340,16 +388,9 @@ private object RowToColumnConverter {
     }
   }
 
-  private object GeographyConverter extends TypeConverter {
+  private object BinaryViewConverter extends TypeConverter {
     override def append(row: SpecializedGetters, column: Int, cv: WritableColumnVector): Unit = {
-      val data = row.getGeography(column).getBytes
-      cv.appendByteArray(data, 0, data.length)
-    }
-  }
-
-  private object GeometryConverter extends TypeConverter {
-    override def append(row: SpecializedGetters, column: Int, cv: WritableColumnVector): Unit = {
-      val data = row.getGeometry(column).getBytes
+      val data = row.getBinaryView(column).getBytes
       cv.appendByteArray(data, 0, data.length)
     }
   }
@@ -370,6 +411,24 @@ private object RowToColumnConverter {
       cv.appendStruct(false)
       cv.getChild(0).appendByteArray(v.getValue, 0, v.getValue.length)
       cv.getChild(1).appendByteArray(v.getMetadata, 0, v.getMetadata.length)
+    }
+  }
+
+  private object TimestampNTZNanosConverter extends TypeConverter {
+    override def append(row: SpecializedGetters, column: Int, cv: WritableColumnVector): Unit = {
+      val v = row.getTimestampNTZNanos(column)
+      cv.appendStruct(false)
+      cv.getChild(0).appendLong(v.epochMicros)
+      cv.getChild(1).appendShort(v.nanosWithinMicro)
+    }
+  }
+
+  private object TimestampLTZNanosConverter extends TypeConverter {
+    override def append(row: SpecializedGetters, column: Int, cv: WritableColumnVector): Unit = {
+      val v = row.getTimestampLTZNanos(column)
+      cv.appendStruct(false)
+      cv.getChild(0).appendLong(v.epochMicros)
+      cv.getChild(1).appendShort(v.nanosWithinMicro)
     }
   }
 
@@ -543,6 +602,11 @@ case class ApplyColumnarRulesAndInsertTransitions(
         case write: DataWritingCommandExec
             if write.cmd.isInstanceOf[V1WriteCommand] && conf.plannedWriteEnabled =>
           write.child.supportsColumnar
+        // A V2 write whose data writers take columnar batches writes those of a query that only
+        // supports columnar output, unless an extension has columnar rules: they may replace the
+        // transitions to rows with their own, which may be the only way to read their batches, so
+        // the write then gets rows through such a transition, as other writes do.
+        case write: V2TableWriteExec if write.writesColumnar && columnarRules.isEmpty => true
         // If it is not required to output columnar (`outputsColumnar` is false), and the plan
         // supports row-based and columnar, we don't need to output row-based data on its children
         // nodes. So we set `outputsColumnar` to true.

@@ -16,9 +16,9 @@
 #
 
 import json
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from pyspark.errors import StreamingQueryException, PySparkValueError
+from pyspark.errors import PySparkTypeError, PySparkValueError, StreamingQueryException
 from pyspark.errors.exceptions.captured import (
     StreamingQueryException as CapturedStreamingQueryException,
 )
@@ -30,7 +30,21 @@ from pyspark.sql.streaming.listener import (
 if TYPE_CHECKING:
     from py4j.java_gateway import JavaObject
 
+# TODO: Add StreamingCheckpointManager to __all__ once we add streaming checkpoint manager to the
+# public API
 __all__ = ["StreamingQuery", "StreamingQueryManager"]
+
+
+def _validate_timeout_type(timeout: Any) -> None:
+    if not isinstance(timeout, (int, float)):
+        raise PySparkTypeError(
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "arg_name": "timeout",
+                "expected_type": "float or int",
+                "arg_type": type(timeout).__name__,
+            },
+        )
 
 
 class StreamingQuery:
@@ -215,7 +229,8 @@ class StreamingQuery:
         >>> sq.stop()
         """
         if timeout is not None:
-            if not isinstance(timeout, (int, float)) or timeout <= 0:
+            _validate_timeout_type(timeout)
+            if timeout <= 0:
                 raise PySparkValueError(
                     errorClass="VALUE_NOT_POSITIVE",
                     messageParameters={"arg_name": "timeout", "arg_value": type(timeout).__name__},
@@ -593,7 +608,8 @@ class StreamingQueryManager:
         >>> sq.stop()
         """
         if timeout is not None:
-            if not isinstance(timeout, (int, float)) or timeout < 0:
+            _validate_timeout_type(timeout)
+            if timeout < 0:
                 raise PySparkValueError(
                     errorClass="VALUE_NOT_POSITIVE",
                     messageParameters={"arg_name": "timeout", "arg_value": type(timeout).__name__},
@@ -670,6 +686,7 @@ class StreamingQueryManager:
         >>> spark.streams.removeListener(test_listener)
         """
         from py4j.java_gateway import java_import
+
         from pyspark import SparkContext
         from pyspark.java_gateway import ensure_callback_server_started
 
@@ -721,25 +738,83 @@ class StreamingQueryManager:
         self._jsqm.removeListener(listener._jlistener)
 
 
+class StreamingCheckpointManager:
+    """
+    A class to manage operations on streaming query checkpoints.
+
+    .. versionadded:: 4.2.0
+
+    Notes
+    -----
+    This API is evolving and currently supported in Spark Classic.
+    """
+
+    def __init__(self, jmanager: "JavaObject") -> None:
+        self._jmanager = jmanager
+
+    def repartition(
+        self, checkpoint_location: str, num_partitions: int, enforce_exactly_once_sink: bool = True
+    ) -> None:
+        """
+        Repartition the stateful streaming operators state in the streaming checkpoint to have
+        `num_partitions` partitions. The streaming query MUST not be running. If `num_partitions` is
+        the same as the current number of partitions, this is a no-op, and an exception will be
+        thrown.
+
+        This produces a new microbatch in the checkpoint that contains the repartitioned state i.e.
+        if the last streaming batch was batch `N`, this will create batch `N+1` with the
+        repartitioned state. Note that this new batch doesn't read input data from sources, it only
+        represents the repartition operation. The next time the streaming query is started, it will
+        pick up from this new batch.
+
+        This will return only when the repartitioning is complete or fails.
+
+        .. versionadded:: 4.2.0
+
+        Parameters
+        ----------
+        checkpoint_location : str
+            The checkpoint location of the streaming query, should be the `checkpointLocation` option
+            on the DataStreamWriter.
+        num_partitions : int
+            The target number of state partitions.
+        enforce_exactly_once_sink : bool, optional
+            If we shouldn't allow skipping failed batches, to avoid duplicates in exactly once sinks.
+            default ``True``.
+
+        Notes
+        -----
+        This API is experimental.
+
+        This operation should only be performed after the streaming query has been stopped. If not,
+        can lead to undefined behavior or checkpoint corruption.
+        """
+        self._jmanager.repartition(checkpoint_location, num_partitions, enforce_exactly_once_sink)
+
+
 def _test() -> None:
     import doctest
     import os
     import sys
-    from pyspark.sql import SparkSession
-    import pyspark.sql.streaming.query
+
     from py4j.protocol import Py4JError
+
+    import pyspark.sql.streaming.query
+    from pyspark.core.context import SparkContext
+    from pyspark.sql import SparkSession
 
     os.chdir(os.environ["SPARK_HOME"])
 
     globs = pyspark.sql.streaming.query.__dict__.copy()
+    sc = SparkContext("local[4]", "PythonTest")
     try:
         spark = SparkSession._getActiveSessionOrCreate()
-    except Py4JError:  # noqa: F821
-        spark = SparkSession(sc)  # type: ignore[name-defined] # noqa: F821
+    except Py4JError:
+        spark = SparkSession(sc)
 
     globs["spark"] = spark
 
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.sql.streaming.query,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE | doctest.REPORT_NDIFF,

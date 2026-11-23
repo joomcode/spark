@@ -18,7 +18,7 @@
 package org.apache.spark.sql.catalyst.expressions
 
 import java.nio.charset.StandardCharsets
-import java.time.{Duration, Period}
+import java.time.{Duration, LocalTime, Period}
 import java.time.temporal.ChronoUnit
 
 import com.google.common.math.LongMath
@@ -238,7 +238,23 @@ class MathExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   test("asinh") {
-    testUnary(Asinh, (x: Double) => StrictMath.log(x + math.sqrt(x * x + 1.0)))
+    // fdlibm-aligned reference function
+    def asinhRef(x: Double): Double = {
+      val ax = Math.abs(x)
+      val w = if (ax.isInfinite || ax.isNaN) {
+        ax
+      } else if (ax < 1.0 / (1 << 28)) {
+        ax
+      } else if (ax > (1 << 28)) {
+        StrictMath.log(ax) + StrictMath.log(2.0)
+      } else if (ax > 2.0) {
+        StrictMath.log(2.0 * ax + 1.0 / (math.sqrt(x * x + 1.0) + ax))
+      } else {
+        StrictMath.log1p(ax + x * x / (1.0 + math.sqrt(1.0 + x * x)))
+      }
+      Math.copySign(w, x)
+    }
+    testUnary(Asinh, asinhRef)
     checkConsistencyBetweenInterpretedAndCodegen(Asinh, DoubleType)
 
     checkEvaluation(Asinh(Double.NegativeInfinity), Double.NegativeInfinity)
@@ -280,8 +296,25 @@ class MathExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   test("acosh") {
-    testUnary(Acosh, (x: Double) => StrictMath.log(x + math.sqrt(x * x - 1.0)))
-    checkConsistencyBetweenInterpretedAndCodegen(Cosh, DoubleType)
+    // fdlibm-aligned reference function
+    def acoshRef(x: Double): Double = {
+      if (x < 1.0) {
+        Double.NaN
+      } else if (x >= (1 << 28)) {
+        StrictMath.log(x) + StrictMath.log(2.0)
+      } else if (x == 1.0) {
+        0.0
+      } else if (x > 2.0) {
+        val t = x * x
+        StrictMath.log(2.0 * x - 1.0 / (x + math.sqrt(t - 1.0)))
+      } else {
+        val t = x - 1.0
+        StrictMath.log1p(t + math.sqrt(2.0 * t + t * t))
+      }
+    }
+    testUnary(Acosh, acoshRef, (10 to 20).map(_ * 0.1))
+    testUnary(Acosh, acoshRef, (-20 to 9).map(_ * 0.1), expectNaN = true)
+    checkConsistencyBetweenInterpretedAndCodegen(Acosh, DoubleType)
 
     val nullLit = Literal.create(null, NullType)
     val doubleNullLit = Literal.create(null, DoubleType)
@@ -360,13 +393,21 @@ class MathExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   test("ceil") {
-    testUnary(Ceil, (d: Double) => math.ceil(d).toLong)
-    checkConsistencyBetweenInterpretedAndCodegen(Ceil, DoubleType)
+    testUnary(Ceil(_), (d: Double) => math.ceil(d).toLong)
+    checkConsistencyBetweenInterpretedAndCodegenAllowingException(
+      (child: Expression) => Ceil(child),
+      DoubleType)
 
-    testUnary(Ceil, (d: Decimal) => d.ceil, (-20 to 20).map(x => Decimal(x * 0.1)))
-    checkConsistencyBetweenInterpretedAndCodegen(Ceil, DecimalType(25, 3))
-    checkConsistencyBetweenInterpretedAndCodegen(Ceil, DecimalType(25, 0))
-    checkConsistencyBetweenInterpretedAndCodegen(Ceil, DecimalType(5, 0))
+    testUnary(Ceil(_), (d: Decimal) => d.ceil, (-20 to 20).map(x => Decimal(x * 0.1)))
+    checkConsistencyBetweenInterpretedAndCodegen(
+      (child: Expression) => Ceil(child),
+      DecimalType(25, 3))
+    checkConsistencyBetweenInterpretedAndCodegen(
+      (child: Expression) => Ceil(child),
+      DecimalType(25, 0))
+    checkConsistencyBetweenInterpretedAndCodegen(
+      (child: Expression) => Ceil(child),
+      DecimalType(5, 0))
 
     val doublePi: Double = 3.1415
     val floatPi: Float = 3.1415f
@@ -387,16 +428,29 @@ class MathExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(checkDataTypeAndCast(Ceil(1234567890123456L)), 1234567890123456L, EmptyRow)
     checkEvaluation(checkDataTypeAndCast(Ceil(0.01)), 1L, EmptyRow)
     checkEvaluation(checkDataTypeAndCast(Ceil(-0.10)), 0L, EmptyRow)
+
+    checkExceptionInExpression[SparkArithmeticException](
+      Ceil(Literal(1e30), failOnError = true),
+      "ARITHMETIC_OVERFLOW")
+    checkEvaluation(Ceil(Literal(1e30), failOnError = false), Long.MaxValue)
   }
 
   test("floor") {
-    testUnary(Floor, (d: Double) => math.floor(d).toLong)
-    checkConsistencyBetweenInterpretedAndCodegen(Floor, DoubleType)
+    testUnary(Floor(_), (d: Double) => math.floor(d).toLong)
+    checkConsistencyBetweenInterpretedAndCodegenAllowingException(
+      (child: Expression) => Floor(child),
+      DoubleType)
 
-    testUnary(Floor, (d: Decimal) => d.floor, (-20 to 20).map(x => Decimal(x * 0.1)))
-    checkConsistencyBetweenInterpretedAndCodegen(Floor, DecimalType(25, 3))
-    checkConsistencyBetweenInterpretedAndCodegen(Floor, DecimalType(25, 0))
-    checkConsistencyBetweenInterpretedAndCodegen(Floor, DecimalType(5, 0))
+    testUnary(Floor(_), (d: Decimal) => d.floor, (-20 to 20).map(x => Decimal(x * 0.1)))
+    checkConsistencyBetweenInterpretedAndCodegen(
+      (child: Expression) => Floor(child),
+      DecimalType(25, 3))
+    checkConsistencyBetweenInterpretedAndCodegen(
+      (child: Expression) => Floor(child),
+      DecimalType(25, 0))
+    checkConsistencyBetweenInterpretedAndCodegen(
+      (child: Expression) => Floor(child),
+      DecimalType(5, 0))
 
     val doublePi: Double = 3.1415
     val floatPi: Float = 3.1415f
@@ -417,6 +471,11 @@ class MathExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(checkDataTypeAndCast(Floor(1234567890123456L)), 1234567890123456L, EmptyRow)
     checkEvaluation(checkDataTypeAndCast(Floor(0.01)), 0L, EmptyRow)
     checkEvaluation(checkDataTypeAndCast(Floor(-0.10)), -1L, EmptyRow)
+
+    checkExceptionInExpression[SparkArithmeticException](
+      Floor(Literal(-1e30), failOnError = true),
+      "ARITHMETIC_OVERFLOW")
+    checkEvaluation(Floor(Literal(-1e30), failOnError = false), Long.MinValue)
   }
 
   test("factorial") {
@@ -432,6 +491,29 @@ class MathExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
   test("rint") {
     testUnary(Rint, math.rint)
     checkConsistencyBetweenInterpretedAndCodegen(Rint, DoubleType)
+  }
+
+  test("SPARK-61175: rint returns the canonical NaN") {
+    val expr = Rint(BoundReference(0, DoubleType, nullable = true))
+    val canonical = java.lang.Double.doubleToRawLongBits(Double.NaN)
+    // A NaN with a payload, a signalling one, and the two with the sign bit set. Every JIT tier
+    // keeps the payload of the first two, so they fail without the fix wherever the test runs.
+    // The sign is cleared by the interpreter and C1 but kept by C2, so the last two check the
+    // sign only when the code under test has been compiled by C2.
+    val nans = Seq(0x7ff8000000000001L, 0x7ff0000000000001L, 0xfff8000000000000L,
+      0xfff0000000000001L).map(java.lang.Double.longBitsToDouble)
+    for (nan <- nans) {
+      val row = InternalRow(nan)
+      // checkEvaluation compares the UnsafeRow bytes in both factory modes, which sees the bits.
+      checkEvaluation(expr, Double.NaN, row)
+      val interpreted = evaluateWithoutCodegen(expr, row).asInstanceOf[Double]
+      assert(java.lang.Double.doubleToRawLongBits(interpreted) === canonical)
+    }
+    // Every other result keeps its bits, the signed zeros and the infinities included.
+    for (d <- Seq(-0.0, 0.0, -0.4, 0.5, 1.5, -2.5, 1e300, Double.MinPositiveValue,
+        Double.PositiveInfinity, Double.NegativeInfinity)) {
+      checkEvaluation(expr, math.rint(d), InternalRow(d))
+    }
   }
 
   test("exp") {
@@ -666,6 +748,27 @@ class MathExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       null,
       create_row(null))
     checkConsistencyBetweenInterpretedAndCodegen(Logarithm, DoubleType, DoubleType)
+  }
+
+  test("truncate") {
+    // Truncation toward zero, distinct from floor/ceil (toward -inf/+inf) and round (to nearest).
+    checkEvaluation(Truncate(Literal(Decimal(BigDecimal("1234.5678"))), Literal(2)),
+      Decimal(BigDecimal("1234.56")))
+    checkEvaluation(Truncate(Literal(Decimal(BigDecimal("-1234.5678"))), Literal(2)),
+      Decimal(BigDecimal("-1234.56")))
+    checkEvaluation(Truncate(Literal(Decimal(BigDecimal("1234.5678"))), Literal(-2)),
+      Decimal(BigDecimal("1200")))
+    checkEvaluation(Truncate(Literal(Decimal(BigDecimal("-3.99"))), Literal(0)),
+      Decimal(BigDecimal("-3")))
+    // Default scale is 0.
+    checkEvaluation(new Truncate(Literal(Decimal(BigDecimal("3.99")))), Decimal(BigDecimal("3")))
+    // Integral input with negative scale.
+    checkEvaluation(Truncate(Literal(125), Literal(-1)), 120)
+    // Double input.
+    checkEvaluation(Truncate(Literal(3.1415926), Literal(3)), 3.141)
+    // Null propagation.
+    checkEvaluation(Truncate(Literal.create(null, DoubleType), Literal(2)), null)
+    checkEvaluation(Truncate(Literal(1.23), Literal.create(null, IntegerType)), null)
   }
 
   test("round/bround/floor/ceil") {
@@ -964,6 +1067,38 @@ class MathExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(WidthBucket(5.35, 0.024, Double.PositiveInfinity, 5L), null)
   }
 
+  test("width_bucket with the TIME type") {
+    def time(t: LocalTime, precision: Int = TimeType.MICROS_PRECISION): Literal =
+      Literal.create(t.toNanoOfDay, TimeType(precision))
+    val t08 = time(LocalTime.of(8, 0, 0))
+    val t09 = time(LocalTime.of(9, 0, 0))
+    val t12 = time(LocalTime.of(12, 0, 0))
+    val t17 = time(LocalTime.of(17, 0, 0))
+    val n8 = Literal(8L)
+
+    // 09:00:00..17:00:00 split into 8 one-hour buckets.
+    checkEvaluation(WidthBucket(t12, t09, t17, n8), 4L)
+    checkEvaluation(WidthBucket(t09, t09, t17, n8), 1L)   // lower edge
+    checkEvaluation(WidthBucket(t17, t09, t17, n8), 9L)   // >= max -> numBucket + 1
+    checkEvaluation(WidthBucket(t08, t09, t17, n8), 0L)   // < min -> 0
+    // Reversed range (min > max).
+    checkEvaluation(WidthBucket(t12, t17, t09, n8), 6L)
+
+    // Mixed precisions are allowed; comparison uses the shared nanos-of-day value.
+    checkEvaluation(
+      WidthBucket(
+        time(LocalTime.of(12, 0, 0), 0),
+        time(LocalTime.of(9, 0, 0), 3),
+        time(LocalTime.of(17, 0, 0), 9),
+        n8),
+      4L)
+
+    // Null and degenerate inputs.
+    checkEvaluation(WidthBucket(Literal.create(null, TimeType()), t09, t17, n8), null)
+    checkEvaluation(WidthBucket(t12, t09, t17, Literal.create(null, LongType)), null)
+    checkEvaluation(WidthBucket(t12, t09, t09, n8), null) // min == max
+  }
+
   test("context independent foldable math expressions") {
     // Create some base literals
     val intLit = Literal(5)
@@ -1010,4 +1145,64 @@ class MathExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
         s"Expression $expr should be context independent foldable")
     }
   }
+
+  test("SPARK-55557: hyperbolic functions should not overflow with large inputs") {
+    checkEvaluation(Asinh(Double.MaxValue), 710.4758600739439)
+    checkEvaluation(Asinh(Math.sqrt(Double.MaxValue)), 355.58450362725193)
+    checkEvaluation(Acosh(Double.MaxValue), 710.4758600739439)
+    checkEvaluation(Acosh(Math.sqrt(Double.MaxValue)), 355.58450362725193)
+    checkEvaluation(Asinh(Double.MinValue), -710.4758600739439)
+    checkEvaluation(Asinh(-Math.sqrt(Double.MaxValue)), -355.58450362725193)
+    // Large negative values below the overflow threshold
+    checkEvaluation(Asinh(-1E100), -230.95165647996453)
+    checkEvaluation(Asinh(-1E50), -115.82240183026224)
+    checkNaN(Acosh(Double.MinValue))
+    checkNaN(Acosh(-Math.sqrt(Double.MaxValue) + 1))
+    checkNaN(Acosh(-Math.sqrt(Double.MaxValue) + 2))
+  }
+
+  test("SPARK-56089: multiple Asinh/Acosh in same codegen scope should not collide") {
+    // When multiple Asinh/Acosh expressions are codegen'd in the same scope with
+    // non-nullable children, nullSafeCodeGen emits code without an if-block wrapper.
+    // Without ctx.freshName(), hardcoded variable names (ax, w, t) cause
+    // "Redefinition of local variable" compilation errors.
+    checkEvaluation(
+      Add(Asinh(Literal(1.0)), Asinh(Literal(2.0))),
+      0.881373587019543 + 1.4436354751788103)
+    checkEvaluation(
+      Add(Acosh(Literal(1.5)), Acosh(Literal(2.0))),
+      0.9624236501192069 + 1.3169578969248166)
+  }
+
+  test("SPARK-56089: asinh/acosh fdlibm algorithm coverage") {
+    // asinh: hardcoded reference values cross-verified against C libm (glibc/musl fdlibm)
+    checkEvaluation(Asinh(Literal(0.5)), 0.48121182505960347, EmptyRow)
+    checkEvaluation(Asinh(Literal(1.0)), 0.881373587019543, EmptyRow)
+    checkEvaluation(Asinh(Literal(2.0)), 1.4436354751788103, EmptyRow)
+    checkEvaluation(Asinh(Literal(10.0)), 2.99822295029797, EmptyRow)
+    checkEvaluation(Asinh(Literal(1e8)), 19.11382792451231, EmptyRow)
+    // |x| < 2^-28 (identity branch)
+    checkEvaluation(Asinh(Literal(1.0e-10)), 1.0e-10, EmptyRow)
+    // |x| > 2^28 branch
+    val asinhExpected = Math.log(Double.MaxValue) + StrictMath.log(2.0)
+    checkEvaluation(Asinh(Literal(Double.MaxValue)), asinhExpected, EmptyRow)
+    checkEvaluation(Asinh(Literal(-Double.MaxValue)), -asinhExpected, EmptyRow)
+    // infinity
+    checkEvaluation(Asinh(Literal(Double.PositiveInfinity)), Double.PositiveInfinity, EmptyRow)
+    checkEvaluation(Asinh(Literal(Double.NegativeInfinity)), Double.NegativeInfinity, EmptyRow)
+
+    // acosh: hardcoded reference values cross-verified against C libm (glibc/musl fdlibm)
+    checkEvaluation(Acosh(Literal(1.0)), 0.0, EmptyRow)
+    checkEvaluation(Acosh(Literal(1.5)), 0.9624236501192069, EmptyRow)
+    checkEvaluation(Acosh(Literal(2.0)), 1.3169578969248166, EmptyRow)
+    checkEvaluation(Acosh(Literal(10.0)), 2.993222846126381, EmptyRow)
+    checkEvaluation(Acosh(Literal(1e8)), 19.11382792451231, EmptyRow)
+    // x >= 2^28 branch
+    val acoshExpected = Math.log(Double.MaxValue) + StrictMath.log(2.0)
+    checkEvaluation(Acosh(Literal(Double.MaxValue)), acoshExpected, EmptyRow)
+    checkEvaluation(Acosh(Literal(Double.PositiveInfinity)), Double.PositiveInfinity)
+    // x < 1 => NaN
+    checkEvaluation(Acosh(Literal(0.5)), Double.NaN, EmptyRow)
+  }
+
 }

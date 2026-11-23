@@ -17,22 +17,20 @@
 
 import os
 import string
-from typing import Any, Dict, Optional, Union, List, Sequence, Mapping, Tuple
 import uuid
 import warnings
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 
+from pyspark import pandas as ps
+from pyspark.pandas.frame import DataFrame
 from pyspark.pandas.internal import InternalFrame
 from pyspark.pandas.namespace import _get_index_map
-from pyspark import pandas as ps
-from pyspark.sql import SparkSession
-from pyspark.sql.utils import get_lit_sql_str
-from pyspark.pandas.utils import default_session
-from pyspark.pandas.frame import DataFrame
 from pyspark.pandas.series import Series
-from pyspark.sql.utils import is_remote
-
+from pyspark.pandas.utils import default_session
+from pyspark.sql import SparkSession
+from pyspark.sql.utils import get_lit_sql_str, is_remote
 
 __all__ = ["sql"]
 
@@ -193,8 +191,7 @@ def sql(
         from pyspark.pandas import sql_processor
 
         warnings.warn(
-            "Deprecated in 3.3.0, and the legacy behavior "
-            "will be removed in the future releases.",
+            "Deprecated in 3.3.0, and the legacy behavior will be removed in the future releases.",
             FutureWarning,
         )
         return sql_processor.sql(query, index_col=index_col, **kwargs)
@@ -305,11 +302,12 @@ class PandasSQLStringFormatter(string.Formatter):
 
 
 def _test() -> None:
-    import os
     import doctest
+    import os
     import sys
-    from pyspark.sql import SparkSession
+
     import pyspark.pandas.sql_formatter
+    from pyspark.sql import SparkSession
 
     os.chdir(os.environ["SPARK_HOME"])
 
@@ -320,7 +318,7 @@ def _test() -> None:
         .appName("pyspark.pandas.sql_formatter tests")
         .getOrCreate()
     )
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.sql_formatter,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

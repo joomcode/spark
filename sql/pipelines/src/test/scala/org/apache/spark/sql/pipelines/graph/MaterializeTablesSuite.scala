@@ -17,14 +17,22 @@
 
 package org.apache.spark.sql.pipelines.graph
 
+import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
 import org.apache.spark.SparkThrowable
-import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.classic.SparkSession
-import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Identifier, TableCatalog}
+import org.apache.spark.sql.{AnalysisException, Row, SQLContext}
+import org.apache.spark.sql.connector.catalog.{
+  CatalogV2Util,
+  Identifier,
+  InMemoryTableCatalog,
+  Table => V2Table,
+  TableCatalog,
+  TableChange
+}
 import org.apache.spark.sql.connector.expressions.{ClusterByTransform, Expressions, FieldReference}
 import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.pipelines.graph.DatasetManager.TableMaterializationException
 import org.apache.spark.sql.pipelines.utils.{BaseCoreExecutionTest, TestGraphRegistrationContext}
 import org.apache.spark.sql.test.SharedSparkSession
@@ -38,9 +46,9 @@ class DefaultMaterializeTablesSuite extends MaterializeTablesSuite with SharedSp
  * tables are written with the appropriate schemas.
  */
 abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
+  import testImplicits._
+
   test("basic") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -124,8 +132,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("multiple") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -162,8 +168,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("temporary views don't get materialized") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -239,8 +243,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("schema matches existing table schema") {
-    val session = spark
-    import session.implicits._
 
     sql(s"CREATE TABLE ${TestGraphRegistrationContext.DEFAULT_DATABASE}.t2(x INT)")
     val catalog = spark.sessionState.catalogManager.currentCatalog.asInstanceOf[TableCatalog]
@@ -268,9 +270,7 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("invalid schema merge") {
-    val session = spark
-    implicit val sparkSession: SparkSession = spark
-    import session.implicits._
+    implicit val sqlCtx: SQLContext = spark.sqlContext
 
     val streamInts = MemoryStream[Int]
     streamInts.addData(1, 2)
@@ -299,8 +299,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("table materialized with specified schema, even if different from inferred") {
-    val session = spark
-    import session.implicits._
 
     sql(s"CREATE TABLE ${TestGraphRegistrationContext.DEFAULT_DATABASE}.t4(x INT)")
     val catalog = spark.sessionState.catalogManager.currentCatalog.asInstanceOf[TableCatalog]
@@ -338,8 +336,7 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("specified schema incompatible with existing table") {
-    val session = spark
-    import session.implicits._
+    implicit val sqlCtx: SQLContext = spark.sqlContext
 
     sql(s"CREATE TABLE ${TestGraphRegistrationContext.DEFAULT_DATABASE}.t6(x BOOLEAN)")
     val catalog = spark.sessionState.catalogManager.currentCatalog.asInstanceOf[TableCatalog]
@@ -353,7 +350,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
 
     val ex = intercept[TableMaterializationException] {
       materializeGraph(new TestGraphRegistrationContext(spark) {
-        implicit val sparkSession: SparkSession = spark
         val source: MemoryStream[Int] = MemoryStream[Int]
         source.addData(1, 2)
         registerTable(
@@ -385,8 +381,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("partition columns with user schema") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -415,8 +409,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("specifying partition column with existing partitioned table") {
-    val session = spark
-    import session.implicits._
 
     sql(
       s"CREATE TABLE ${TestGraphRegistrationContext.DEFAULT_DATABASE}.t7(x BOOLEAN, y INT) " +
@@ -482,8 +474,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("specifying partition column different from existing partitioned table") {
-    val session = spark
-    import session.implicits._
 
     sql(
       s"CREATE TABLE ${TestGraphRegistrationContext.DEFAULT_DATABASE}.t8(x BOOLEAN, y INT) " +
@@ -547,8 +537,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("Invalid table properties error during table materialization") {
-    val session = spark
-    import session.implicits._
 
     // Invalid pipelines property
     val graph1 =
@@ -578,7 +566,7 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
 
     val graph1 = new TestGraphRegistrationContext(spark) {
       registerTable("a", query = Option(dfFlowFunc(spark.readStream.format("rate").load())))
-    }.resolveToDataflowGraph().validate()
+    }.resolveToDataflowGraph().validate(spark.sessionState.conf.caseSensitiveAnalysis)
 
     materializeGraph(graph1, storageRoot = storageRoot)
   }
@@ -587,9 +575,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
     test(
       s"Complete tables should not evolve schema - isFullRefresh = $isFullRefresh"
     ) {
-      val session = spark
-      import session.implicits._
-
       val rawGraph =
         new TestGraphRegistrationContext(spark) {
           registerView("a", query = dfFlowFunc(Seq((1, 2), (2, 3)).toDF("x", "y")))
@@ -645,9 +630,7 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
     test(
       s"Streaming tables should evolve schema only if not full refresh = $isFullRefresh"
     ) {
-      val session = spark
-      implicit val sparkSession: SparkSession = spark
-      import session.implicits._
+      implicit val sqlCtx: SQLContext = spark.sqlContext
 
       val streamInts = MemoryStream[Int]
       streamInts.addData(1 until 5: _*)
@@ -656,7 +639,7 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
         new TestGraphRegistrationContext(spark) {
           registerView("a", query = dfFlowFunc(streamInts.toDF()))
           registerTable("b", query = Option(sqlFlowFunc(spark, "SELECT value AS x FROM STREAM a")))
-        }.resolveToDataflowGraph().validate()
+        }.resolveToDataflowGraph().validate(spark.sessionState.conf.caseSensitiveAnalysis)
 
       val (refreshSelection, fullRefreshSelection) = if (isFullRefresh) {
         (NoTables, AllTables)
@@ -686,7 +669,7 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
         new TestGraphRegistrationContext(spark) {
           registerView("a", query = dfFlowFunc(streamInts.toDF()))
           registerTable("b", query = Option(sqlFlowFunc(spark, "SELECT value AS y FROM STREAM a")))
-        }.resolveToDataflowGraph().validate(),
+        }.resolveToDataflowGraph().validate(spark.sessionState.conf.caseSensitiveAnalysis),
         contextOpt = updateContextOpt,
         storageRoot = storageRoot
       )
@@ -714,8 +697,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   test(
     "materialize only selected tables"
   ) {
-    val session = spark
-    import session.implicits._
 
     val graph = new TestGraphRegistrationContext(spark) {
       registerTable("a", query = Option(dfFlowFunc(Seq((1, 2), (2, 3)).toDF("x", "y"))))
@@ -761,8 +742,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("tables with arrays and maps") {
-    val session = spark
-    import session.implicits._
 
     val rawGraph =
       new TestGraphRegistrationContext(spark) {
@@ -857,8 +836,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("materializing no tables doesn't throw") {
-    val session = spark
-    import session.implicits._
 
     val graph1 =
       new DataflowGraph(flows = Seq.empty, tables = Seq.empty, views = Seq.empty, sinks = Seq.empty)
@@ -888,8 +865,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("cluster columns with user schema") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -925,8 +900,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("specifying cluster column with existing clustered table") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -981,8 +954,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("specifying cluster column different from existing clustered table") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -1020,8 +991,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("cluster columns only (no partitioning)") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -1059,8 +1028,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("materialized view with cluster columns") {
-    val session = spark
-    import session.implicits._
 
     materializeGraph(
       new TestGraphRegistrationContext(spark) {
@@ -1090,8 +1057,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("partition and cluster columns together should fail") {
-    val session = spark
-    import session.implicits._
 
     val ex = intercept[TableMaterializationException] {
       materializeGraph(
@@ -1112,8 +1077,6 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
   }
 
   test("cluster column that doesn't exist in table schema should fail") {
-    val session = spark
-    import session.implicits._
 
     val ex = intercept[TableMaterializationException] {
       materializeGraph(
@@ -1128,5 +1091,549 @@ abstract class MaterializeTablesSuite extends BaseCoreExecutionTest {
       )
     }
     assert(ex.cause.isInstanceOf[AnalysisException])
+  }
+
+  // =============== Table evolution in catalog tests ===============
+
+  private val recordingCatalogName = "recording_cat"
+  private val recordingNamespace = "rec_ns"
+
+  /**
+   * Registers [[RecordingInMemoryTableCatalog]] under `recordingCatalogName`, creates
+   * `recordingNamespace`, runs `body`, then tears the registration back down.
+   */
+  private def withRecordingCatalog(body: => Unit): Unit = {
+    spark.conf.set(
+      s"spark.sql.catalog.$recordingCatalogName",
+      classOf[RecordingInMemoryTableCatalog].getName
+    )
+    try {
+      spark.sql(s"CREATE NAMESPACE IF NOT EXISTS $recordingCatalogName.$recordingNamespace")
+      body
+    } finally {
+      spark.sessionState.catalogManager.reset()
+      spark.sessionState.conf.unsetConf(s"spark.sql.catalog.$recordingCatalogName")
+    }
+  }
+
+  /**
+   * Materializes a single streaming table under the recording catalog/namespace with the given
+   * schema and properties.
+   */
+  private def materializeStreamingTable(
+      name: String,
+      schema: StructType,
+      properties: Map[String, String]): Unit = {
+    // All nulls dummy row, compatible with any schema type
+    val row = Row.fromSeq(Seq.fill(schema.length)(null))
+    val df = spark.createDataFrame(spark.sparkContext.parallelize(Seq(row)), schema)
+    materializeGraph(
+      new TestGraphRegistrationContext(spark) {
+        registerTable(
+          name,
+          query = Option(dfFlowFunc(df)),
+          specifiedSchema = Option(schema),
+          properties = properties,
+          catalog = Option(recordingCatalogName),
+          database = Option(recordingNamespace)
+        )
+      }.resolveToDataflowGraph(),
+      storageRoot = storageRoot
+    )
+  }
+
+  private def recordingCatalog: RecordingInMemoryTableCatalog =
+    spark.sessionState.catalogManager
+      .catalog(recordingCatalogName)
+      .asInstanceOf[RecordingInMemoryTableCatalog]
+
+  private def loadTableFromRecordingCatalog(name: String): V2Table = {
+    val catalog = spark.sessionState.catalogManager
+      .catalog(recordingCatalogName)
+      .asInstanceOf[TableCatalog]
+    catalog.loadTable(Identifier.of(Array(recordingNamespace), name))
+  }
+
+  test("re-materializing an unchanged table does not issue an alterTable") {
+    withRecordingCatalog {
+      val schema = new StructType().add("id", IntegerType).add("value", StringType)
+      val props = Map("p.a" -> "1", "p.b" -> "2")
+      // Creating the table issues no alter, and re-materializing the unchanged table is a no-op,
+      // so no alter is ever recorded.
+      materializeStreamingTable("t", schema, props)
+      assert(recordingCatalog.recordedAlters.isEmpty)
+      materializeStreamingTable("t", schema, props)
+      assert(recordingCatalog.recordedAlters.isEmpty)
+    }
+  }
+
+  test("re-materializing with changed/new properties issues an alterTable that sets them") {
+    withRecordingCatalog {
+      val schema = new StructType().add("id", IntegerType).add("value", StringType)
+      // Creating the table issues no alter; re-materializing with changed/added properties issues
+      // exactly one alter that sets them.
+      materializeStreamingTable("t", schema, Map("p.a" -> "1"))
+      assert(recordingCatalog.recordedAlters.isEmpty)
+      materializeStreamingTable("t", schema, Map("p.a" -> "2", "p.new" -> "n"))
+      assert(recordingCatalog.recordedAlters.size == 1)
+
+      val changes = recordingCatalog.recordedAlters.flatten
+      assert(changes.forall(_.isInstanceOf[TableChange.SetProperty]))
+      val set = changes.collect {
+        case s: TableChange.SetProperty => s.property() -> s.value()
+      }.toMap
+      assert(set == Map("p.a" -> "2", "p.new" -> "n"))
+
+      val table = loadTableFromRecordingCatalog("t")
+      assert(table.properties().get("p.a") == "2")
+      assert(table.properties().get("p.new") == "n")
+    }
+  }
+
+  test("re-materializing with an added column issues an alterTable") {
+    withRecordingCatalog {
+      // Creating the table issues no alter; re-materializing with an added column issues exactly
+      // one alter that adds it.
+      materializeStreamingTable("t", new StructType().add("id", IntegerType), Map("p.a" -> "1"))
+      assert(recordingCatalog.recordedAlters.isEmpty)
+      materializeStreamingTable(
+        "t",
+        new StructType().add("id", IntegerType).add("value", StringType),
+        Map("p.a" -> "1")
+      )
+      assert(recordingCatalog.recordedAlters.size == 1)
+
+      val changes = recordingCatalog.recordedAlters.flatten
+      assert(changes.exists(_.isInstanceOf[TableChange.AddColumn]))
+
+      assert(
+        loadTableFromRecordingCatalog("t").columns() sameElements
+          CatalogV2Util.structTypeToV2Columns(
+            new StructType().add("id", IntegerType).add("value", StringType)
+          )
+      )
+    }
+  }
+
+  test("SPARK-58517: re-materializing with a case-only column difference is a no-op under " +
+    "case-insensitive resolution") {
+    withRecordingCatalog {
+      withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
+        // Create the table with `value`, then re-materialize with the same column cased as `Value`.
+        // Under case-insensitive resolution these are the same column, so schema evolution must
+        // fold `Value` onto the existing `value`: no alterTable, and the persisted column keeps its
+        // original name/case. Before SPARK-58517 the case-sensitive merge instead added a second
+        // `Value` column, corrupting the table.
+        materializeStreamingTable(
+          "t", new StructType().add("id", IntegerType).add("value", StringType), Map.empty)
+        assert(recordingCatalog.recordedAlters.isEmpty)
+
+        materializeStreamingTable(
+          "t", new StructType().add("id", IntegerType).add("Value", StringType), Map.empty)
+        assert(recordingCatalog.recordedAlters.isEmpty,
+          s"expected no alter, got: ${recordingCatalog.recordedAlters}")
+
+        assert(
+          loadTableFromRecordingCatalog("t").columns() sameElements
+            CatalogV2Util.structTypeToV2Columns(
+              new StructType().add("id", IntegerType).add("value", StringType)
+            ),
+          "the persisted schema should keep the original `value` column, not gain a `Value` column"
+        )
+      }
+    }
+  }
+
+  test("SPARK-58517: multi-flow schema inference folds case-only column differences under " +
+    "case-insensitive resolution") {
+    withRecordingCatalog {
+      withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
+        // Two append flows write to the same streaming table, one emitting `value` and the other
+        // `Value`. The target schema is INFERRED by merging the flows' schemas, which happens
+        // before the evolveTable path runs -- so inference must honor case-insensitivity too,
+        // otherwise the table is created with both columns and the engine's own resolver cannot
+        // disambiguate them.
+        val df1 = spark.createDataFrame(
+          spark.sparkContext.parallelize(Seq(Row(1, "a"))),
+          new StructType().add("id", IntegerType).add("value", StringType))
+        val df2 = spark.createDataFrame(
+          spark.sparkContext.parallelize(Seq(Row(2, "b"))),
+          new StructType().add("id", IntegerType).add("Value", StringType))
+
+        val ctx = new TestGraphRegistrationContext(spark) {
+          registerTable(
+            "t",
+            catalog = Option(recordingCatalogName),
+            database = Option(recordingNamespace))
+          registerFlow(
+            "t", "f1", dfFlowFunc(df1),
+            catalog = Option(recordingCatalogName), database = Option(recordingNamespace))
+          registerFlow(
+            "t", "f2", dfFlowFunc(df2),
+            catalog = Option(recordingCatalogName), database = Option(recordingNamespace))
+        }
+
+        val graph = ctx.resolveToDataflowGraph()
+        val inferredSchemas = graph.inferSchemas(spark.sessionState.conf.caseSensitiveAnalysis)
+        val (_, inferred) = inferredSchemas.head
+        // The two spellings fold into a single column, and the lowest flow identifier supplies the
+        // surviving spelling: `f1` sorts before `f2`, so `value` wins.
+        assert(inferred.fieldNames.toSeq === Seq("id", "value"))
+      }
+    }
+  }
+
+  test("SPARK-58517: a case-only fold picks the same spelling for the materialized table and for " +
+    "downstream resolution, in either flow declaration order") {
+    // The table's schema is derived twice from the same flows, by two different callers: the graph
+    // materializes the table from `inferSchemas`, while downstream flows resolve against the
+    // `VirtualTableInput` schema, whose `availableFlows` is in declaration order, not sorted. Both
+    // go through `inferSchemaFromFlows`, which merges in sorted flow identifier order, so the
+    // surviving spelling is the same on both paths and does not depend on declaration order. Were
+    // the two to disagree, the downstream view would persist a column spelled differently from the
+    // source column it selects, and -- because `diffSchemas` keys on exact names -- reordering the
+    // flow definitions would turn the next refresh into a drop-then-add of that column.
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
+      // `f_eu` sorts before `f_us`, so `value` is the surviving spelling in both orders.
+      def graphWithFlowsDeclared(usFirst: Boolean): DataflowGraph = {
+        val usDf = spark.createDataFrame(
+          spark.sparkContext.parallelize(Seq(Row(1, "a"))),
+          new StructType().add("id", IntegerType).add("Value", StringType))
+        val euDf = spark.createDataFrame(
+          spark.sparkContext.parallelize(Seq(Row(2, "b"))),
+          new StructType().add("id", IntegerType).add("value", StringType))
+
+        new TestGraphRegistrationContext(spark) {
+          registerTable("events")
+          val registerUs = () => registerFlow("events", "f_us", dfFlowFunc(usDf))
+          val registerEu = () => registerFlow("events", "f_eu", dfFlowFunc(euDf))
+          if (usFirst) {
+            registerUs()
+            registerEu()
+          } else {
+            registerEu()
+            registerUs()
+          }
+          // Reads the table, so it resolves against the VirtualTableInput schema.
+          registerMaterializedView(
+            "events_summary",
+            query = sqlFlowFunc(spark, "SELECT id, value FROM events"))
+        }.resolveToDataflowGraph()
+      }
+
+      Seq(true, false).foreach { usFirst =>
+        val graph = graphWithFlowsDeclared(usFirst)
+        val sessionCaseSensitive = spark.sessionState.conf.caseSensitiveAnalysis
+        val eventsIdentifier = fullyQualifiedIdentifier("events")
+
+        val materializedSchema = graph.inferSchemas(sessionCaseSensitive)(eventsIdentifier)
+        assert(
+          materializedSchema.fieldNames.toSeq === Seq("id", "value"),
+          s"materialized schema for usFirst=$usFirst")
+
+        // The downstream view's own schema reflects what it resolved against upstream: Spark takes
+        // the resolved attribute's name, so a `Value` upstream would surface here as `Value`.
+        val summarySchema = graph
+          .inferSchemas(sessionCaseSensitive)(fullyQualifiedIdentifier("events_summary"))
+        assert(
+          summarySchema.fieldNames.toSeq === Seq("id", "value"),
+          s"downstream schema for usFirst=$usFirst")
+      }
+    }
+  }
+
+  test("multi-flow schema inference keeps case-only column differences distinct under " +
+    "case-sensitive resolution") {
+    withRecordingCatalog {
+      withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+        // The case-sensitive control: `value` and `Value` are distinct columns, so inference
+        // contributes both.
+        val df1 = spark.createDataFrame(
+          spark.sparkContext.parallelize(Seq(Row(1, "a"))),
+          new StructType().add("id", IntegerType).add("value", StringType))
+        val df2 = spark.createDataFrame(
+          spark.sparkContext.parallelize(Seq(Row(2, "b"))),
+          new StructType().add("id", IntegerType).add("Value", StringType))
+
+        val ctx = new TestGraphRegistrationContext(spark) {
+          registerTable(
+            "t",
+            catalog = Option(recordingCatalogName),
+            database = Option(recordingNamespace))
+          registerFlow(
+            "t", "f1", dfFlowFunc(df1),
+            catalog = Option(recordingCatalogName), database = Option(recordingNamespace))
+          registerFlow(
+            "t", "f2", dfFlowFunc(df2),
+            catalog = Option(recordingCatalogName), database = Option(recordingNamespace))
+        }
+
+        val graph = ctx.resolveToDataflowGraph()
+        val inferred = graph.inferSchemas(
+          spark.sessionState.conf.caseSensitiveAnalysis).values.head
+        // Both spellings survive as distinct columns in sorted flow identifier order.
+        assert(inferred.fieldNames.toSeq === Seq("id", "value", "Value"))
+      }
+    }
+  }
+
+  test("SPARK-58517: a materialized view's case-only column rename is applied under " +
+    "case-insensitive resolution") {
+    // The non-merging path: for a materialized view `targetSchema` is the run's declared schema
+    // as-is (no merge with the persisted schema), so a case-only rename must remain visible to
+    // `diffSchemas` as a drop-then-add. Case-insensitive matching here would emit no change at all
+    // and freeze the persisted spelling forever -- the table would permanently disagree with its
+    // definition, with no error pointing at the discrepancy, and a colleague materializing the same
+    // definition against a fresh table would get the declared casing instead.
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
+      materializeGraph(
+        new TestGraphRegistrationContext(spark) {
+          registerView("src", query = dfFlowFunc(Seq((1, 2L)).toDF("id", "total")))
+          registerMaterializedView("mv", query = sqlFlowFunc(spark, "SELECT id, total FROM src"))
+        }.resolveToDataflowGraph(),
+        storageRoot = storageRoot
+      )
+
+      val catalog = spark.sessionState.catalogManager.currentCatalog.asInstanceOf[TableCatalog]
+      val identifier = Identifier.of(Array(TestGraphRegistrationContext.DEFAULT_DATABASE), "mv")
+      assert(
+        catalog.loadTable(identifier).columns() sameElements CatalogV2Util.structTypeToV2Columns(
+          new StructType().add("id", IntegerType).add("total", LongType))
+      )
+
+      // Re-materialize with the column cased as `Total`. The table must follow the definition.
+      materializeGraph(
+        new TestGraphRegistrationContext(spark) {
+          registerView("src", query = dfFlowFunc(Seq((1, 2L)).toDF("id", "total")))
+          registerMaterializedView(
+            "mv", query = sqlFlowFunc(spark, "SELECT id, total AS Total FROM src"))
+        }.resolveToDataflowGraph(),
+        storageRoot = storageRoot
+      )
+      assert(
+        catalog.loadTable(identifier).columns() sameElements CatalogV2Util.structTypeToV2Columns(
+          new StructType().add("id", IntegerType).add("Total", LongType)),
+        "the materialized view should adopt the declared `Total` casing, not keep `total`"
+      )
+    }
+  }
+
+  test("SPARK-58517: a full-refreshed streaming table's case-only column rename is applied " +
+    "under case-insensitive resolution") {
+    // The streaming-table analog of the materialized-view case above: a full refresh also takes
+    // `targetSchema` as the declared schema without merging, so the same case-only rename must be
+    // applied rather than silently ignored.
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
+      val graph = materializeGraph(
+        new TestGraphRegistrationContext(spark) {
+          registerView("src", query = dfFlowFunc(Seq((1, 2L)).toDF("id", "total")))
+          registerTable("st", query = Option(sqlFlowFunc(spark, "SELECT id, total FROM src")))
+        }.resolveToDataflowGraph(),
+        storageRoot = storageRoot
+      )
+
+      val catalog = spark.sessionState.catalogManager.currentCatalog.asInstanceOf[TableCatalog]
+      val identifier = Identifier.of(Array(TestGraphRegistrationContext.DEFAULT_DATABASE), "st")
+      assert(
+        catalog.loadTable(identifier).columns() sameElements CatalogV2Util.structTypeToV2Columns(
+          new StructType().add("id", IntegerType).add("total", LongType))
+      )
+
+      val renamedGraph =
+        new TestGraphRegistrationContext(spark) {
+          registerView("src", query = dfFlowFunc(Seq((1, 2L)).toDF("id", "total")))
+          registerTable(
+            "st", query = Option(sqlFlowFunc(spark, "SELECT id, total AS Total FROM src")))
+        }.resolveToDataflowGraph()
+
+      materializeGraph(
+        renamedGraph,
+        contextOpt = Option(
+          TestPipelineUpdateContext(
+            spark = spark,
+            unresolvedGraph = graph,
+            refreshTables = NoTables,
+            fullRefreshTables = AllTables,
+            storageRoot = storageRoot
+          )
+        ),
+        storageRoot = storageRoot
+      )
+      assert(
+        catalog.loadTable(identifier).columns() sameElements CatalogV2Util.structTypeToV2Columns(
+          new StructType().add("id", IntegerType).add("Total", LongType)),
+        "a full-refreshed streaming table should adopt the declared `Total` casing"
+      )
+    }
+  }
+
+  test("re-materializing with a case-only column difference adds a column under case-sensitive " +
+    "resolution") {
+    withRecordingCatalog {
+      withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+        // The case-sensitive counterpart: `value` and `Value` are distinct, so `Value` is added.
+        materializeStreamingTable(
+          "t", new StructType().add("id", IntegerType).add("value", StringType), Map.empty)
+        assert(recordingCatalog.recordedAlters.isEmpty)
+
+        materializeStreamingTable(
+          "t", new StructType().add("id", IntegerType).add("Value", StringType), Map.empty)
+        assert(recordingCatalog.recordedAlters.size == 1)
+        val changes = recordingCatalog.recordedAlters.flatten
+        assert(changes.collect { case ac: TableChange.AddColumn => ac.fieldNames()(0) } ==
+          Seq("Value"))
+      }
+    }
+  }
+
+  test("SPARK-58517: schema evolution uses the pipeline's case sensitivity, not the session's") {
+    // A pipeline-level `SET spark.sql.caseSensitive` never reaches the session, so evolution must
+    // read it from the flows. Here the session default is case-INsensitive while the pipeline asks
+    // for case-SENSITIVE, so `Value` must become its own column alongside the persisted `value` --
+    // matching how the flow itself resolves the name.
+    withRecordingCatalog {
+      withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
+        materializeGraph(
+          new TestGraphRegistrationContext(
+            spark, Map(SQLConf.CASE_SENSITIVE.key -> "true")) {
+            registerView("src", query = dfFlowFunc(Seq((1, "a")).toDF("id", "value")))
+            registerTable(
+              "t",
+              query = Option(sqlFlowFunc(spark, "SELECT id, value FROM src")),
+              catalog = Option(recordingCatalogName),
+              database = Option(recordingNamespace))
+          }.resolveToDataflowGraph(),
+          storageRoot = storageRoot
+        )
+        assert(
+          loadTableFromRecordingCatalog("t").columns() sameElements
+            CatalogV2Util.structTypeToV2Columns(
+              new StructType().add("id", IntegerType).add("value", StringType)))
+
+        materializeGraph(
+          new TestGraphRegistrationContext(
+            spark, Map(SQLConf.CASE_SENSITIVE.key -> "true")) {
+            registerView("src", query = dfFlowFunc(Seq((1, "a")).toDF("id", "value")))
+            registerTable(
+              "t",
+              query = Option(sqlFlowFunc(spark, "SELECT id, value AS Value FROM src")),
+              catalog = Option(recordingCatalogName),
+              database = Option(recordingNamespace))
+          }.resolveToDataflowGraph(),
+          storageRoot = storageRoot
+        )
+        assert(
+          loadTableFromRecordingCatalog("t").columns() sameElements
+            CatalogV2Util.structTypeToV2Columns(
+              new StructType()
+                .add("id", IntegerType)
+                .add("value", StringType)
+                .add("Value", StringType)),
+          "the pipeline asked for case-sensitive resolution, so `Value` must be its own column")
+      }
+    }
+  }
+
+  test("SPARK-58517: flows writing to one table that disagree on case sensitivity are rejected") {
+    // The effective value decides whether names differing only in case identify the same column, so
+    // if the flows disagree the resulting schema would depend on the order they are evaluated in.
+    // Fail with a clear error instead of picking one arbitrarily.
+    val ctx = new TestGraphRegistrationContext(spark) {
+      registerView("src", query = dfFlowFunc(Seq((1, "a")).toDF("id", "value")))
+      registerTable("t")
+      registerFlow(
+        "t", "f1", sqlFlowFunc(spark, "SELECT id, value FROM src"),
+        sqlConf = Map(SQLConf.CASE_SENSITIVE.key -> "true"))
+      registerFlow(
+        "t", "f2", sqlFlowFunc(spark, "SELECT id, value AS Value FROM src"),
+        sqlConf = Map(SQLConf.CASE_SENSITIVE.key -> "false"))
+    }
+
+    val ex = intercept[AnalysisException] {
+      ctx.resolveToDataflowGraph().inferSchemas(
+        spark.sessionState.conf.caseSensitiveAnalysis)
+    }
+    checkError(
+      exception = ex,
+      condition = "CONFLICTING_PIPELINE_FLOW_CASE_SENSITIVITY",
+      parameters = Map(
+        "tableName" -> "spark_catalog.test_db.t",
+        "configKey" -> SQLConf.CASE_SENSITIVE.key,
+        "flowConfigurations" ->
+          ("false (spark_catalog.test_db.f2); true (spark_catalog.test_db.f1)")
+      )
+    )
+  }
+
+  test("SPARK-58517: a flow inheriting the session value conflicts with one that overrides it") {
+    // f2 leaves the conf unset, so it inherits the session's case-INsensitive default, which
+    // conflicts with f1's explicit case-sensitive request just as much as an opposite explicit
+    // value would.
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
+      val ctx = new TestGraphRegistrationContext(spark) {
+        registerView("src", query = dfFlowFunc(Seq((1, "a")).toDF("id", "value")))
+        registerTable("t")
+        registerFlow(
+          "t", "f1", sqlFlowFunc(spark, "SELECT id, value FROM src"),
+          sqlConf = Map(SQLConf.CASE_SENSITIVE.key -> "true"))
+        registerFlow("t", "f2", sqlFlowFunc(spark, "SELECT id, value FROM src"))
+      }
+
+      val ex = intercept[AnalysisException] {
+        ctx.resolveToDataflowGraph().inferSchemas(
+          spark.sessionState.conf.caseSensitiveAnalysis)
+      }
+      assert(ex.getCondition === "CONFLICTING_PIPELINE_FLOW_CASE_SENSITIVITY")
+      assert(ex.getMessage.contains("session default"))
+    }
+  }
+
+  test("SPARK-58517: flows that agree on case sensitivity are accepted") {
+    // The negative control: identical explicit values are not a conflict, and neither is a value
+    // that merely differs in spelling from the session's ("TRUE" vs "true").
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
+      val ctx = new TestGraphRegistrationContext(spark) {
+        registerView("src", query = dfFlowFunc(Seq((1, "a")).toDF("id", "value")))
+        registerTable("t")
+        registerFlow(
+          "t", "f1", sqlFlowFunc(spark, "SELECT id, value FROM src"),
+          sqlConf = Map(SQLConf.CASE_SENSITIVE.key -> "true"))
+        registerFlow(
+          "t", "f2", sqlFlowFunc(spark, "SELECT id, value AS Value FROM src"),
+          sqlConf = Map(SQLConf.CASE_SENSITIVE.key -> "TRUE"))
+      }
+      val inferred = ctx.resolveToDataflowGraph()
+        .inferSchemas(spark.sessionState.conf.caseSensitiveAnalysis)(
+          fullyQualifiedIdentifier("t"))
+      // Case-sensitive, so both spellings survive.
+      assert(inferred.fieldNames.toSeq === Seq("id", "value", "Value"))
+    }
+  }
+
+  test("re-materializing with a dropped property neither removes it nor issues an alterTable") {
+    withRecordingCatalog {
+      val schema = new StructType().add("id", IntegerType)
+      // This test locks in the current buggy behavior where dropped properties do not materialize
+      // against the catalog table entity. See SPARK-57670.
+      materializeStreamingTable("t", schema, Map("p.keep" -> "v", "p.stale" -> "old"))
+      assert(recordingCatalog.recordedAlters.isEmpty)
+      materializeStreamingTable("t", schema, Map("p.keep" -> "v"))
+      assert(recordingCatalog.recordedAlters.isEmpty)
+
+      assert(loadTableFromRecordingCatalog("t").properties().get("p.stale") == "old")
+    }
+  }
+}
+
+/**
+ * An [[InMemoryTableCatalog]] that records every `alterTable` invocation while still applying it,
+ * so tests can assert whether materialization issued an alter or skipped it as a no-op.
+ */
+class RecordingInMemoryTableCatalog extends InMemoryTableCatalog {
+  val recordedAlters: mutable.ArrayBuffer[Seq[TableChange]] = mutable.ArrayBuffer.empty
+
+  override def alterTable(ident: Identifier, changes: TableChange*): V2Table = {
+    recordedAlters += changes.toSeq
+    super.alterTable(ident, changes: _*)
   }
 }

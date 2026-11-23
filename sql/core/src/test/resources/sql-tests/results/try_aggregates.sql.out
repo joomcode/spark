@@ -157,7 +157,7 @@ org.apache.spark.SparkArithmeticException
   "messageParameters" : {
     "alternative" : " Use 'try_add' to tolerate overflow and return NULL instead.",
     "config" : "\"spark.sql.ansi.enabled\"",
-    "message" : "long overflow"
+    "message" : "overflow"
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -244,7 +244,7 @@ SELECT try_avg(col) FROM VALUES (9223372036854775807L), (1L) AS tab(col)
 -- !query schema
 struct<try_avg(col):double>
 -- !query output
-4.6116860184273879E18
+4.611686018427388E18
 
 
 -- !query
@@ -365,7 +365,7 @@ org.apache.spark.SparkArithmeticException
   "messageParameters" : {
     "alternative" : " Use 'try_add' to tolerate overflow and return NULL instead.",
     "config" : "\"spark.sql.ansi.enabled\"",
-    "message" : "long overflow"
+    "message" : "overflow"
   },
   "queryContext" : [ {
     "objectType" : "",

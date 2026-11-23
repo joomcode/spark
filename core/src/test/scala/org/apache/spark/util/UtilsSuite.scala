@@ -23,11 +23,12 @@ import java.lang.reflect.Field
 import java.net.{BindException, ServerSocket, URI}
 import java.nio.{ByteBuffer, ByteOrder}
 import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.Files
+import java.nio.file.{Files, FileSystems}
+import java.nio.file.attribute.{PosixFilePermission, PosixFilePermissions}
 import java.text.DecimalFormatSymbols
 import java.util.Locale
-import java.util.concurrent.TimeUnit
-import java.util.zip.GZIPOutputStream
+import java.util.concurrent.{CyclicBarrier, TimeUnit}
+import java.util.zip.{GZIPOutputStream, ZipEntry, ZipOutputStream}
 
 import scala.collection.mutable.ListBuffer
 import scala.util.{Random, Try}
@@ -39,6 +40,7 @@ import org.apache.hadoop.fs.audit.CommonAuditContext.currentAuditContext
 import org.apache.hadoop.ipc.{CallerContext => HadoopCallerContext}
 import org.apache.logging.log4j.Level
 import org.mockito.Mockito.when
+import org.scalatest.time.SpanSugar._
 import org.scalatestplus.mockito.MockitoSugar.mock
 
 import org.apache.spark.{SparkConf, SparkException, SparkFunSuite, TaskContext}
@@ -134,10 +136,25 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
 
     assert(Utils.byteStringAsBytes("1") === 1)
     assert(Utils.byteStringAsBytes("1k") === ByteUnit.KiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1Ki") === ByteUnit.KiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1KB") === ByteUnit.KiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1KiB") === ByteUnit.KiB.toBytes(1))
     assert(Utils.byteStringAsBytes("1m") === ByteUnit.MiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1Mi") === ByteUnit.MiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1Mb") === ByteUnit.MiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1MiB") === ByteUnit.MiB.toBytes(1))
     assert(Utils.byteStringAsBytes("1g") === ByteUnit.GiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1GI") === ByteUnit.GiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1gb") === ByteUnit.GiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1giB") === ByteUnit.GiB.toBytes(1))
     assert(Utils.byteStringAsBytes("1t") === ByteUnit.TiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1Ti") === ByteUnit.TiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1tb") === ByteUnit.TiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1Tib") === ByteUnit.TiB.toBytes(1))
     assert(Utils.byteStringAsBytes("1p") === ByteUnit.PiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1pi") === ByteUnit.PiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1pb") === ByteUnit.PiB.toBytes(1))
+    assert(Utils.byteStringAsBytes("1pib") === ByteUnit.PiB.toBytes(1))
 
     // Overflow handling, 1073741824p exceeds Long.MAX_VALUE if converted straight to Bytes
     // This demonstrates that we can have e.g 1024^3 PiB without overflowing.
@@ -512,32 +529,31 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
     val scenario4 = new File(testDir, "scenario4")
     assert(testDir.canWrite)
     assert(testDir.setWritable(false))
-    assert(!Utils.createDirectory(scenario4))
-    assert(!scenario4.exists())
-    assertThrows[IOException](Utils.createDirectory(testDirPath, "scenario4"))
+    // Skip when write permission cannot actually be revoked (e.g., running as root).
+    if (!testDir.canWrite) {
+      assert(!Utils.createDirectory(scenario4))
+      assert(!scenario4.exists())
+      assertThrows[IOException](Utils.createDirectory(testDirPath, "scenario4"))
+    }
     assert(testDir.setWritable(true))
 
     // 5. The parent directory cannot execute
     val scenario5 = new File(testDir, "scenario5")
     assert(testDir.canExecute)
     assert(testDir.setExecutable(false))
-    assert(!Utils.createDirectory(scenario5))
-    assert(!scenario5.exists())
-    assertThrows[IOException](Utils.createDirectory(testDirPath, "scenario5"))
+    // Skip when execute permission cannot actually be revoked (e.g., running as root).
+    if (!testDir.canExecute) {
+      assert(!Utils.createDirectory(scenario5))
+      assert(!scenario5.exists())
+      assertThrows[IOException](Utils.createDirectory(testDirPath, "scenario5"))
+    }
     assert(testDir.setExecutable(true))
 
     // The following 3 scenarios are only for the method: createDirectory(File)
     // 6. Symbolic link
     val scenario6 = Files.createSymbolicLink(new File(testDir, "scenario6")
       .toPath, scenario1.toPath).toFile
-    if (Utils.isJavaVersionAtLeast21) {
-      assert(Utils.createDirectory(scenario6))
-    } else if (Runtime.version().feature() == 17 && Runtime.version().update() >= 14) {
-      // SPARK-50946: Java 17.0.14 includes JDK-8294193, so scenario6 can succeed.
-      assert(Utils.createDirectory(scenario6))
-    } else {
-      assert(!Utils.createDirectory(scenario6))
-    }
+    assert(Utils.createDirectory(scenario6))
     assert(scenario6.exists())
 
     // 7. Directory exists
@@ -549,6 +565,70 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
     val scenario8 = new File(testDir.getCanonicalPath + File.separator + "scenario8")
     assert(scenario8.createNewFile())
     assert(!Utils.createDirectory(scenario8))
+  }
+
+  test("chmod700 leaves rwx------ under concurrent calls on the same path") {
+    // Check both the final mode and samples taken during the race: with an atomic chmod every
+    // sample is the initial or the final mode, and anything else is a non-atomic interleaving.
+    assume(FileSystems.getDefault.supportedFileAttributeViews().contains("posix"))
+    withTempDir { dir =>
+      val initialPerms = PosixFilePermissions.fromString("rwxr-xr-x")
+      val expectedPerms = PosixFilePermissions.fromString("rwx------")
+      // Start from a permissive mode so the assertions cannot pass vacuously under umask 077.
+      Files.setPosixFilePermissions(dir.toPath, initialPerms)
+      assert(Utils.chmod700(dir))
+      Files.setPosixFilePermissions(dir.toPath, initialPerms)
+      @volatile var observing = true
+      // Written only by the observer and read after observer.join(), which synchronizes.
+      var brokenStates = Set.empty[java.util.Set[PosixFilePermission]]
+      var observerError: Throwable = null
+      val observer = new Thread(() => {
+        try {
+          while (observing) {
+            val perms = Files.getPosixFilePermissions(dir.toPath)
+            if (perms != initialPerms && perms != expectedPerms) {
+              brokenStates += perms
+            }
+          }
+        } catch {
+          case t: Throwable => observerError = t
+        }
+      })
+      observer.start()
+      try {
+        val numThreads = 4
+        (1 to 10).foreach { _ =>
+          // Align the thread starts to widen the race window.
+          val barrier = new CyclicBarrier(numThreads)
+          val threads = (1 to numThreads).map { _ =>
+            new Thread(() => {
+              barrier.await()
+              (1 to 20).foreach(_ => Utils.chmod700(dir))
+            })
+          }
+          threads.foreach(_.start())
+          threads.foreach(_.join())
+          assert(Files.getPosixFilePermissions(dir.toPath) === expectedPerms)
+          // Reset so the next round also races from the permissive mode.
+          Files.setPosixFilePermissions(dir.toPath, initialPerms)
+        }
+      } finally {
+        observing = false
+        observer.join()
+      }
+      assert(observerError == null, s"Observer thread failed: $observerError")
+      assert(brokenStates.isEmpty, s"Observed non-atomic permission states: $brokenStates")
+    }
+  }
+
+  test("chmod700 returns false instead of throwing for a nonexistent path") {
+    val missing = new File(System.getProperty("java.io.tmpdir"), "chmod700-" + System.nanoTime())
+    assert(!Utils.chmod700(missing))
+  }
+
+  test("chmod700 returns false for an empty path") {
+    // The NIO empty path resolves to the process working directory; chmod700 must not touch it.
+    assert(!Utils.chmod700(new File("")))
   }
 
   test("doesDirectoryContainFilesNewerThan") {
@@ -702,11 +782,16 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
     try {
       Utils.setLogLevel(Level.ALL)
       assert(rootLogger.getLevel == Level.ALL)
-      assert(log.isInfoEnabled())
+      // Assert enablement on the root logger that `Utils.setLogLevel` controls directly, rather
+      // than on this suite's own logger. The latter is fragile: if the logging configuration
+      // contains an intermediate `org.apache.spark*` LoggerConfig, the suite logger resolves to
+      // that config instead of root, so its effective level no longer tracks `setLogLevel` even
+      // though the root level is updated correctly (as the `getLevel` assertions confirm).
+      assert(rootLogger.isInfoEnabled())
       Utils.setLogLevel(Level.ERROR)
       assert(rootLogger.getLevel == Level.ERROR)
-      assert(!log.isInfoEnabled())
-      assert(log.isErrorEnabled())
+      assert(!rootLogger.isInfoEnabled())
+      assert(rootLogger.isErrorEnabled())
     } finally {
       // Best effort at undoing changes this test made.
       Utils.setLogLevel(current)
@@ -1172,7 +1257,8 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
       "spark.hadoop.fs.s3.awsAccessKeyId",
       "spark.hadoop.fs.s3a.access.key",
       "spark.my.password",
-      "spark.my.sECreT")
+      "spark.my.sECreT",
+      "spark.sql.catalog.mycatalog.credential")
     secretKeys.foreach { key => sparkConf.set(key, "sensitive_value") }
     // Set a non-secret key
     sparkConf.set("spark.regular.property", "regular_value")
@@ -1460,6 +1546,15 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
     assert(Utils.buildLocationMetadata(paths, 18) == "(5 paths)[path0, path1, ...]")
   }
 
+  test("SPARK-58748: wildcard IPv4 and IPv6 bind addresses are not advertised driver addresses") {
+    Seq("0.0.0.0", "::", "[::]", "0:0:0:0:0:0:0:0").foreach { address =>
+      assert(Utils.isAnyLocalAddress(address), s"$address should be a wildcard address")
+    }
+    Seq("10.129.36.37", "::1", "[::1]", "2001:db8::1", "localhost").foreach { address =>
+      assert(!Utils.isAnyLocalAddress(address), s"$address should not be a wildcard address")
+    }
+  }
+
   test("checkHost supports both IPV4 and IPV6") {
     // IPV4 ips
     Utils.checkHost("0.0.0.0")
@@ -1577,7 +1672,7 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
     val sparkConf = new SparkConf()
       .set(MEMORY_OFFHEAP_ENABLED, true)
     val expected =
-      s"${MEMORY_OFFHEAP_SIZE.key} must be > 0 when ${MEMORY_OFFHEAP_ENABLED.key} == true"
+      s"${MEMORY_OFFHEAP_SIZE.key} must be at least 1MiB when ${MEMORY_OFFHEAP_ENABLED.key} == true"
     val message = intercept[IllegalArgumentException] {
       Utils.executorOffHeapMemorySizeAsMb(sparkConf)
     }.getMessage
@@ -1625,7 +1720,7 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
   }
 
   private def callGetTryAgain(t: Try[String]): String = {
-    Utils.getTryWithCallerStacktrace(t)
+    Utils.getTryWithCallerStacktrace(t, isFirstAccess = false)
   }
 
   test("doTryWithCallerStacktrace and getTryWithCallerStacktrace") {
@@ -1654,26 +1749,8 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
     assert(!st1.exists(_.getMethodName == "callDoTry"))
     assert(st1.exists(_.getMethodName == "callGetTry"))
 
-    // The original stack trace with callDoTry should be in the suppressed exceptions.
-    // Example:
-    // scalastyle:off line.size.limit
-    // Suppressed: java.lang.Exception: Full stacktrace of original doTryWithCallerStacktrace caller
-    //   at org.apache.spark.util.UtilsSuite.throwException(UtilsSuite.scala:1640)
-    //   at org.apache.spark.util.UtilsSuite.$anonfun$callDoTry$1(UtilsSuite.scala:1645)
-    //   at scala.util.Try$.apply(Try.scala:213)
-    //   at org.apache.spark.util.Utils$.doTryWithCallerStacktrace(Utils.scala:1586)
-    //   at org.apache.spark.util.UtilsSuite.callDoTry(UtilsSuite.scala:1645)
-    //   at org.apache.spark.util.UtilsSuite.$anonfun$new$165(UtilsSuite.scala:1658)
-    //   ... 56 more
-    // scalastyle:on line.size.limit
-    val origSt = e1.getSuppressed.find(_.isInstanceOf[Utils.OriginalTryStackTraceException])
-    assert(origSt.isDefined)
-    assert(origSt.get.getStackTrace.exists(_.getMethodName == "throwException"))
-    assert(origSt.get.getStackTrace.exists(_.getMethodName == "callDoTry"))
-
-    // Should save the depth of the stack trace under doTryWithCallerStacktrace.
-    assert(origSt.get.asInstanceOf[Utils.OriginalTryStackTraceException]
-      .doTryWithCallerStacktraceDepth == 4)
+    // First access (isFirstAccess = true by default) - no suppressed exception
+    assert(!e1.getSuppressed.exists(_.isInstanceOf[Utils.OriginalTryStackTraceException]))
 
     val e2 = intercept[Exception] {
       callGetTryAgain(t)
@@ -1699,6 +1776,24 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
     assert(st2.exists(_.getMethodName == "callGetTryAgain"))
     // callGetTry that we called before shouldn't be on the stack trace.
     assert(!st2.exists(_.getMethodName == "callGetTry"))
+
+    // Second access (isFirstAccess = false) - suppressed exception should be added.
+    // The original stack trace with callDoTry should be in the suppressed exceptions.
+    // Example:
+    // scalastyle:off line.size.limit
+    // Suppressed: org.apache.spark.util.Utils$OriginalTryStackTraceException: Full stacktrace of original doTryWithCallerStacktrace caller
+    //   at org.apache.spark.util.UtilsSuite.throwException(UtilsSuite.scala:1640)
+    //   at org.apache.spark.util.UtilsSuite.$anonfun$callDoTry$1(UtilsSuite.scala:1645)
+    //   at scala.util.Try$.apply(Try.scala:213)
+    //   at org.apache.spark.util.Utils$.doTryWithCallerStacktrace(Utils.scala:1586)
+    //   at org.apache.spark.util.UtilsSuite.callDoTry(UtilsSuite.scala:1645)
+    //   at org.apache.spark.util.UtilsSuite.$anonfun$new$165(UtilsSuite.scala:1658)
+    //   ... 56 more
+    // scalastyle:on line.size.limit
+    val origSt = e2.getSuppressed.find(_.isInstanceOf[Utils.OriginalTryStackTraceException])
+    assert(origSt.isDefined, "Suppressed exception should be added on subsequent access")
+    assert(origSt.get.getStackTrace.exists(_.getMethodName == "throwException"))
+    assert(origSt.get.getStackTrace.exists(_.getMethodName == "callDoTry"))
 
     // Unfortunately, this utility is not able to clone the exception, but modifies it in place,
     // so now e1 is also pointing to "callGetTryAgain" instead of "callGetTry".
@@ -1745,20 +1840,13 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
       //  at org.apache.spark.util.UtilsSuite.callDoTryNestedNested(UtilsSuite.scala:1654)
       //  at org.apache.spark.util.UtilsSuite.$anonfun$new$172(UtilsSuite.scala:1674)
       // ...
-      // Suppressed: org.apache.spark.util.Utils$OriginalTryStackTraceException: Full stacktrace of original doTryWithCallerStacktrace caller
-      //  at org.apache.spark.util.UtilsSuite.throwException(UtilsSuite.scala:1529)
-      //  at org.apache.spark.util.UtilsSuite.$anonfun$callDoTry$1(UtilsSuite.scala:1534)
-      //  at scala.util.Try$.apply(Try.scala:217)
-      //  at org.apache.spark.util.Utils$.doTryWithCallerStacktrace(Utils.scala:1377)
-      //  at org.apache.spark.util.UtilsSuite.callDoTry(UtilsSuite.scala:1534)
-      //  at org.apache.spark.util.UtilsSuite.$anonfun$callDoTryNested$1(UtilsSuite.scala:1631)
-      //  ...
       // scalastyle:on line.size.limit
 
       assert(e.getStackTrace.exists(_.getMethodName == "callGetTryFromNested"))
       assert(!e.getStackTrace.exists(_.getMethodName == "callGetTryFromNestedNested"))
       assert(!e.getStackTrace.exists(_.getMethodName == "callGetTry"))
-      assert(e.getSuppressed.length == 1)
+      // No suppressed exception - the wrapper is used internally only
+      assert(e.getSuppressed.length == 0)
 
       Utils.getTryWithCallerStacktrace(t)
     }
@@ -1806,7 +1894,8 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
       assert(e.getStackTrace.exists(_.getMethodName == "callGetTryFromNestedNested"))
       assert(!e.getStackTrace.exists(_.getMethodName == "callGetTryFromNested"))
       assert(!e.getStackTrace.exists(_.getMethodName == "callGetTry"))
-      assert(e.getSuppressed.length == 1)
+      // No suppressed exception - the wrapper is used internally only
+      assert(e.getSuppressed.length == 0)
 
       Utils.getTryWithCallerStacktrace(t)
     }
@@ -1850,7 +1939,115 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
     assert(e.getStackTrace.exists(_.getMethodName == "callGetTry"))
     assert(!e.getStackTrace.exists(_.getMethodName == "callGetTryFromNested"))
     assert(!e.getStackTrace.exists(_.getMethodName == "callGetTryFromNestedNested"))
-    assert(e.getSuppressed.length == 1)
+    // No suppressed exception - the wrapper is used internally only
+    assert(e.getSuppressed.length == 0)
+  }
+
+  test("unzipFilesFromInputStream") {
+    withTempDir { dir =>
+      val baos = new ByteArrayOutputStream()
+      val zout = new ZipOutputStream(baos)
+      Seq("file1.txt" -> "hello", "file2.txt" -> "world").foreach { case (name, content) =>
+        zout.putNextEntry(new ZipEntry(name))
+        zout.write(content.getBytes(UTF_8))
+        zout.closeEntry()
+      }
+      zout.close()
+
+      val extracted = Utils.unzipFilesFromInputStream(
+        new ByteArrayInputStream(baos.toByteArray), dir)
+      assert(extracted.map(_.getName).toSet === Set("file1.txt", "file2.txt"))
+      assert(new String(Files.readAllBytes(new File(dir, "file1.txt").toPath), UTF_8) === "hello")
+      assert(new String(Files.readAllBytes(new File(dir, "file2.txt").toPath), UTF_8) === "world")
+    }
+  }
+
+  test("SPARK-48290: nthSmallest returns the same elements as sorting") {
+    val inputs = Seq(
+      Array(1L),
+      Array(2L, 1L),
+      Array(5L, 4L, 3L, 2L, 1L),
+      Array(1L, 1L, 1L, 1L),
+      Array.tabulate(1000)(i => i.toLong),
+      Array.tabulate(1000)(i => (1000 - i).toLong),
+      Array.tabulate(1000)(_ => 7L),
+      Array.tabulate(1000)(i => math.min(i, 999 - i).toLong),
+      Array.fill(1000)(Random.nextLong()))
+    inputs.foreach { input =>
+      val expected = input.sorted
+      for (n <- input.indices) {
+        assert(Utils.nthSmallest(input.clone(), n) === expected(n))
+      }
+    }
+  }
+
+  test("SPARK-48290: nthSmallest is not quadratic on an organ pipe distribution") {
+    // Sizes that rise and then fall defeat any fixed pivot choice, so a plain quickselect needs
+    // more than 10^11 comparisons for these selections and does not finish in any reasonable
+    // time. Sorting the range still under consideration keeps each selection in the millisecond
+    // range, so the time limit only has to be generous enough to be free of flakiness.
+    val length = 1 << 20
+    val input = Array.tabulate(length)(i => math.min(i, length - 1 - i).toLong)
+    val expected = input.sorted
+    failAfter(60.seconds) {
+      Seq(0, 1, length / 2 - 1, length / 2, length - 100, length - 1).foreach { n =>
+        assert(Utils.nthSmallest(input.clone(), n) === expected(n))
+      }
+    }
+  }
+
+  test("SPARK-48290: nthSmallest partitions the array around the returned element") {
+    // nthSmallest reorders the array in place and documents that no element before index n is
+    // larger and none after it is smaller than the returned value. Callers are allowed to rely on
+    // that much of the ordering, so pin it here rather than only the returned value.
+    val inputs = Seq(
+      Array.tabulate(1000)(i => i.toLong),
+      Array.tabulate(1000)(i => (1000 - i).toLong),
+      Array.tabulate(1000)(i => math.min(i, 999 - i).toLong),
+      Array.tabulate(1000)(i => (i % 7).toLong),
+      Array.fill(1000)(Random.nextLong()))
+    inputs.foreach { input =>
+      Seq(0, 1, 17, 500, 900, 998, 999).foreach { n =>
+        val sizes = input.clone()
+        val nth = Utils.nthSmallest(sizes, n)
+        assert(sizes(n) === nth)
+        assert(sizes.take(n).forall(_ <= nth), "no element below index n may be larger")
+        assert(sizes.drop(n + 1).forall(_ >= nth), "no element above index n may be smaller")
+      }
+    }
+  }
+
+  test("SPARK-48290: nthSmallest rejects an out of range index") {
+    intercept[IllegalArgumentException](Utils.nthSmallest(Array(1L, 2L), -1))
+    intercept[IllegalArgumentException](Utils.nthSmallest(Array(1L, 2L), 2))
+    intercept[IllegalArgumentException](Utils.nthSmallest(Array.empty[Long], 0))
+  }
+
+  test("SPARK-48290: medianInPlace agrees with median") {
+    val inputs = Seq(
+      Array(1L),
+      Array(2L, 1L),
+      Array(0L, 0L, 0L),
+      Array(5L, 4L, 3L, 2L, 1L),
+      Array.tabulate(999)(i => i.toLong),
+      Array.fill(1000)(Random.nextLong().abs))
+    inputs.foreach { input =>
+      assert(Utils.medianInPlace(input.clone()) === Utils.median(input, false))
+    }
+  }
+
+  test("SPARK-61322: isJavaArraySizeLimitExceeded distinguishes array-size limits from heap " +
+    "exhaustion") {
+    Seq(
+      "Required array length 2147483639 + 626 is too large",
+      "Requested array size exceeds VM limit"
+    ).foreach { message =>
+      assert(Utils.isJavaArraySizeLimitExceeded(new OutOfMemoryError(message)))
+    }
+    assert(!Utils.isJavaArraySizeLimitExceeded(new OutOfMemoryError("Java heap space")))
+    assert(!Utils.isJavaArraySizeLimitExceeded(new OutOfMemoryError()))
+    assert(!Utils.isJavaArraySizeLimitExceeded(
+      new RuntimeException("Requested array size exceeds VM limit")))
   }
 }
 

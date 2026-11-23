@@ -19,13 +19,14 @@ package org.apache.spark.ui
 
 import java.net.{BindException, ServerSocket}
 import java.net.{URI, URL}
+import java.nio.charset.StandardCharsets
 import java.util.Locale
 
 import scala.io.Source
 
 import jakarta.servlet._
 import jakarta.servlet.http.{HttpServlet, HttpServletRequest, HttpServletResponse}
-import org.eclipse.jetty.servlet.{ServletContextHandler, ServletHolder}
+import org.eclipse.jetty.ee10.servlet.{ServletContextHandler, ServletHolder}
 import org.eclipse.jetty.util.thread.QueuedThreadPool
 import org.mockito.Mockito.{mock, when}
 import org.scalatest.concurrent.Eventually._
@@ -201,6 +202,26 @@ class UISuite extends SparkFunSuite {
     }
   }
 
+  test("SPARK-59613: /static/sql resources are served by the core static handler") {
+    withSpark(newSparkContext()) { sc =>
+      val ui = sc.ui.get
+      Seq(
+        "allexecutionspage.js",
+        "executionpage.js",
+        "spark-sql-viz.css",
+        "spark-sql-viz.js",
+        "sql-table-utils.js").foreach { name =>
+        val url = new URI(s"${ui.webUrl}/static/sql/$name").toURL
+        val content = Utils.tryWithResource(Source.fromURL(url, "UTF-8"))(_.mkString)
+        val expected = Utils.tryWithResource(
+          getClass.getResourceAsStream(s"/${SparkUI.STATIC_RESOURCE_DIR}/sql/$name")) { in =>
+          new String(in.readAllBytes(), StandardCharsets.UTF_8)
+        }
+        assert(content === expected, s"$url did not return the bundled file")
+      }
+    }
+  }
+
   test("verify proxy rewrittenURI") {
     val prefix = "/worker-id"
     val target = s"http://$localhost:8081"
@@ -234,7 +255,7 @@ class UISuite extends SparkFunSuite {
     val targetUri = URI.create(s"http://$localhost:4040")
     when(clientRequest.getScheme()).thenReturn("http")
     when(clientRequest.getHeader("host")).thenReturn(s"$localhost:8080")
-    when(clientRequest.getPathInfo()).thenReturn("/proxy/worker-id/jobs")
+    when(clientRequest.getPathInfo()).thenReturn("/worker-id/jobs")
     var newHeader = JettyUtils.createProxyLocationHeader(headerValue, clientRequest, targetUri)
     assert(newHeader.toString() === s"http://$localhost:8080/proxy/worker-id/jobs")
     headerValue = s"http://$localhost:4041/jobs"
@@ -368,8 +389,11 @@ class UISuite extends SparkFunSuite {
       serverInfo.addHandler(redirect, securityMgr)
 
       // Test Jetty's built-in redirect to add the trailing slash to the context path.
+      // As of `Jetty 12`, when asking for the root of a servlet context without the trailing
+      // slash, status code 301 is returned.
       TestUtils.withHttpConnection(new URI(s"$serverAddr/ctx1").toURL) { conn =>
-        assert(conn.getResponseCode() === HttpServletResponse.SC_FOUND)
+        conn.setInstanceFollowRedirects(false)
+        assert(conn.getResponseCode() === HttpServletResponse.SC_MOVED_PERMANENTLY)
         val location = Option(conn.getHeaderFields().get("Location"))
           .map(_.get(0)).orNull
         assert(location === s"$proxyRoot/ctx1/")
@@ -400,7 +424,7 @@ class UISuite extends SparkFunSuite {
     }
   }
 
-  test("SPARK-45522: Jetty 10 and above shouuld return status code 302 with correct redirect url" +
+  test("SPARK-47086: Jetty 12 and above should return status code 301 with correct redirect url" +
     " when request URL ends with a context path without trailing '/'") {
     val proxyRoot = "https://proxy.example.com:443/prefix"
     val (conf, securityMgr, sslOptions) = sslDisabledConf()
@@ -415,9 +439,10 @@ class UISuite extends SparkFunSuite {
       assert(TestUtils.httpResponseCode(new URI(urlStr + "/").toURL) === HttpServletResponse.SC_OK)
 
       // In the case of trailing slash,
-      // 302 should be return and the redirect URL shouuld be part of the header.
-      assert(TestUtils.redirectUrl(new URI(urlStr).toURL) === proxyRoot + "/ctx/");
-      assert(TestUtils.httpResponseCode(new URI(urlStr).toURL) === HttpServletResponse.SC_FOUND)
+      // 301 should be return and the redirect URL should be part of the header.
+      assert(TestUtils.redirectUrl(new URI(urlStr).toURL) === proxyRoot + "/ctx/")
+      assert(TestUtils.httpResponseCode(
+        new URI(urlStr).toURL) === HttpServletResponse.SC_MOVED_PERMANENTLY)
     } finally {
       stopServer(serverInfo)
     }
@@ -463,12 +488,13 @@ class UISuite extends SparkFunSuite {
     }
   }
 
-  test("SPARK-54563: Jetty sanitizes newlines in X-Frame-Options header") {
+  test("SPARK-54563: Jetty sanitizes newlines in CSP frame-ancestors header") {
     val valueWithNewlines = "example.com\nmalicious\nheader"
     val (conf, securityMgr, sslOptions) = sslDisabledConf()
     // Set the config value directly to bypass validation, simulating what could happen
     // if someone bypasses the config validation (e.g., through direct property setting)
     conf.set("spark.ui.allowFramingFrom", valueWithNewlines)
+    conf.set("spark.ui.contentSecurityPolicy.enabled", "true")
 
     val serverInfo = JettyUtils.startJettyServer("0.0.0.0", 0, sslOptions, conf)
     try {
@@ -478,16 +504,20 @@ class UISuite extends SparkFunSuite {
       val url = new URI(s"http://$localhost:${serverInfo.boundPort}/test/root").toURL
       TestUtils.withHttpConnection(url) { conn =>
         val xFrameOptions = conn.getHeaderField("X-Frame-Options")
-        // Jetty should sanitize newlines by replacing them with spaces
-        assert(xFrameOptions !== null, "X-Frame-Options header should be present")
-        assert(!xFrameOptions.contains("\n"),
-          "X-Frame-Options header should not contain newlines")
-        assert(!xFrameOptions.contains("\r"),
-          "X-Frame-Options header should not contain carriage returns")
-        // The header value should have newlines replaced with spaces
-        val expectedValue = "ALLOW-FROM " + valueWithNewlines.replaceAll("[\r\n]+", " ")
-        assert(xFrameOptions === expectedValue,
-          s"X-Frame-Options header should have newlines replaced with spaces")
+        // X-Frame-Options is always SAMEORIGIN as a legacy fallback
+        assert(xFrameOptions === "SAMEORIGIN",
+          "X-Frame-Options should always be SAMEORIGIN")
+
+        // The allowFramingFrom value is now in the CSP frame-ancestors directive.
+        // Jetty should sanitize newlines in the CSP header.
+        val csp = conn.getHeaderField("Content-Security-Policy")
+        assert(csp !== null, "Content-Security-Policy header should be present")
+        assert(csp.contains("frame-ancestors"),
+          "CSP should contain frame-ancestors directive")
+        assert(!csp.contains("\n"),
+          "CSP header should not contain newlines")
+        assert(!csp.contains("\r"),
+          "CSP header should not contain carriage returns")
       }
     } finally {
       stopServer(serverInfo)
@@ -525,9 +555,53 @@ class UISuite extends SparkFunSuite {
       lastRequest = req
       res.sendError(HttpServletResponse.SC_OK)
     }
-
   }
 
+  test("SPARK-58521: createProxyHandler forwards X-Forwarded-Context header") {
+    val (conf, securityMgr, sslOptions) = sslDisabledConf()
+    val targetServer = JettyUtils.startJettyServer("0.0.0.0", 0, sslOptions, conf)
+    val proxyServer = JettyUtils.startJettyServer("0.0.0.0", 0, sslOptions, conf)
+
+    @volatile var forwardedContext: String = null
+    val targetHandler = new ServletContextHandler()
+    targetHandler.setContextPath("/")
+    targetHandler.addServlet(new ServletHolder(new HttpServlet {
+      override def doGet(req: HttpServletRequest, resp: HttpServletResponse): Unit = {
+        forwardedContext = req.getHeader("X-Forwarded-Context")
+        resp.setStatus(HttpServletResponse.SC_OK)
+      }
+    }), "/*")
+    targetServer.addHandler(targetHandler, securityMgr)
+
+    val targetAddr = s"http://$localhost:${targetServer.boundPort}"
+    val proxyHandler = JettyUtils.createProxyHandler(_ => Some(targetAddr))
+    proxyServer.addHandler(proxyHandler, securityMgr)
+
+    try {
+      val proxyUrl = s"http://$localhost:${proxyServer.boundPort}/proxy/app-123/stages/"
+      TestUtils.withHttpConnection(new URI(proxyUrl).toURL) { conn =>
+        assert(conn.getResponseCode === HttpServletResponse.SC_OK)
+        assert(forwardedContext === "/proxy/app-123")
+      }
+    } finally {
+      stopServer(proxyServer)
+      stopServer(targetServer)
+    }
+  }
+
+  test("actions via GET follow the cluster manager unless set explicitly") {
+    // The YARN ResourceManager/AM proxy does not forward POST (SPARK-6846), so GET is
+    // accepted there and refused everywhere else.
+    assert(SparkUI.actionsViaGetEnabled(new SparkConf().set("spark.master", "yarn")))
+    assert(!SparkUI.actionsViaGetEnabled(new SparkConf().set("spark.master", "local[*]")))
+    assert(!SparkUI.actionsViaGetEnabled(new SparkConf()))
+
+    // An explicit setting wins in both directions.
+    assert(!SparkUI.actionsViaGetEnabled(
+      new SparkConf().set("spark.master", "yarn").set(UI.UI_ACTIONS_VIA_GET_ENABLED, false)))
+    assert(SparkUI.actionsViaGetEnabled(
+      new SparkConf().set("spark.master", "local[*]").set(UI.UI_ACTIONS_VIA_GET_ENABLED, true)))
+  }
 }
 
 // Filter for testing; returns a configurable code for every request.

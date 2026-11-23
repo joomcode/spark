@@ -19,6 +19,7 @@ package org.apache.spark.types.variant;
 
 import org.apache.spark.QueryContext;
 import org.apache.spark.SparkRuntimeException;
+import org.apache.spark.network.util.ByteUnit;
 import org.apache.spark.network.util.JavaUtils;
 import scala.collection.immutable.Map$;
 
@@ -26,8 +27,11 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.UUID;
+
+import com.fasterxml.jackson.core.JsonFactory;
 
 /**
  * This class defines constants related to the variant format and provides functions for
@@ -50,6 +54,12 @@ import java.util.UUID;
  * - UTF-8 string data.
  */
 public class VariantUtil {
+  // Jackson's JsonFactory is thread-safe and intended to be reused, so the variant module shares a
+  // single instance. Variant.escapeJson (one call per serialized string or key) and
+  // VariantBuilder.parseJson (one call per parsed JSON value) both use it, which avoids a per-call
+  // factory allocation (including its symbol tables) and keeps one source of configuration.
+  static final JsonFactory JSON_FACTORY = new JsonFactory();
+
   public static final int BASIC_TYPE_BITS = 2;
   public static final int BASIC_TYPE_MASK = 0x3;
   public static final int TYPE_INFO_MASK = 0x3F;
@@ -174,6 +184,11 @@ public class VariantUtil {
         ((offsetSize - 1) << BASIC_TYPE_BITS) | ARRAY);
   }
 
+  // Build a metadata header byte for an offset size of 1 to 4 bytes, with `sorted_strings` unset.
+  static byte metadataHeader(int offsetSize) {
+    return (byte) (VERSION | ((offsetSize - 1) << 6));
+  }
+
   // An exception indicating that the variant value or metadata doesn't
   static SparkRuntimeException malformedVariant() {
     return new SparkRuntimeException("MALFORMED_VARIANT",
@@ -187,12 +202,14 @@ public class VariantUtil {
   }
 
   // An exception indicating that an external caller tried to call the Variant constructor with
-  // value or metadata exceeding the 16MiB size limit. We will never construct a Variant this large,
-  // so it should only be possible to encounter this exception when reading a Variant produced by
-  // another tool.
+  // value or metadata exceeding `SIZE_LIMIT`. We will never construct a Variant this large, so it
+  // should only be possible to encounter this exception when reading a Variant produced by another
+  // tool. Canonicalization reports the same condition when its rebuild would exceed `SIZE_LIMIT`.
   static SparkRuntimeException variantConstructorSizeLimit() {
     return new SparkRuntimeException("VARIANT_CONSTRUCTOR_SIZE_LIMIT",
-        Map$.MODULE$.<String, String>empty(), null, new QueryContext[]{}, "");
+        new scala.collection.immutable.Map.Map1<>("sizeLimit",
+            ByteUnit.BYTE.toMiB(SIZE_LIMIT) + " MiB"),
+        null, new QueryContext[]{}, "");
   }
 
   // Check the validity of an array index `pos`. Throw `MALFORMED_VARIANT` if it is out of bound,
@@ -428,7 +445,8 @@ public class VariantUtil {
   // Get a decimal value from variant value `value[pos...]`.
   // Throw `MALFORMED_VARIANT` if the variant is malformed.
   public static BigDecimal getDecimalWithOriginalScale(byte[] value, int pos) {
-    checkIndex(pos, value.length);
+    // Decimal should at least have header + scale.
+    checkIndex(pos + 1, value.length);
     int basicType = value[pos] & BASIC_TYPE_MASK;
     int typeInfo = (value[pos] >> BASIC_TYPE_BITS) & TYPE_INFO_MASK;
     if (basicType != PRIMITIVE) throw unexpectedType(Type.DECIMAL);
@@ -506,7 +524,9 @@ public class VariantUtil {
         length = readUnsigned(value, pos + 1, U32_SIZE);
       }
       checkIndex(start + length - 1, value.length);
-      return new String(value, start, length);
+      // The string content is UTF-8 encoded (it is written by `VariantBuilder.appendString`).
+      // Decode with UTF-8 explicitly rather than relying on the JVM default charset.
+      return new String(value, start, length, StandardCharsets.UTF_8);
     }
     throw unexpectedType(Type.STRING);
   }
@@ -589,23 +609,170 @@ public class VariantUtil {
     return handler.apply(size, offsetSize, offsetStart, dataStart);
   }
 
+  // Validate whether a variant is well-formed. Returns true if the variant binary is structurally
+  // well-formed (all bounds and type-info checks pass), false if it is malformed.
+  //
+  // This is close to, but not strictly equivalent to, "`toJson` does not throw". It is more
+  // lenient in that it does not enforce the `SIZE_LIMIT` check that the `Variant` constructor
+  // applies (which throws `VARIANT_CONSTRUCTOR_SIZE_LIMIT`). It is stricter in that it requires
+  // every object and array to have its final offset, and its data and children to lie within
+  // their bounds. The implementation otherwise has the same structure as `toJson` (see
+  // `Variant.toJsonImpl`).
+  //
+  // Implementation note: this `try { ... } catch (SparkRuntimeException e)` is sound only because
+  // every helper invoked by `validateImpl` throws `MALFORMED_VARIANT` /
+  // `UNKNOWN_PRIMITIVE_TYPE_IN_VARIANT` rather than a raw `ArrayIndexOutOfBoundsException` on
+  // malformed input. Preserve that invariant when adding new cases.
+  public static boolean isValidVariant(byte[] value, byte[] metadata) {
+    if (value == null || metadata == null) return false;
+    // Validate the metadata version, similar to the check in the `Variant` constructor.
+    if (metadata.length < 1 || (metadata[0] & VERSION_MASK) != VERSION) return false;
+    try {
+      validateImpl(value, metadata, 0);
+      return true;
+    } catch (SparkRuntimeException e) {
+      return false;
+    }
+  }
+
+  private static void validateImpl(byte[] value, byte[] metadata, int pos) {
+    switch (getType(value, pos)) {
+      case OBJECT:
+        handleObject(value, pos, (size, idSize, offsetSize, idStart, offsetStart, dataStart) -> {
+          // The offset list has `size + 1` entries. The last one is the size of the field data,
+          // which must lie within `value`.
+          int dataSize = readUnsigned(value, offsetStart + offsetSize * size, offsetSize);
+          if ((long) dataStart + dataSize > value.length) throw malformedVariant();
+          for (int i = 0; i < size; ++i) {
+            int id = readUnsigned(value, idStart + idSize * i, idSize);
+            int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+            int elementPos = dataStart + offset;
+            getMetadataKey(metadata, id);
+            validateImpl(value, metadata, elementPos);
+            // Sub-values are sliced by `valueSize` (e.g. `Variant.getValue`), so a field that
+            // extends past the field data of the object would be truncated.
+            if ((long) offset + valueSize(value, elementPos) > dataSize) throw malformedVariant();
+          }
+          return null;
+        });
+        break;
+      case ARRAY:
+        handleArray(value, pos, (size, offsetSize, offsetStart, dataStart) -> {
+          // The offset list has `size + 1` entries. The last one is the size of the element data,
+          // which must lie within `value`.
+          int dataSize = readUnsigned(value, offsetStart + offsetSize * size, offsetSize);
+          if ((long) dataStart + dataSize > value.length) throw malformedVariant();
+          for (int i = 0; i < size; ++i) {
+            int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+            int elementPos = dataStart + offset;
+            validateImpl(value, metadata, elementPos);
+            // Sub-values are sliced by `valueSize` (e.g. `Variant.getValue`), so an element that
+            // extends past the element data of the array would be truncated.
+            if ((long) offset + valueSize(value, elementPos) > dataSize) throw malformedVariant();
+          }
+          return null;
+        });
+        break;
+      case NULL:
+        break;
+      case BOOLEAN:
+        getBoolean(value, pos);
+        break;
+      case LONG:
+        getLong(value, pos);
+        break;
+      case STRING:
+        getString(value, pos);
+        break;
+      case DOUBLE:
+        getDouble(value, pos);
+        break;
+      case DECIMAL:
+        getDecimal(value, pos);
+        break;
+      case DATE:
+      case TIMESTAMP:
+      case TIMESTAMP_NTZ:
+        getLong(value, pos);
+        break;
+      case FLOAT:
+        getFloat(value, pos);
+        break;
+      case BINARY:
+        getBinary(value, pos);
+        break;
+      case UUID:
+        getUuid(value, pos);
+        break;
+      default:
+        // This is practically unreachable because we handle all possible types. It only
+        // intends to ensure we don't forget adding a new case when adding a new type.
+        throw malformedVariant();
+    }
+  }
+
+  // Encode an object field key for comparison in the order required by the Variant spec.
+  public static byte[] encodeKey(String key) {
+    return key.getBytes(StandardCharsets.UTF_8);
+  }
+
+  // Compare UTF-8-encoded object field keys using unsigned lexicographic byte ordering.
+  public static int compareKeys(byte[] left, byte[] right) {
+    return Arrays.compareUnsigned(left, right);
+  }
+
+  // Read the byte width of the dictionary size and offsets from the metadata header.
+  static int getMetadataOffsetSize(byte[] metadata) {
+    checkIndex(0, metadata.length);
+    // The highest 2 bits hold `offset_size - 1`. Mask after the shift because bytes are signed.
+    return ((metadata[0] >> 6) & 0x3) + 1;
+  }
+
+  // Read the dictionary size, stored right after the header byte in `offsetSize` bytes.
+  static int getMetadataNumKeys(byte[] metadata, int offsetSize) {
+    return readUnsigned(metadata, 1, offsetSize);
+  }
+
+  // Return where the dictionary strings start: after the header byte, the dictionary size, and
+  // `numKeys + 1` offsets. Throw `MALFORMED_VARIANT` if that is past the end of the metadata, so
+  // on return all offsets are in bounds.
+  static int getMetadataStringStart(byte[] metadata, int numKeys, int offsetSize) {
+    long stringStart = 1L + (numKeys + 2L) * offsetSize;
+    if (stringStart > metadata.length) throw malformedVariant();
+    return (int) stringStart;
+  }
+
   // Get a key at `id` in the variant metadata.
   // Throw `MALFORMED_VARIANT` if the variant is malformed. An out-of-bound `id` is also considered
   // a malformed variant because it is read from the corresponding variant value.
   public static String getMetadataKey(byte[] metadata, int id) {
-    checkIndex(0, metadata.length);
-    // Extracts the highest 2 bits in the metadata header to determine the integer size of the
-    // offset list.
-    int offsetSize = ((metadata[0] >> 6) & 0x3) + 1;
-    int dictSize = readUnsigned(metadata, 1, offsetSize);
+    // Dictionary keys are UTF-8 encoded (see `VariantBuilder.addKey`). Decode with UTF-8
+    // explicitly rather than relying on the platform-dependent JVM default charset.
+    return handleMetadataKey(metadata, id, (bytes, start, length) ->
+        new String(bytes, start, length, StandardCharsets.UTF_8));
+  }
+
+  // Read the original dictionary key bytes without UTF-8 decoding or replacement.
+  static byte[] getMetadataKeyBytes(byte[] metadata, int id) {
+    return handleMetadataKey(metadata, id, (bytes, start, length) ->
+        Arrays.copyOfRange(bytes, start, start + length));
+  }
+
+  private interface MetadataKeyHandler<T> {
+    T apply(byte[] metadata, int start, int length);
+  }
+
+  // Read and validate a dictionary key range before passing it to `handler`.
+  private static <T> T handleMetadataKey(
+      byte[] metadata, int id, MetadataKeyHandler<T> handler) {
+    int offsetSize = getMetadataOffsetSize(metadata);
+    int dictSize = getMetadataNumKeys(metadata, offsetSize);
     if (id >= dictSize) throw malformedVariant();
-    // There are a header byte, a `dictSize` with `offsetSize` bytes, and `(dictSize + 1)` offsets
-    // before the string data.
-    int stringStart = 1 + (dictSize + 2) * offsetSize;
+    int stringStart = getMetadataStringStart(metadata, dictSize, offsetSize);
     int offset = readUnsigned(metadata, 1 + (id + 1) * offsetSize, offsetSize);
     int nextOffset = readUnsigned(metadata, 1 + (id + 2) * offsetSize, offsetSize);
     if (offset > nextOffset) throw malformedVariant();
     checkIndex(stringStart + nextOffset - 1, metadata.length);
-    return new String(metadata, stringStart + offset, nextOffset - offset);
+    return handler.apply(metadata, stringStart + offset, nextOffset - offset);
   }
 }

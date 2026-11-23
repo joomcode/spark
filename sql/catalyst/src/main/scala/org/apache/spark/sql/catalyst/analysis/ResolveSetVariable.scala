@@ -18,7 +18,6 @@
 package org.apache.spark.sql.catalyst.analysis
 
 import org.apache.spark.SparkException
-import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.logical.{Limit, LogicalPlan, SetVariable}
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -33,23 +32,8 @@ import org.apache.spark.sql.types.IntegerType
  */
 class ResolveSetVariable(val catalogManager: CatalogManager) extends Rule[LogicalPlan]
   with ColumnResolutionHelper {
-  private val variableResolution = new VariableResolution(catalogManager.tempVariableManager)
-
-  /**
-   * Checks for duplicate variable names and throws an exception if found.
-   * Names are normalized when the variables are created.
-   * No need for case insensitive comparison here.
-   */
-  private def checkForDuplicateVariables(variables: Seq[VariableReference]): Unit = {
-    // TODO: we need to group by the qualified variable name once other catalogs support it.
-    val dups = variables.groupBy(_.identifier).filter(kv => kv._2.length > 1)
-    if (dups.nonEmpty) {
-      throw new AnalysisException(
-        errorClass = "DUPLICATE_ASSIGNMENTS",
-        messageParameters = Map("nameList" ->
-          dups.keys.map(key => toSQLId(key.name())).mkString(", ")))
-    }
-  }
+  private val variableResolution =
+    new VariableResolution(catalogManager.tempVariableManager, catalogManager)
 
   override def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsWithPruning(
     _.containsPattern(COMMAND), ruleId) {
@@ -61,7 +45,11 @@ class ResolveSetVariable(val catalogManager: CatalogManager) extends Rule[Logica
             nameParts = u.nameParts
           ) match {
             case Some(variable) => variable.copy(canFold = false)
-            case _ => throw unresolvedVariableError(u.nameParts, Seq("SYSTEM", "SESSION"))
+            case _ =>
+              throw unresolvedVariableError(
+                u.nameParts,
+                variableResolution.searchPathEntriesForError,
+                u.origin)
           }
 
         case other => throw SparkException.internalError(
@@ -77,10 +65,12 @@ class ResolveSetVariable(val catalogManager: CatalogManager) extends Rule[Logica
 
       // Check for duplicate variable names - this handles both regular SET VAR (after resolution)
       // and EXECUTE IMMEDIATE ... INTO (which comes pre-resolved)
-      checkForDuplicateVariables(targetVariables)
+      VariableAssignmentUtils.checkForDuplicateVariables(targetVariables)
 
       val withCasts = TableOutputResolver.resolveVariableOutputColumns(
-        targetVariables, setVariable.sourceQuery, conf)
+        expected = targetVariables,
+        query = setVariable.sourceQuery,
+        conf = conf)
       val withLimit = if (withCasts.maxRows.exists(_ <= 2)) {
         withCasts
       } else {

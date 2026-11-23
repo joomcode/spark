@@ -20,10 +20,10 @@ package org.apache.spark.sql.execution.adaptive
 import scala.collection.mutable
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.plans.physical.SinglePartition
+import org.apache.spark.sql.catalyst.plans.physical.{SinglePartition, UnknownPartitioning}
 import org.apache.spark.sql.execution.{ShufflePartitionSpec, SparkPlan, UnaryExecNode, UnionExec}
 import org.apache.spark.sql.execution.exchange.{ENSURE_REQUIREMENTS, REBALANCE_PARTITIONS_BY_COL, REBALANCE_PARTITIONS_BY_NONE, REPARTITION_BY_COL, ShuffleExchangeLike, ShuffleOrigin}
-import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, CartesianProductExec}
+import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, BroadcastRangeJoinExec, CartesianProductExec}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.Utils
 
@@ -68,9 +68,9 @@ case class CoalesceShufflePartitions(session: SparkSession) extends AQEShuffleRe
       }
     }
 
-    // Sub-plans under the Union/CartesianProduct/BroadcastHashJoin/BroadcastNestedLoopJoin
-    // operator can be coalesced independently, so we can divide them into independent
-    // "coalesce groups", and all shuffle stages within each group have to be coalesced together.
+    // Sub-plans under Union, CartesianProduct, and broadcast joins (hash, nested loop, range)
+    // can be coalesced independently, so we divide them into independent "coalesce groups",
+    // and all shuffle stages within each group have to be coalesced together.
     val coalesceGroups = collectCoalesceGroups(plan)
 
     // Divide minimum task parallelism among coalesce groups according to their data sizes.
@@ -109,7 +109,10 @@ case class CoalesceShufflePartitions(session: SparkSession) extends AQEShuffleRe
         coalesceGroup.shuffleStages.map(_.partitionSpecs),
         advisoryTargetSize = advisoryTargetSize,
         minNumPartitions = minNumPartitions,
-        minPartitionSize = minPartitionSize)
+        minPartitionSize = minPartitionSize,
+        shuffleStageIds = coalesceGroup.shuffleStages.map(_.shuffleStage.id),
+        maxReducerPartitionsPerTask =
+          conf.getConf(SQLConf.COALESCE_PARTITIONS_MAX_REDUCER_PARTITIONS_PER_TASK))
 
       if (newPartitionSpecs.nonEmpty) {
         coalesceGroup.shuffleStages.zip(newPartitionSpecs).map { case (stageInfo, partSpecs) =>
@@ -143,7 +146,7 @@ case class CoalesceShufflePartitions(session: SparkSession) extends AQEShuffleRe
 
   /**
    * Gather all coalesce-able groups such that the shuffle stages in each child of a
-   * Union/CartesianProduct/BroadcastHashJoin/BroadcastNestedLoopJoin operator are in their
+   * Union, CartesianProduct, or broadcast join (hash, nested loop, or range) are in their
    * independent groups if:
    * 1) all leaf nodes of this child are exchange stages; and
    * 2) all these shuffle stages support coalescing.
@@ -179,15 +182,24 @@ case class CoalesceShufflePartitions(session: SparkSession) extends AQEShuffleRe
 
   private def childrenNeedCompatiblePartitioning(p: SparkPlan): Boolean = p match {
     // TODO: match more plan nodes here.
-    case _: UnionExec => false
+    // A UnionExec that reports a concrete outputPartitioning has that partitioning relied on by
+    // downstream operators, so its children must remain co-partitioned -- coalesce them as a
+    // single group. When it reports UnknownPartitioning (a plain union, or children that are not
+    // compatibly partitioned), the children may still be coalesced independently. Ask what the
+    // union reports now rather than only the stamped decision: a rule that runs after the stamp,
+    // such as `OptimizeSkewedJoin` splitting one branch, can take the layout away, and the union
+    // then concatenates whatever its children produce.
+    case u: UnionExec => !u.outputPartitioning.isInstanceOf[UnknownPartitioning]
     case _: CartesianProductExec => false
     case _: BroadcastHashJoinExec => false
     case _: BroadcastNestedLoopJoinExec => false
+    case _: BroadcastRangeJoinExec => false
     case _ => true
   }
 
   private def isExplodingJoin(p: SparkPlan): Boolean = p match {
     case _: BroadcastNestedLoopJoinExec => true
+    case _: BroadcastRangeJoinExec => true
     case _: CartesianProductExec => true
     case _ => false
   }

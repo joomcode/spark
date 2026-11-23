@@ -15,22 +15,24 @@
 # limitations under the License.
 #
 import inspect
+import logging
 import os
 import time
-import logging
-from typing import Iterator, Tuple
 import unittest
+from typing import Iterator, Tuple
 
 from pyspark.errors import PythonException
-from pyspark.sql import Row, functions as sf
+from pyspark.sql import Row
+from pyspark.sql import functions as sf
 from pyspark.sql.functions import array, col, explode, lit, mean, stddev
 from pyspark.sql.window import Window
-from pyspark.testing.sqlutils import (
-    ReusedSQLTestCase,
+from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import (
+    assertDataFrameEqual,
+    eventually,
     have_pyarrow,
     pyarrow_requirement_message,
 )
-from pyspark.testing.utils import assertDataFrameEqual
 from pyspark.util import is_remote_only
 
 if have_pyarrow:
@@ -59,7 +61,7 @@ def function_variations(func):
 
 @unittest.skipIf(
     not have_pyarrow,
-    pyarrow_requirement_message,  # type: ignore[arg-type]
+    pyarrow_requirement_message,
 )
 class ApplyInArrowTestsMixin:
     @property
@@ -105,6 +107,32 @@ class ApplyInArrowTestsMixin:
             actual2 = grouped_df.applyInArrow(func_variation, "id long, value long").collect()
             self.assertEqual(actual2, expected)
 
+    def test_apply_in_arrow_large_var_types(self):
+        # SPARK-56929: when useLargeVarTypes=true, the expected schema computed by
+        # worker.py for result validation must also use large_string/large_binary,
+        # otherwise verify_arrow_result raises a spurious RESULT_COLUMN_TYPES_MISMATCH.
+        data = [(0, "foo", b"foo"), (0, "bar", b"bar"), (1, None, None), (1, "baz", b"baz")]
+        df = self.spark.createDataFrame(data, "id long, s string, b binary")
+        schema = "id long, s string, b binary"
+
+        def func(table):
+            assert pa.types.is_large_string(table.schema.field("s").type)
+            assert pa.types.is_large_binary(table.schema.field("b").type)
+            return table
+
+        for assign_cols_by_name in [True, False]:
+            with self.subTest(assign_cols_by_name=assign_cols_by_name):
+                with self.sql_conf(
+                    {
+                        "spark.sql.execution.arrow.useLargeVarTypes": True,
+                        "spark.sql.legacy.execution.pandas.groupedMap."
+                        "assignColumnsByName": assign_cols_by_name,
+                    }
+                ):
+                    for func_variation in function_variations(func):
+                        actual = df.groupby("id").applyInArrow(func_variation, schema)
+                        assertDataFrameEqual(actual, df)
+
     def test_apply_in_arrow_empty_groupby(self):
         df = self.data
 
@@ -146,14 +174,13 @@ class ApplyInArrowTestsMixin:
         with self.quiet():
             with self.assertRaisesRegex(
                 PythonException,
-                "Return type of the user-defined function should be pyarrow.Table, but is tuple",
+                r"pyarrow\.Table.*\btuple\b",
             ):
                 df.groupby("id").applyInArrow(stats, schema="id long, m double").collect()
 
             with self.assertRaisesRegex(
                 PythonException,
-                "Return type of the user-defined function should be pyarrow.RecordBatch, but is "
-                + "tuple",
+                r"iterator of pyarrow\.RecordBatch.*iterator of tuple",
             ):
                 df.groupby("id").applyInArrow(stats_iter, schema="id long, m double").collect()
 
@@ -175,7 +202,8 @@ class ApplyInArrowTestsMixin:
                     for func_variation in function_variations(lambda table: table):
                         with self.assertRaisesRegex(
                             PythonException,
-                            f"Columns do not match in their data type: {expected}",
+                            "Column types of the returned data do not match specified schema. "
+                            f"Mismatch: {expected}",
                         ):
                             df.groupby("id").applyInArrow(func_variation, schema=schema).collect()
 
@@ -200,7 +228,8 @@ class ApplyInArrowTestsMixin:
                         for func_variation in function_variations(lambda table: table):
                             with self.assertRaisesRegex(
                                 PythonException,
-                                f"Columns do not match in their data type: {expected}",
+                                "Column types of the returned data do not match specified schema. "
+                                f"Mismatch: {expected}",
                             ):
                                 df.groupby("id").applyInArrow(
                                     func_variation, schema=schema
@@ -223,13 +252,46 @@ class ApplyInArrowTestsMixin:
             for func_variation in function_variations(stats):
                 with self.assertRaisesRegex(
                     PythonException,
-                    "Column names of the returned pyarrow.Table do not match specified schema. "
-                    "Missing: m. Unexpected: v, v2.\n",
+                    "Column names of the returned data do not match specified schema. "
+                    "Missing: m. Unexpected: v, v2.",
                 ):
                     # stats returns three columns while here we set schema with two columns
                     df.groupby("id").applyInArrow(
                         func_variation, schema="id long, m double"
                     ).collect()
+
+    def test_apply_in_arrow_returning_wrong_column_count_positional_assignment(self):
+        df = self.data
+
+        def too_many_cols(key, table):
+            return pa.Table.from_pydict(
+                {
+                    "a": [key[0].as_py()],
+                    "b": [pc.mean(table.column("v")).as_py()],
+                    "c": [pc.stddev(table.column("v")).as_py()],
+                }
+            )
+
+        def too_few_cols(key, table):
+            return pa.Table.from_pydict({"a": [key[0].as_py()]})
+
+        with self.sql_conf(
+            {"spark.sql.legacy.execution.pandas.groupedMap.assignColumnsByName": False}
+        ):
+            with self.quiet():
+                for func, expected, actual in [
+                    (too_many_cols, 2, 3),
+                    (too_few_cols, 2, 1),
+                ]:
+                    with self.subTest(func=func.__name__):
+                        for func_variation in function_variations(func):
+                            with self.assertRaisesRegex(
+                                PythonException,
+                                rf"Expected: {expected}.*Actual: {actual}",
+                            ):
+                                df.groupby("id").applyInArrow(
+                                    func_variation, schema="a long, b double"
+                                ).collect()
 
     def test_apply_in_arrow_returning_empty_dataframe(self):
         df = self.data
@@ -264,8 +326,7 @@ class ApplyInArrowTestsMixin:
         with self.quiet():
             with self.assertRaisesRegex(
                 PythonException,
-                "Column names of the returned pyarrow.Table do not match specified schema. "
-                "Missing: m.\n",
+                "Column names of the returned data do not match specified schema. Missing: m.",
             ):
                 # stats returns one column for even keys while here we set schema with two columns
                 df.groupby("id").applyInArrow(odd_means, schema="id long, m double").collect()
@@ -416,20 +477,27 @@ class ApplyInArrowTestsMixin:
                 df,
             )
 
-            logs = self.spark.tvf.python_worker_logs()
+            # Worker logs are captured asynchronously from the worker's stdout and only
+            # become visible once the trailing block is flushed, so they may not all be
+            # present immediately after the query completes. Poll until they show up.
+            @eventually(timeout=5, catch_assertions=True)
+            def check_logs():
+                logs = self.spark.tvf.python_worker_logs()
 
-            assertDataFrameEqual(
-                logs.select("level", "msg", "context", "logger"),
-                [
-                    Row(
-                        level="WARNING",
-                        msg=f"arrow grouped map: {dict(id=lst, value=[v*10 for v in lst])}",
-                        context={"func_name": func_with_logging.__name__},
-                        logger="test_arrow_grouped_map",
-                    )
-                    for lst in [[0, 2, 4, 6, 8], [1, 3, 5, 7]]
-                ],
-            )
+                assertDataFrameEqual(
+                    logs.select("level", "msg", "context", "logger"),
+                    [
+                        Row(
+                            level="WARNING",
+                            msg=f"arrow grouped map: {dict(id=lst, value=[v * 10 for v in lst])}",
+                            context={"func_name": func_with_logging.__name__},
+                            logger="test_arrow_grouped_map",
+                        )
+                        for lst in [[0, 2, 4, 6, 8], [1, 3, 5, 7]]
+                    ],
+                )
+
+            check_logs()
 
     @unittest.skipIf(is_remote_only(), "Requires JVM access")
     def test_apply_in_arrow_iter_with_logging(self):
@@ -456,20 +524,27 @@ class ApplyInArrowTestsMixin:
                 df,
             )
 
-            logs = self.spark.tvf.python_worker_logs()
+            # Worker logs are captured asynchronously from the worker's stdout and only
+            # become visible once the trailing block is flushed, so they may not all be
+            # present immediately after the query completes. Poll until they show up.
+            @eventually(timeout=5, catch_assertions=True)
+            def check_logs():
+                logs = self.spark.tvf.python_worker_logs()
 
-            assertDataFrameEqual(
-                logs.select("level", "msg", "context", "logger"),
-                [
-                    Row(
-                        level="WARNING",
-                        msg=f"arrow grouped map: {dict(id=lst, value=[v*10 for v in lst])}",
-                        context={"func_name": func_with_logging.__name__},
-                        logger="test_arrow_grouped_map",
-                    )
-                    for lst in [[0, 2, 4], [6, 8], [1, 3, 5], [7]]
-                ],
-            )
+                assertDataFrameEqual(
+                    logs.select("level", "msg", "context", "logger"),
+                    [
+                        Row(
+                            level="WARNING",
+                            msg=f"arrow grouped map: {dict(id=lst, value=[v * 10 for v in lst])}",
+                            context={"func_name": func_with_logging.__name__},
+                            logger="test_arrow_grouped_map",
+                        )
+                        for lst in [[0, 2, 4], [6, 8], [1, 3, 5], [7]]
+                    ],
+                )
+
+            check_logs()
 
 
 class ApplyInArrowTests(ApplyInArrowTestsMixin, ReusedSQLTestCase):
@@ -496,12 +571,6 @@ class ApplyInArrowTests(ApplyInArrowTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.arrow.test_arrow_grouped_map import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

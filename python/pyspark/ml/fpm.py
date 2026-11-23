@@ -16,18 +16,18 @@
 #
 
 import sys
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from pyspark import keyword_only, since
-from pyspark.sql import DataFrame
+from pyspark.ml.param.shared import HasPredictionCol, Param, Params, TypeConverters
 from pyspark.ml.util import (
-    JavaMLWritable,
     JavaMLReadable,
-    try_remote_attribute_relation,
+    JavaMLWritable,
     invoke_helper_relation,
+    try_remote_attribute_relation,
 )
 from pyspark.ml.wrapper import JavaEstimator, JavaModel, JavaParams
-from pyspark.ml.param.shared import HasPredictionCol, Param, TypeConverters, Params
+from pyspark.sql import DataFrame
 
 if TYPE_CHECKING:
     from py4j.java_gateway import JavaObject
@@ -240,6 +240,7 @@ class FPGrowth(
     >>> fpm.transform(data).take(1) == model2.transform(data).take(1)
     True
     """
+
     _input_kwargs: Dict[str, Any]
 
     @keyword_only
@@ -532,6 +533,7 @@ class PrefixSpan(JavaParams):
 
 if __name__ == "__main__":
     import doctest
+
     import pyspark.ml.fpm
     from pyspark.sql import SparkSession
 
@@ -547,7 +549,7 @@ if __name__ == "__main__":
     temp_path = tempfile.mkdtemp()
     globs["temp_path"] = temp_path
     try:
-        (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+        failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
         spark.stop()
     finally:
         from shutil import rmtree

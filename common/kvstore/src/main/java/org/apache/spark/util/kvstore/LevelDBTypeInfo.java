@@ -222,14 +222,7 @@ class LevelDBTypeInfo {
     private final Index parent;
 
     private Index(KVIndex self, KVTypeInfo.Accessor accessor, Index parent) {
-      byte[] name = self.value().getBytes(UTF_8);
-      if (parent != null) {
-        byte[] child = new byte[name.length + 1];
-        child[0] = SECONDARY_IDX_PREFIX;
-        System.arraycopy(name, 0, child, 1, name.length);
-      }
-
-      this.name = name;
+      this.name = self.value().getBytes(UTF_8);
       this.isNatural = self.value().equals(KVIndex.NATURAL_INDEX_NAME);
       this.copy = isNatural || self.copy();
       this.accessor = accessor;
@@ -466,6 +459,15 @@ class LevelDBTypeInfo {
 
       if (value instanceof String str) {
         byte[] bytes = str.getBytes(UTF_8);
+        for (byte b : bytes) {
+          if (b == KEY_SEPARATOR) {
+            // String bytes are copied verbatim into the key, so an embedded key
+            // separator would corrupt the index key structure and mix entries across
+            // range scans and deletes. Reject such values outright.
+            throw new IllegalArgumentException(
+              "Index string values cannot contain the key separator (0x00) byte.");
+          }
+        }
         result = new byte[bytes.length + 1];
         result[0] = prefix;
         System.arraycopy(bytes, 0, result, 1, bytes.length);

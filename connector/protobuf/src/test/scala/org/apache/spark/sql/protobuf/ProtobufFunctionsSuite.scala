@@ -17,15 +17,25 @@
 package org.apache.spark.sql.protobuf
 
 import java.sql.Timestamp
-import java.time.Duration
+import java.time.{Duration, LocalTime}
+import java.util.concurrent.{CountDownLatch, TimeUnit}
+import java.util.concurrent.atomic.AtomicBoolean
 
+import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
 
 import com.google.protobuf.{Any => AnyProto, BoolValue, ByteString, BytesValue, DoubleValue, DynamicMessage, FloatValue, Int32Value, Int64Value, StringValue, UInt32Value, UInt64Value}
 import org.json4s.jackson.JsonMethods
 
-import org.apache.spark.sql.{AnalysisException, Column, DataFrame, QueryTest, Row}
+import org.apache.spark.SparkRuntimeException
+import org.apache.spark.sql.{AnalysisException, Column, DataFrame, Row}
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, CreateMap, ElementAt, Expression, ExprId, FromProtobuf, LeafExpression, Literal, ToProtobuf}
+import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
+import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.functions.{array, lit, map, struct, typedLit}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.protobuf.protos.Proto2Messages.Proto2AllTypes
 import org.apache.spark.sql.protobuf.protos.SimpleMessageProtos._
 import org.apache.spark.sql.protobuf.protos.SimpleMessageProtos.SimpleMessageRepeated.NestedEnum
@@ -34,8 +44,26 @@ import org.apache.spark.sql.protobuf.utils.ProtobufUtils
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.util.{ProtobufUtils => CommonProtobufUtils}
+import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.util.ThreadUtils
 
-class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with ProtobufTestBase
+/** A test string literal that runs onEval before returning, to pause or fail evaluation. */
+private case class StringLiteralWithEvalHook(
+    value: String,
+    onEval: () => Unit)
+  extends LeafExpression with CodegenFallback {
+
+  override def foldable: Boolean = true
+  override def nullable: Boolean = false
+  override def dataType: DataType = StringType
+
+  override def eval(input: InternalRow): Any = {
+    onEval()
+    UTF8String.fromString(value)
+  }
+}
+
+class ProtobufFunctionsSuite extends SharedSparkSession with ProtobufTestBase
   with Serializable {
 
   import testImplicits._
@@ -95,6 +123,104 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
       case None => functions.to_protobuf(col, messageName)
     }
   }
+
+  private def protobufExpression(
+      functionName: String,
+      options: Expression,
+      messageName: Expression = Literal("OtherExample"),
+      descFilePath: Expression = Literal(testFileDesc)): (Expression, AttributeReference) = {
+    val dataType = if (functionName == "FROM_PROTOBUF") {
+      BinaryType
+    } else {
+      StructType(Seq(StructField("other", StringType)))
+    }
+    val data = AttributeReference("data", dataType)(exprId = ExprId(1))
+    val expression = if (functionName == "FROM_PROTOBUF") {
+      new FromProtobuf(data, messageName, descFilePath, options)
+    } else {
+      new ToProtobuf(data, messageName, descFilePath, options)
+    }
+    (expression, data)
+  }
+
+  private def canonicalizedOptions(
+      expression: Expression,
+      data: AttributeReference): Map[String, String] = {
+    val (messageName, descriptor, options) =
+      QueryPlan.normalizeExpressions(expression, Seq(data)) match {
+        case from: ProtobufDataToCatalyst =>
+          (from.messageName, from.binaryFileDescriptorSet, from.options)
+        case to: CatalystDataToProtobuf =>
+          (to.messageName, to.binaryFileDescriptorSet, to.options)
+        case other => fail(s"Unexpected canonicalized expression: ${other.getClass.getName}")
+      }
+    assert(messageName == "OtherExample")
+    assert(descriptor.exists(_.sameElements(testFileDesc)))
+    options
+  }
+
+  private def protobufExpressionWithStatefulArgument(
+      functionName: String,
+      argumentName: String,
+      onEval: () => Unit = () => (),
+      duplicateKey: Boolean = false): (Expression, AttributeReference) = {
+    val value = argumentName match {
+      case "options" => "value1"
+      case "messageName" => "OtherExample"
+      case "descFilePath" => testFileDescFile
+    }
+    val secondKey = StringLiteralWithEvalHook(if (duplicateKey) "key1" else "key2", onEval)
+    val secondValue = if (argumentName == "options") "value2" else value
+    val map = CreateMap(Seq(Literal("key1"), Literal(value), secondKey, Literal(secondValue)))
+    argumentName match {
+      case "options" => protobufExpression(functionName, map)
+      case "messageName" =>
+        protobufExpression(functionName, Literal(null),
+          messageName = ElementAt(map, Literal("key1")))
+      case "descFilePath" =>
+        protobufExpression(functionName, Literal(null),
+          descFilePath = ElementAt(map, Literal("key1")))
+    }
+  }
+
+  // A lookup in a map whose keys are 0.0 and -0.0, which are one key unless
+  // spark.sql.legacy.disableMapKeyNormalization is true.
+  private def signedZeroKeyLookup(value: String): Expression = ElementAt(
+    CreateMap(Seq(Literal(0.0D), Literal(value), Literal(-0.0D), Literal(value))),
+    Literal(0.0D))
+
+  private def protobufExpressionWithSignedZeroKeys(
+      functionName: String,
+      argumentName: String): (Expression, AttributeReference) = argumentName match {
+    case "options" =>
+      protobufExpression(
+        functionName, CreateMap(Seq(Literal("key1"), signedZeroKeyLookup("value1"))))
+    case "messageName" =>
+      protobufExpression(functionName, Literal(null),
+        messageName = signedZeroKeyLookup("OtherExample"))
+    case "descFilePath" =>
+      protobufExpression(functionName, Literal(null),
+        descFilePath = signedZeroKeyLookup(testFileDescFile))
+  }
+
+  private def protobufDataFrame(
+      functionName: String,
+      options: String = "map('mode', 'PERMISSIVE', 'mode', 'FAILFAST')"): DataFrame = {
+    val input = if (functionName == "FROM_PROTOBUF") {
+      lit(OtherExample.newBuilder().setOther("value").build().toByteArray)
+    } else {
+      struct(lit("value").as("other"))
+    }
+    spark.range(1).select(input.as("data")).selectExpr(
+      s"$functionName(data, 'OtherExample', '$testFileDescFile', $options) AS value")
+  }
+
+  private def protobufDataFrameResult(functionName: String): Row =
+    if (functionName == "FROM_PROTOBUF") {
+      Row(Row("value"))
+    } else {
+      Row(OtherExample.newBuilder().setOther("value").build().toByteArray)
+    }
 
   test("roundtrip in to_protobuf and from_protobuf - struct") {
     val df = spark
@@ -163,8 +289,12 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
   }
 
   test("roundtrip in from_protobuf and to_protobuf - Repeated Message Once") {
-    val repeatedMessageDesc = ProtobufUtils.buildDescriptor(testFileDesc, "RepeatedMessage")
-    val basicMessageDesc = ProtobufUtils.buildDescriptor(testFileDesc, "BasicMessage")
+    val repeatedMessageDesc = ProtobufUtils
+      .buildDescriptor("RepeatedMessage", Some(testFileDesc))
+      .descriptor
+    val basicMessageDesc = ProtobufUtils
+      .buildDescriptor("BasicMessage", Some(testFileDesc))
+      .descriptor
 
     val basicMessage = DynamicMessage
       .newBuilder(basicMessageDesc)
@@ -200,8 +330,12 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
   }
 
   test("roundtrip in from_protobuf and to_protobuf - Repeated Message Twice") {
-    val repeatedMessageDesc = ProtobufUtils.buildDescriptor(testFileDesc, "RepeatedMessage")
-    val basicMessageDesc = ProtobufUtils.buildDescriptor(testFileDesc, "BasicMessage")
+    val repeatedMessageDesc = ProtobufUtils
+      .buildDescriptor("RepeatedMessage", Some(testFileDesc))
+      .descriptor
+    val basicMessageDesc = ProtobufUtils
+      .buildDescriptor("BasicMessage", Some(testFileDesc))
+      .descriptor
 
     val basicMessage1 = DynamicMessage
       .newBuilder(basicMessageDesc)
@@ -251,7 +385,9 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
   }
 
   test("roundtrip in from_protobuf and to_protobuf - Map") {
-    val messageMapDesc = ProtobufUtils.buildDescriptor(testFileDesc, "SimpleMessageMap")
+    val messageMapDesc = ProtobufUtils
+      .buildDescriptor("SimpleMessageMap", Some(testFileDesc))
+      .descriptor
 
     val mapStr1 = DynamicMessage
       .newBuilder(messageMapDesc.findNestedTypeByName("StringMapdataEntry"))
@@ -345,8 +481,12 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
   }
 
   test("roundtrip in from_protobuf and to_protobuf - Enum") {
-    val messageEnumDesc = ProtobufUtils.buildDescriptor(testFileDesc, "SimpleMessageEnum")
-    val basicEnumDesc = ProtobufUtils.buildDescriptor(testFileDesc, "BasicEnumMessage")
+    val messageEnumDesc = ProtobufUtils
+      .buildDescriptor("SimpleMessageEnum", Some(testFileDesc))
+      .descriptor
+    val basicEnumDesc = ProtobufUtils
+      .buildDescriptor("BasicEnumMessage", Some(testFileDesc))
+      .descriptor
 
     val dynamicMessage = DynamicMessage
       .newBuilder(messageEnumDesc)
@@ -389,9 +529,15 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
   }
 
   test("round trip in from_protobuf and to_protobuf - Multiple Message") {
-    val messageMultiDesc = ProtobufUtils.buildDescriptor(testFileDesc, "MultipleExample")
-    val messageIncludeDesc = ProtobufUtils.buildDescriptor(testFileDesc, "IncludedExample")
-    val messageOtherDesc = ProtobufUtils.buildDescriptor(testFileDesc, "OtherExample")
+    val messageMultiDesc = ProtobufUtils
+      .buildDescriptor("MultipleExample", Some(testFileDesc))
+      .descriptor
+    val messageIncludeDesc = ProtobufUtils
+      .buildDescriptor("IncludedExample", Some(testFileDesc))
+      .descriptor
+    val messageOtherDesc = ProtobufUtils
+      .buildDescriptor("OtherExample", Some(testFileDesc))
+      .descriptor
 
     val otherMessage = DynamicMessage
       .newBuilder(messageOtherDesc)
@@ -470,8 +616,8 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
     val catalystTypesFile = protobufDescriptorFile("catalyst_types.desc")
     val descBytes = CommonProtobufUtils.readDescriptorFileContent(catalystTypesFile)
 
-    val oldProducer = ProtobufUtils.buildDescriptor(descBytes, "oldProducer")
-    val newConsumer = ProtobufUtils.buildDescriptor(descBytes, "newConsumer")
+    val oldProducer = ProtobufUtils.buildDescriptor("oldProducer", Some(descBytes)).descriptor
+    val newConsumer = ProtobufUtils.buildDescriptor("newConsumer", Some(descBytes)).descriptor
 
     val oldProducerMessage = DynamicMessage
       .newBuilder(oldProducer)
@@ -512,8 +658,8 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
     val catalystTypesFile = protobufDescriptorFile("catalyst_types.desc")
     val descBytes = CommonProtobufUtils.readDescriptorFileContent(catalystTypesFile)
 
-    val newProducer = ProtobufUtils.buildDescriptor(descBytes, "newProducer")
-    val oldConsumer = ProtobufUtils.buildDescriptor(descBytes, "oldConsumer")
+    val newProducer = ProtobufUtils.buildDescriptor("newProducer", Some(descBytes)).descriptor
+    val oldConsumer = ProtobufUtils.buildDescriptor("oldConsumer", Some(descBytes)).descriptor
 
     val newProducerMessage = DynamicMessage
       .newBuilder(newProducer)
@@ -560,7 +706,9 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
 
     val binary = toProtobuf.first().get(0).asInstanceOf[Array[Byte]]
 
-    val messageDescriptor = ProtobufUtils.buildDescriptor(testFileDesc, "requiredMsg")
+    val messageDescriptor = ProtobufUtils
+      .buildDescriptor("requiredMsg", Some(testFileDesc))
+      .descriptor
     val actualMessage = DynamicMessage.parseFrom(messageDescriptor, binary)
 
     assert(actualMessage.getField(messageDescriptor.findFieldByName("key"))
@@ -582,7 +730,9 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
   }
 
   test("from_protobuf filter to_protobuf") {
-    val basicMessageDesc = ProtobufUtils.buildDescriptor(testFileDesc, "BasicMessage")
+    val basicMessageDesc = ProtobufUtils
+      .buildDescriptor("BasicMessage", Some(testFileDesc))
+      .descriptor
 
     val basicMessage = DynamicMessage
       .newBuilder(basicMessageDesc)
@@ -698,6 +848,136 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
     }
   }
 
+  test("convert.timestamp.duration.to.native=false keeps Timestamp/Duration as struct") {
+    // Build a proto payload the normal way (native Timestamp/Duration on the write side),
+    // then read it back with the conversion disabled and assert both fields deserialize as
+    // struct<seconds: bigint, nanos: int> -- the raw proto shape -- instead of TimestampType /
+    // DayTimeIntervalType.
+    val tsSchema = StructType(
+      StructField("timeStampMsg",
+        StructType(
+          StructField("key", StringType, nullable = true) ::
+            StructField("stmp", TimestampType, nullable = true) :: Nil
+        ), nullable = true) :: Nil)
+    val ts = Timestamp.valueOf("2016-05-09 10:12:43.999")
+    val tsInput = spark.createDataFrame(
+      spark.sparkContext.parallelize(Seq(
+        Row(Row("key1", ts)))),
+      tsSchema)
+
+    val expectedStruct = StructType(
+      StructField("seconds", LongType, nullable = true) ::
+        StructField("nanos", IntegerType, nullable = true) :: Nil)
+
+    checkWithFileAndClassName("timeStampMsg") {
+      case (name, descFilePathOpt) =>
+        val toProtoDf = tsInput
+          .select(to_protobuf_wrapper($"timeStampMsg", name, descFilePathOpt) as Symbol("to_proto"))
+        val fromProtoDf = toProtoDf
+          .select(from_protobuf_wrapper($"to_proto", name, descFilePathOpt,
+            Map("convert.timestamp.duration.to.native" -> "false")) as Symbol("timeStampMsg"))
+
+        val stmpField = fromProtoDf.schema("timeStampMsg").dataType
+          .asInstanceOf[StructType]("stmp")
+        assert(stmpField.dataType === expectedStruct)
+        // Derive the expected epoch from the input Timestamp so the assertion is independent
+        // of the JVM default time zone (Timestamp.valueOf parses in the local zone).
+        val row = fromProtoDf.select("timeStampMsg.stmp.seconds", "timeStampMsg.stmp.nanos").first()
+        assert(row.getLong(0) === ts.getTime / 1000)
+        assert(row.getInt(1) === 999000000)
+    }
+
+    val durSchema = StructType(
+      StructField("durationMsg",
+        StructType(
+          StructField("key", StringType, nullable = true) ::
+            StructField("duration", DayTimeIntervalType.defaultConcreteType, nullable = true) ::
+            Nil
+        ), nullable = true) :: Nil)
+    val durInput = spark.createDataFrame(
+      spark.sparkContext.parallelize(Seq(
+        Row(Row("key1", Duration.ofSeconds(4).plusNanos(500000000))))),
+      durSchema)
+
+    checkWithFileAndClassName("durationMsg") {
+      case (name, descFilePathOpt) =>
+        val toProtoDf = durInput
+          .select(to_protobuf_wrapper($"durationMsg", name, descFilePathOpt) as Symbol("to_proto"))
+        val fromProtoDf = toProtoDf
+          .select(from_protobuf_wrapper($"to_proto", name, descFilePathOpt,
+            Map("convert.timestamp.duration.to.native" -> "false")) as Symbol("durationMsg"))
+
+        val durField = fromProtoDf.schema("durationMsg").dataType
+          .asInstanceOf[StructType]("duration")
+        assert(durField.dataType === expectedStruct)
+        val row = fromProtoDf.select("durationMsg.duration.seconds", "durationMsg.duration.nanos")
+          .first()
+        assert(row.getLong(0) === 4L)
+        assert(row.getInt(1) === 500000000)
+    }
+  }
+
+  test("SPARK-57573: Handle TimeType between to_protobuf and from_protobuf") {
+    val schema = StructType(
+      StructField("timeMsg",
+        StructType(
+          StructField("key", StringType, nullable = true) ::
+            StructField("time_val", TimeType(), nullable = true) :: Nil
+        ),
+        nullable = true
+      ) :: Nil
+    )
+
+    val localTime = LocalTime.of(12, 34, 56, 123456000)
+    val inputDf = spark.createDataFrame(
+      spark.sparkContext.parallelize(Seq(
+        Row(Row("key1", localTime))
+      )),
+      schema
+    )
+
+    checkWithFileAndClassName("timeMsg") {
+      case (name, descFilePathOpt) =>
+        val toProtoDf = inputDf
+          .select(to_protobuf_wrapper($"timeMsg", name,
+            descFilePathOpt) as Symbol("to_proto"))
+
+        val fromProtoDf = toProtoDf
+          .select(from_protobuf_wrapper($"to_proto", name,
+            descFilePathOpt) as Symbol("timeMsg"))
+
+        // The int64 field carries no logical-type marker, so from_protobuf infers it as
+        // LongType holding nanoseconds-of-day rather than TimeType.
+        assert(fromProtoDf.schema("timeMsg").dataType.asInstanceOf[StructType]("time_val")
+          .dataType === LongType)
+        assert(fromProtoDf.select("timeMsg.key").first().get(0) === "key1")
+        assert(fromProtoDf.select("timeMsg.time_val").first().get(0) === localTime.toNanoOfDay)
+    }
+  }
+
+  test("SPARK-57573: TimeType roundtrip through ProtobufSerializer and ProtobufDeserializer") {
+    val descriptor = ProtobufUtils.buildDescriptor("timeMsg", Some(testFileDesc)).descriptor
+    Seq(
+      (TimeType(TimeType.MIN_PRECISION), LocalTime.of(0, 0, 0)),
+      (TimeType(TimeType.MICROS_PRECISION), LocalTime.of(23, 59, 59, 999999000)),
+      (TimeType(TimeType.MICROS_PRECISION), LocalTime.of(12, 34, 56, 123456000))
+    ).foreach { case (timeType, localTime) =>
+      val catalyst = StructType(
+        StructField("key", StringType) ::
+          StructField("time_val", timeType) :: Nil)
+      val serializer = new ProtobufSerializer(catalyst, descriptor, nullable = false)
+      val deserializer = new ProtobufDeserializer(descriptor, catalyst)
+      val nanos = localTime.toNanoOfDay
+      val input = InternalRow(UTF8String.fromString("key1"), nanos)
+
+      val message = serializer.serialize(input).asInstanceOf[DynamicMessage]
+      val result = deserializer.deserialize(message).get
+
+      assert(result.getUTF8String(0).toString === "key1")
+      assert(result.getLong(1) === nanos)
+    }
+  }
+
   test("raise protobuf descriptor error") {
     val df = Seq(ByteString.empty().toByteArray).toDF("value")
     val descWithoutImports = descriptorSetWithoutImports(testFileDesc, "BasicMessage")
@@ -714,7 +994,7 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
   }
 
   test("Verify OneOf field between from_protobuf -> to_protobuf and struct -> from_protobuf") {
-    val descriptor = ProtobufUtils.buildDescriptor(testFileDesc, "OneOfEvent")
+    val descriptor = ProtobufUtils.buildDescriptor("OneOfEvent", Some(testFileDesc)).descriptor
     val oneOfEvent = OneOfEvent.newBuilder()
       .setKey("key")
       .setCol1(123)
@@ -804,7 +1084,7 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
   }
 
   test("Verify recursion field with complex schema with recursive.fields.max.depth") {
-    val descriptor = ProtobufUtils.buildDescriptor(testFileDesc, "Employee")
+    val descriptor = ProtobufUtils.buildDescriptor("Employee", Some(testFileDesc)).descriptor
 
     val manager = Employee.newBuilder().setFirstName("firstName").setLastName("lastName").build()
     val em2 = EM2.newBuilder().setTeamsize(100).setEm2Manager(manager).build()
@@ -846,7 +1126,9 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
 
   test("Verify OneOf field with recursive fields between from_protobuf -> to_protobuf." +
     "and struct -> from_protobuf") {
-    val descriptor = ProtobufUtils.buildDescriptor(testFileDesc, "OneOfEventWithRecursion")
+    val descriptor = ProtobufUtils
+      .buildDescriptor("OneOfEventWithRecursion", Some(testFileDesc))
+      .descriptor
 
     val nestedTwo = OneOfEventWithRecursion.newBuilder()
       .setKey("keyNested2").setValue("valueNested2").build()
@@ -1416,6 +1698,30 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
     }
   }
 
+  test("deeply nested Any-in-Any is rejected as malformed instead of overflowing the stack") {
+    checkWithFileAndClassName("ProtoWithAny") { case (name, descFilePathOpt) =>
+      // Each nested Any level is re-parsed by JsonFormat with a fresh protobuf recursion
+      // limit; without a cross-level budget a deeply nested record overflows the executor
+      // stack with StackOverflowError, which PERMISSIVE mode cannot recover from.
+      var nested = AnyProto.pack(SimpleMessage.newBuilder().setId(1).build())
+      (0 until 2000).foreach(_ => nested = AnyProto.pack(nested))
+      val deeplyNested = ProtoWithAny.newBuilder()
+        .setEventName("deeply-nested")
+        .setDetails(nested)
+        .build()
+        .toByteArray
+      val inputDF = Seq(deeplyNested).toDF("binary")
+
+      val options = Map(
+        ProtobufOptions.CONVERT_ANY_FIELDS_TO_JSON_CONFIG -> "true",
+        "mode" -> "PERMISSIVE")
+      val dfJson = inputDF.select(
+        from_protobuf_wrapper($"binary", name, descFilePathOpt, options).as("proto"))
+      // The record is treated as malformed (null in PERMISSIVE mode) and the task survives.
+      assert(dfJson.collect()(0).getStruct(0) == null)
+    }
+  }
+
   test("test explicitly set zero values - proto3") {
     // All fields explicitly zero. Message, map, repeated, and oneof fields
     // are left unset, as null is their zero value.
@@ -1957,11 +2263,10 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
             )
           }
         } else {
-          if (defaults == "false") {
-            checkAnswer(parsedExplicitZero, expectedEmpty)
-          } else {
-            checkAnswer(parsedExplicitZero, Seq((0)).toDF("int32_val"))
-          }
+          // When unwrapping, a present wrapper carries a value even if it is the inner scalar's
+          // default, so an explicit zero unwraps to 0 regardless of emit.default.values (which
+          // only governs bare proto3 scalars, not a wrapper message's presence).
+          checkAnswer(parsedExplicitZero, Seq((0)).toDF("int32_val"))
         }
 
         // For nonzero, we should get back the number or wrapped version regardless
@@ -1987,6 +2292,35 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
           )
         }
       }
+    }
+  }
+
+  test("well known wrappers with empty container elements unwrap to defaults") {
+    // A repeated/map field of unwrapped wrappers uses a non-null container
+    // (containsNull = false / valueContainsNull = false). A present-but-empty wrapper element
+    // must unwrap to the inner scalar's default, not null -- a null in a non-null container
+    // crashes downstream. Other container-wrapper tests only use non-empty elements, so this
+    // covers the empty-element case for both a repeated and a map field.
+    val message = spark.range(1).select(
+      lit(
+        WellKnownWrapperTypes.newBuilder()
+          .addInt32List(Int32Value.getDefaultInstance) // empty element -> 0
+          .addInt32List(Int32Value.of(7))
+          .putWktMap(1, StringValue.getDefaultInstance) // empty value -> ""
+          .build().toByteArray
+      ).as("raw_proto"))
+
+    val opt = Map("unwrap.primitive.wrapper.types" -> "true")
+    checkWithFileAndClassName("WellKnownWrapperTypes") { case (name, descFilePathOpt) =>
+      val parsed = message.select(
+        from_protobuf_wrapper($"raw_proto", name, descFilePathOpt, opt).as("proto"))
+
+      checkAnswer(
+        parsed.select("proto.int32_list"),
+        spark.range(1).select(typedLit(List(0, 7)).as("int32_list")))
+      checkAnswer(
+        parsed.select("proto.wkt_map"),
+        spark.range(1).select(typedLit(Map(1 -> "")).as("wkt_map")))
     }
   }
 
@@ -2232,6 +2566,184 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
     }
   }
 
+  Seq("FROM_PROTOBUF", "TO_PROTOBUF").foreach { functionName =>
+    Seq("options", "messageName", "descFilePath").foreach { argumentName =>
+      gridTest(s"SPARK-60945: $functionName $argumentName survive overlapping canonicalization")(
+        Seq("EXCEPTION", "LAST_WIN")) { policy =>
+        withSQLConf(SQLConf.MAP_KEY_DEDUP_POLICY.key -> policy) {
+          val firstEvaluationPaused = new CountDownLatch(1)
+          val resumeFirstEvaluation = new CountDownLatch(1)
+          val pauseOnNextEval = new AtomicBoolean(true)
+          val (expression, data) = protobufExpressionWithStatefulArgument(
+            functionName, argumentName, () => {
+              if (pauseOnNextEval.compareAndSet(true, false)) {
+                firstEvaluationPaused.countDown()
+                assert(resumeFirstEvaluation.await(1, TimeUnit.MINUTES),
+                  "first evaluation was never resumed")
+              }
+            })
+          val expectedOptions = if (argumentName == "options") {
+            Map("key1" -> "value1", "key2" -> "value2")
+          } else {
+            Map.empty[String, String]
+          }
+          val sqlConf = SQLConf.get
+          val executor = ThreadUtils.newDaemonSingleThreadExecutor("protobuf-arguments-race-test")
+          val executionContext = ExecutionContext.fromExecutorService(executor)
+          try {
+            val firstEvaluation = Future {
+              SQLConf.withExistingConf(sqlConf) {
+                canonicalizedOptions(expression, data)
+              }
+            }(executionContext)
+            assert(firstEvaluationPaused.await(1, TimeUnit.MINUTES),
+              "first canonicalization never paused")
+            // The first evaluation has inserted key1 and is paused while evaluating key2.
+            assert(canonicalizedOptions(expression, data) == expectedOptions)
+            resumeFirstEvaluation.countDown()
+            assert(ThreadUtils.awaitResult(firstEvaluation, 1.minute) == expectedOptions)
+          } finally {
+            resumeFirstEvaluation.countDown()
+            executor.shutdownNow()
+            assert(executor.awaitTermination(10, TimeUnit.SECONDS))
+          }
+        }
+      }
+
+      test(s"SPARK-60945: $functionName $argumentName survive a failed evaluation") {
+        withSQLConf(SQLConf.MAP_KEY_DEDUP_POLICY.key -> "EXCEPTION") {
+          val failOnNextEval = new AtomicBoolean(true)
+          val expectedFailure = new RuntimeException("first argument evaluation failed")
+          val (expression, data) = protobufExpressionWithStatefulArgument(
+            functionName, argumentName, () => {
+              if (failOnNextEval.compareAndSet(true, false)) {
+                throw expectedFailure
+              }
+            })
+          val expectedOptions = if (argumentName == "options") {
+            Map("key1" -> "value1", "key2" -> "value2")
+          } else {
+            Map.empty[String, String]
+          }
+          val failure = intercept[RuntimeException] {
+            QueryPlan.normalizeExpressions(expression, Seq(data))
+          }
+          assert(failure eq expectedFailure)
+
+          // Retrying must not reuse the partial map left by the failed evaluation.
+          assert(canonicalizedOptions(expression, data) == expectedOptions)
+        }
+      }
+
+      gridTest(s"SPARK-60945: canonicalizing $functionName uses the analysis-time " +
+        s"map key policy for $argumentName")(
+        Seq("LAST_WIN", "EXCEPTION")) { capturedPolicy =>
+        val (expression, data) = withSQLConf(
+          SQLConf.MAP_KEY_DEDUP_POLICY.key -> capturedPolicy) {
+          val result = protobufExpressionWithStatefulArgument(
+            functionName, argumentName, duplicateKey = true)
+          if (capturedPolicy == "LAST_WIN") {
+            // Like analysis, evaluate the expression once before the conf changes. Under EXCEPTION
+            // this would already fail on the duplicate key, so only the LAST_WIN run does it.
+            result._1.dataType
+          }
+          result
+        }
+        val currentPolicy = if (capturedPolicy == "LAST_WIN") "EXCEPTION" else "LAST_WIN"
+        withSQLConf(SQLConf.MAP_KEY_DEDUP_POLICY.key -> currentPolicy) {
+          if (capturedPolicy == "LAST_WIN") {
+            val expectedOptions = if (argumentName == "options") {
+              Map("key1" -> "value2")
+            } else {
+              Map.empty[String, String]
+            }
+            assert(canonicalizedOptions(expression, data) == expectedOptions)
+          } else {
+            checkError(
+              exception = intercept[SparkRuntimeException] {
+                canonicalizedOptions(expression, data)
+              },
+              condition = "DUPLICATED_MAP_KEY",
+              parameters = Map(
+                "key" -> "key1",
+                "mapKeyDedupPolicy" -> s"\"${SQLConf.MAP_KEY_DEDUP_POLICY.key}\""))
+          }
+          assert(SQLConf.get.getConf(SQLConf.MAP_KEY_DEDUP_POLICY).toString == currentPolicy)
+        }
+      }
+
+      gridTest(s"SPARK-60945: canonicalizing $functionName uses the analysis-time map key " +
+        s"normalization for $argumentName")(Seq(true, false)) { capturedDisabled =>
+        val policy = SQLConf.MAP_KEY_DEDUP_POLICY.key -> "EXCEPTION"
+        val normalization = SQLConf.DISABLE_MAP_KEY_NORMALIZATION.key
+        val (expression, data) = withSQLConf(policy, normalization -> capturedDisabled.toString) {
+          val result = protobufExpressionWithSignedZeroKeys(functionName, argumentName)
+          if (capturedDisabled) {
+            // Like analysis, evaluate the expression once before the conf changes. With
+            // normalization, 0.0 and -0.0 are one key, so only the disabled run does it.
+            result._1.dataType
+          }
+          result
+        }
+        withSQLConf(policy, normalization -> (!capturedDisabled).toString) {
+          if (capturedDisabled) {
+            val expectedOptions = if (argumentName == "options") {
+              Map("key1" -> "value1")
+            } else {
+              Map.empty[String, String]
+            }
+            assert(canonicalizedOptions(expression, data) == expectedOptions)
+          } else {
+            checkError(
+              exception = intercept[SparkRuntimeException] {
+                canonicalizedOptions(expression, data)
+              },
+              condition = "DUPLICATED_MAP_KEY",
+              parameters = Map(
+                "key" -> "-0.0",
+                "mapKeyDedupPolicy" -> s"\"${SQLConf.MAP_KEY_DEDUP_POLICY.key}\""))
+          }
+        }
+      }
+    }
+
+    test(s"SPARK-60945: $functionName cached plan retains its map key policy across sessions") {
+      val cached = withSQLConf(SQLConf.MAP_KEY_DEDUP_POLICY.key -> "LAST_WIN") {
+        protobufDataFrame(functionName).cache()
+      }
+      try {
+        val otherSession = spark.newSession()
+        otherSession.conf.set(SQLConf.MAP_KEY_DEDUP_POLICY.key, "EXCEPTION")
+        checkAnswer(otherSession.range(1).toDF(), Seq(Row(0L)))
+      } finally {
+        withSQLConf(SQLConf.MAP_KEY_DEDUP_POLICY.key -> "LAST_WIN") {
+          cached.unpersist(blocking = true)
+        }
+      }
+    }
+
+    test(s"SPARK-60945: $functionName executes after the map key policy changes") {
+      val df = withSQLConf(SQLConf.MAP_KEY_DEDUP_POLICY.key -> "LAST_WIN") {
+        protobufDataFrame(functionName)
+      }
+      withSQLConf(SQLConf.MAP_KEY_DEDUP_POLICY.key -> "EXCEPTION") {
+        checkAnswer(df, Seq(protobufDataFrameResult(functionName)))
+      }
+    }
+
+    test(s"SPARK-60945: $functionName executes after the map key normalization changes") {
+      val policy = SQLConf.MAP_KEY_DEDUP_POLICY.key -> "EXCEPTION"
+      val normalization = SQLConf.DISABLE_MAP_KEY_NORMALIZATION.key
+      val options = "map('mode', element_at(map(0.0D, 'PERMISSIVE', -0.0D, 'PERMISSIVE'), 0.0D))"
+      val df = withSQLConf(policy, normalization -> "true") {
+        protobufDataFrame(functionName, options)
+      }
+      withSQLConf(policy, normalization -> "false") {
+        checkAnswer(df, Seq(protobufDataFrameResult(functionName)))
+      }
+    }
+  }
+
   test("SPARK-54156: boolean Protobuf options reject non-boolean values") {
     Seq(
       "emit.default.values",
@@ -2278,5 +2790,85 @@ class ProtobufFunctionsSuite extends QueryTest with SharedSparkSession with Prot
       functions.from_protobuf($"value", messageName, testFileDesc, options) as Symbol("sample"))
     assert(expectedDf.schema === fromProtoDf.schema)
     checkAnswer(fromProtoDf, expectedDf)
+  }
+
+  test("descriptor cache: repeated builds on the same bytes share the cached parse") {
+    ProtobufUtils.clearDescriptorCacheForTesting()
+    val first = ProtobufUtils.buildDescriptor("BasicMessage", Some(testFileDesc))
+    val second = ProtobufUtils.buildDescriptor("BasicMessage", Some(testFileDesc))
+    // Same descriptor instance (from the shared parse), not a rebuilt copy.
+    assert(first.descriptor eq second.descriptor)
+    val repeated = ProtobufUtils.buildDescriptor("RepeatedMessage", Some(testFileDesc))
+    assert(repeated.descriptor ne first.descriptor)
+    // Distinct message names on the same bytes still share one parse.
+    assert(ProtobufUtils.fileDescriptorCacheSizeForTesting() == 1)
+  }
+
+  test("descriptor cache: distinct bytes are parsed and cached separately") {
+    ProtobufUtils.clearDescriptorCacheForTesting()
+    // Derive a second, genuinely distinct descriptor set from the same source rather than relying
+    // on testFileDesc vs proto2FileDesc being different bytes: under SBT both point at one combined
+    // descriptor file, so they hash to the same cache key. proto2_messages.proto has no imports, so
+    // its single-file set parses standalone and is distinct from the full combined set either way.
+    val proto2Standalone = descriptorSetWithoutImports(proto2FileDesc, "FoobarWithRequiredFieldBar")
+    val basic = ProtobufUtils.buildDescriptor("BasicMessage", Some(testFileDesc))
+    val proto2 = ProtobufUtils.buildDescriptor("FoobarWithRequiredFieldBar", Some(proto2Standalone))
+    assert(proto2.descriptor ne basic.descriptor)
+    assert(ProtobufUtils.fileDescriptorCacheSizeForTesting() == 2)
+  }
+
+  test("descriptor cache: buildTypeRegistry shares the parse with buildDescriptor") {
+    ProtobufUtils.clearDescriptorCacheForTesting()
+    ProtobufUtils.buildDescriptor("BasicMessage", Some(testFileDesc))
+    assert(ProtobufUtils.fileDescriptorCacheSizeForTesting() == 1)
+    // The other entry point reuses the same parse rather than adding an entry.
+    ProtobufUtils.buildTypeRegistry(testFileDesc)
+    assert(ProtobufUtils.fileDescriptorCacheSizeForTesting() == 1)
+  }
+
+  test("descriptor cache: the extensions-enabled flag is honored per call") {
+    ProtobufUtils.clearDescriptorCacheForTesting()
+    val extConf = SQLConf.PROTOBUF_EXTENSIONS_SUPPORT_ENABLED
+    // The flag is read per build, so a shared cached parse still yields the flag-correct result.
+    withSQLConf(extConf.key -> "false") {
+      val disabled = ProtobufUtils.buildDescriptor("BasicMessage", Some(testFileDesc))
+      assert(disabled.extensionRegistry eq com.google.protobuf.ExtensionRegistry.getEmptyRegistry)
+    }
+    withSQLConf(extConf.key -> "true") {
+      val enabled = ProtobufUtils.buildDescriptor("BasicMessage", Some(testFileDesc))
+      assert(enabled.extensionRegistry ne com.google.protobuf.ExtensionRegistry.getEmptyRegistry)
+    }
+    assert(ProtobufUtils.fileDescriptorCacheSizeForTesting() == 1)
+  }
+
+  test("descriptor cache: disabled (size 0) reparses every time and caches nothing") {
+    ProtobufUtils.clearDescriptorCacheForTesting()
+    withSQLConf(SQLConf.PROTOBUF_DESCRIPTOR_CACHE_SIZE.key -> "0") {
+      val first = ProtobufUtils.buildDescriptor("BasicMessage", Some(testFileDesc))
+      val second = ProtobufUtils.buildDescriptor("BasicMessage", Some(testFileDesc))
+      // Each call reparses, so the descriptors come from different graphs.
+      assert(first.descriptor ne second.descriptor)
+      assert(ProtobufUtils.fileDescriptorCacheSizeForTesting() == 0)
+    }
+  }
+
+  test("descriptor cache: an unknown message name surfaces the domain exception") {
+    ProtobufUtils.clearDescriptorCacheForTesting()
+    // The parse succeeds; only the message lookup fails, so the parse stays cached below.
+    intercept[AnalysisException] {
+      ProtobufUtils.buildDescriptor("NoSuchMessage", Some(testFileDesc))
+    }
+    val good = ProtobufUtils.buildDescriptor("BasicMessage", Some(testFileDesc))
+    assert(good.descriptor != null)
+    assert(ProtobufUtils.fileDescriptorCacheSizeForTesting() == 1)
+  }
+
+  test("descriptor cache: a failed parse is not cached") {
+    ProtobufUtils.clearDescriptorCacheForTesting()
+    intercept[AnalysisException] {
+      ProtobufUtils.buildTypeRegistry(Array[Byte](1, 2, 3, 4))
+    }
+    // A failed parse leaves the cache empty.
+    assert(ProtobufUtils.fileDescriptorCacheSizeForTesting() == 0)
   }
 }

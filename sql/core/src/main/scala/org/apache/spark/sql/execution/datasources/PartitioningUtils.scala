@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.execution.datasources
 
-import java.lang.{Double => JDouble, Long => JLong}
+import java.lang.{Byte => JByte, Double => JDouble, Long => JLong, Short => JShort}
 import java.math.{BigDecimal => JBigDecimal}
 import java.time.ZoneId
 import java.util.Locale
@@ -308,10 +308,14 @@ object PartitioningUtils extends SQLConfHelper {
       None
     } else {
       val columnName = unescapePathName(columnSpec.take(equalSignIndex))
-      assert(columnName.nonEmpty, s"Empty partition column name in '$columnSpec'")
+      if (columnName.isEmpty) {
+        throw QueryExecutionErrors.emptyPartitionColumnNameError(columnSpec)
+      }
 
       val rawColumnValue = columnSpec.drop(equalSignIndex + 1)
-      assert(rawColumnValue.nonEmpty, s"Empty partition column value in '$columnSpec'")
+      if (rawColumnValue.isEmpty) {
+        throw QueryExecutionErrors.emptyPartitionColumnValueError(columnSpec)
+      }
 
       val dataType = if (userSpecifiedDataTypes.contains(columnName)) {
         // SPARK-26188: if user provides corresponding column schema, get the column value without
@@ -353,23 +357,54 @@ object PartitioningUtils extends SQLConfHelper {
   /**
    * This is the inverse of parsePathFragment().
    */
-  def getPathFragment(spec: TablePartitionSpec, partitionSchema: StructType): String = {
+  def getPathFragment(
+      spec: TablePartitionSpec,
+      partitionSchema: StructType,
+      validatePartitionColumns: Boolean): String = {
     partitionSchema.map { field =>
       escapePathName(field.name) + "=" +
         getPartitionValueString(
-          removeLeadingZerosFromNumberTypePartition(spec(field.name), field.dataType))
+          removeLeadingZerosFromNumberTypePartition(
+            spec(field.name), field.dataType, validatePartitionColumns))
     }.mkString("/")
   }
 
-  def removeLeadingZerosFromNumberTypePartition(value: String, dataType: DataType): String =
+  def getPathFragment(spec: TablePartitionSpec, partitionSchema: StructType): String = {
+    getPathFragment(spec, partitionSchema, validatePartitionColumns = true)
+  }
+
+  def removeLeadingZerosFromNumberTypePartition(
+      value: String,
+      dataType: DataType,
+      validatePartitionColumns: Boolean): String =
     dataType match {
       case ByteType | ShortType | IntegerType | LongType | FloatType | DoubleType =>
-        Option(castPartValueToDesiredType(dataType, value, null)).map(_.toString).orNull
+        if (value == null) {
+          null
+        } else {
+          try {
+            Option(castPartValueToDesiredType(dataType, value, null)).map(_.toString).orNull
+          } catch {
+            case _: NumberFormatException if !validatePartitionColumns =>
+              // If validation is disabled and value cannot be cast to numeric type, return as-is.
+              // This handles legacy tables with string partition values that don't match
+              // the partition column's numeric type definition.
+              // Leading zeros (e.g., "007") are still normalized to "7" since they parse.
+              value
+          }
+        }
       case _ => value
     }
 
+  def getPathFragment(
+      spec: TablePartitionSpec,
+      partitionColumns: Seq[Attribute],
+      validatePartitionColumns: Boolean): String = {
+    getPathFragment(spec, DataTypeUtils.fromAttributes(partitionColumns), validatePartitionColumns)
+  }
+
   def getPathFragment(spec: TablePartitionSpec, partitionColumns: Seq[Attribute]): String = {
-    getPathFragment(spec, DataTypeUtils.fromAttributes(partitionColumns))
+    getPathFragment(spec, partitionColumns, validatePartitionColumns = true)
   }
 
   /**
@@ -546,26 +581,25 @@ object PartitioningUtils extends SQLConfHelper {
       zoneId: ZoneId): Any = desiredType match {
     case _ if value == DEFAULT_PARTITION_NAME => null
     case NullType => null
-    case StringType => UTF8String.fromString(unescapePathName(value))
-    case ByteType => Integer.parseInt(value).toByte
-    case ShortType => Integer.parseInt(value).toShort
+    case _: StringType => UTF8String.fromString(unescapePathName(value))
+    case ByteType => JByte.parseByte(value)
+    case ShortType => JShort.parseShort(value)
     case IntegerType => Integer.parseInt(value)
     case LongType => JLong.parseLong(value)
     case FloatType => JDouble.parseDouble(value).toFloat
     case DoubleType => JDouble.parseDouble(value)
-    case _: DecimalType => Literal(new JBigDecimal(value)).value
+    // Cast in ANSI mode, here and in the datetime and interval cases below, so that a value that
+    // the type cannot hold fails in any session and `spark.sql.sources.validatePartitionColumns`
+    // alone decides between an error and null.
+    case dt: DecimalType => Cast(Literal(value), dt, ansiEnabled = true).eval()
     case DateType =>
-      Cast(Literal(value), DateType, Some(zoneId.getId)).eval()
-    case tt: TimeType => Cast(Literal(unescapePathName(value)), tt).eval()
+      Cast(Literal(value), DateType, Some(zoneId.getId), ansiEnabled = true).eval()
+    case tt: TimeType => Cast(Literal(unescapePathName(value)), tt, ansiEnabled = true).eval()
     // Timestamp types
-    case dt if AnyTimestampType.acceptsType(dt) =>
-      Try {
-        Cast(Literal(unescapePathName(value)), dt, Some(zoneId.getId)).eval()
-      }.getOrElse {
-        Cast(Cast(Literal(value), DateType, Some(zoneId.getId)), dt).eval()
-      }
+    case dt if AnyTimestampType.acceptsType(dt) || AnyTimestampNanoType.acceptsType(dt) =>
+      Cast(Literal(unescapePathName(value)), dt, Some(zoneId.getId), ansiEnabled = true).eval()
     case it: AnsiIntervalType =>
-      Cast(Literal(unescapePathName(value)), it).eval()
+      Cast(Literal(unescapePathName(value)), it, ansiEnabled = true).eval()
     case BinaryType => value.getBytes()
     case BooleanType => value.toBoolean
     case dt => throw SparkException.internalError(s"Unsupported partition type: $dt")
@@ -596,6 +630,8 @@ object PartitioningUtils extends SQLConfHelper {
     // non default collated strings should not be used as partition columns
     // as we cannot implement string collation semantic with directory names
     case st: StringType => st.supportsBinaryOrdering
+    // geospatial values cannot be cast to and from strings, which partition values are stored as
+    case _: GeometryType | _: GeographyType => false
     case a: AtomicType => !a.isInstanceOf[VariantType]
     case _ => false
   }
@@ -644,11 +680,12 @@ object PartitioningUtils extends SQLConfHelper {
    * Given a collection of [[Literal]]s, resolves possible type conflicts by
    * [[findWiderTypeForPartitionColumn]].
    */
-  private def resolveTypeConflicts(typedValues: Seq[TypedPartValue]): Seq[TypedPartValue] = {
+  private def resolveTypeConflicts(typedValues: Seq[TypedPartValue]): IndexedSeq[TypedPartValue] = {
     val dataTypes = typedValues.map(_.dataType)
     val desiredType = dataTypes.reduce(findWiderTypeForPartitionColumn)
 
-    typedValues.map(tv => tv.copy(dataType = desiredType))
+    // IndexedSeq guarantees O(1) apply at the call site; a List would make the loop O(n^2).
+    typedValues.view.map(tv => tv.copy(dataType = desiredType)).toIndexedSeq
   }
 
   /**

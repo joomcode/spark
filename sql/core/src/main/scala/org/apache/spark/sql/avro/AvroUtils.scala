@@ -16,18 +16,18 @@
  */
 package org.apache.spark.sql.avro
 
-import java.io.{FileNotFoundException, IOException}
+import java.io.{Closeable, FileNotFoundException, IOException}
 import java.util.Locale
 
 import scala.jdk.CollectionConverters._
 
-import org.apache.avro.{Schema, SchemaFormatter}
-import org.apache.avro.file.{DataFileReader, FileReader}
+import org.apache.avro.{Schema, SchemaFormatter, SchemaParseException}
+import org.apache.avro.file.{DataFileReader, DataFileStream, FileReader}
 import org.apache.avro.generic.{GenericDatumReader, GenericRecord}
 import org.apache.avro.mapred.{AvroOutputFormat, FsInput}
 import org.apache.avro.mapreduce.AvroJob
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.FileStatus
+import org.apache.hadoop.fs.{FileStatus, GlobPattern, Path}
 import org.apache.hadoop.mapreduce.Job
 
 import org.apache.spark.{SparkException, SparkIllegalArgumentException}
@@ -38,7 +38,7 @@ import org.apache.spark.sql.avro.AvroCompressionCodec._
 import org.apache.spark.sql.avro.AvroOptions.IGNORE_EXTENSION
 import org.apache.spark.sql.catalyst.{FileSourceOptions, InternalRow}
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
-import org.apache.spark.sql.execution.datasources.OutputWriterFactory
+import org.apache.spark.sql.execution.datasources.{DataSourceUtils, OutputWriterFactory, SupportsArchiveFormat}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.util.Utils
@@ -47,6 +47,30 @@ private[sql] object AvroUtils extends Logging {
 
   val JSON_INLINE_FORMAT: String = "json/inline"
   val JSON_PRETTY_FORMAT: String = "json/pretty"
+
+  /**
+   * Parses an Avro schema from a JSON string with proper error handling.
+   *
+   * The Avro 1.12.x library's Schema.Parser can throw NullPointerException from
+   * ParseContext.resolve() when the schema references named types that cannot be
+   * resolved. This method wraps such NPEs in SchemaParseException so they are
+   * handled by the existing error handling in from_avro/to_avro (which catches
+   * NonFatal exceptions and reports them via the parseMode mechanism).
+   *
+   * @param jsonFormatSchema the Avro schema in JSON string format
+   * @return the parsed Avro Schema
+   * @throws SchemaParseException if the schema cannot be parsed
+   */
+  def parseAvroSchema(jsonFormatSchema: String): Schema = {
+    try {
+      new Schema.Parser().setValidateDefaults(false).parse(jsonFormatSchema)
+    } catch {
+      case e: NullPointerException =>
+        val ex = new SchemaParseException(s"Failed to parse Avro schema: ${e.getMessage}")
+        ex.initCause(e)
+        throw ex
+    }
+  }
 
   def inferSchema(
       spark: SparkSession,
@@ -62,8 +86,23 @@ private[sql] object AvroUtils extends Logging {
     // User can specify an optional avro json schema.
     val avroSchema = parsedOptions.schema
       .getOrElse {
-        inferAvroSchemaFromFiles(files, conf, parsedOptions.ignoreExtension,
-          new FileSourceOptions(CaseInsensitiveMap(options)).ignoreCorruptFiles)
+        val fileSourceOptions = new FileSourceOptions(CaseInsensitiveMap(options))
+        // Tar archives are inferred by reading each entry's writer schema from its Avro header
+        // (streamed, never unpacked to disk), then any loose files. Avro has no DSv2 reader and
+        // does not merge schemas, so this is V1-only and uses the first readable writer schema.
+        val (archives, nonArchives) = if (fileSourceOptions.archiveFormatEnabled) {
+          files.partition(f => SupportsArchiveFormat.isArchivePath(f.getPath))
+        } else {
+          (Seq.empty[FileStatus], files)
+        }
+        if (archives.nonEmpty) {
+          inferAvroSchemaFromArchives(archives, nonArchives, conf, parsedOptions.ignoreExtension,
+            fileSourceOptions.ignoreCorruptFiles, fileSourceOptions.ignoreMissingFiles,
+            fileSourceOptions.archivePathFilterPattern)
+        } else {
+          inferAvroSchemaFromFiles(files, conf, parsedOptions.ignoreExtension,
+            fileSourceOptions.ignoreCorruptFiles)
+        }
       }
 
     SchemaConverters.toSqlType(
@@ -82,6 +121,8 @@ private[sql] object AvroUtils extends Logging {
 
   def supportsDataType(dataType: DataType): Boolean = dataType match {
     case _: VariantType => false
+
+    case _: GeometryType | _: GeographyType => false
 
     case _: AtomicType => true
 
@@ -125,15 +166,17 @@ private[sql] object AvroUtils extends Logging {
                 case DEFLATE => Some(sqlConf.getConf(SQLConf.AVRO_DEFLATE_LEVEL), codecName)
                 case XZ => Some(sqlConf.getConf(SQLConf.AVRO_XZ_LEVEL), codecName)
                 case ZSTANDARD =>
-                  jobConf.setBoolean(AvroOutputFormat.ZSTD_BUFFERPOOL_KEY,
-                    sqlConf.getConf(SQLConf.AVRO_ZSTANDARD_BUFFER_POOL_ENABLED))
+                  DataSourceUtils.setConfIfAbsent(jobConf,
+                    AvroOutputFormat.ZSTD_BUFFERPOOL_KEY,
+                    sqlConf.getConf(SQLConf.AVRO_ZSTANDARD_BUFFER_POOL_ENABLED).toString)
                   Some(sqlConf.getConf(SQLConf.AVRO_ZSTANDARD_LEVEL), "zstd")
                 case _ => None
               }
               levelAndCodecName.foreach { case (level, mapredCodecName) =>
+                val levelKey = s"avro.mapred.$mapredCodecName.level"
+                DataSourceUtils.setConfIfAbsent(jobConf, levelKey, level.toString)
                 logInfo(log"Compressing Avro output using the ${MDC(CODEC_NAME, codecName)} " +
-                  log"codec at level ${MDC(CODEC_LEVEL, level)}")
-                jobConf.setInt(s"avro.mapred.$mapredCodecName.level", level.toInt)
+                  log"codec at level ${MDC(CODEC_LEVEL, jobConf.get(levelKey))}")
               }
             } else {
               logInfo(log"Compressing Avro output using the ${MDC(CODEC_NAME, codecName)} codec")
@@ -191,6 +234,78 @@ private[sql] object AvroUtils extends Logging {
       case None =>
         throw new FileNotFoundException(
           "No Avro files found. If files don't have .avro extension, set ignoreExtension to true")
+    }
+  }
+
+  /**
+   * Infers an Avro schema from tar archives (`.tar`/`.tar.gz`/`.tgz`) by reading the writer schema
+   * from the first readable archive entry's Avro header via a forward-only [[DataFileStream]] --
+   * the archive is streamed, never unpacked to disk, and records are never scanned. Mirrors
+   * [[inferAvroSchemaFromFiles]]: schema evolution is not supported, so the first readable writer
+   * schema (across the archives, then any loose files) is used for the whole dataset, and archives
+   * past the first readable one are never opened.
+   */
+  private def inferAvroSchemaFromArchives(
+      archives: Seq[FileStatus],
+      nonArchives: Seq[FileStatus],
+      conf: Configuration,
+      ignoreExtension: Boolean,
+      ignoreCorruptFiles: Boolean,
+      ignoreMissingFiles: Boolean,
+      archivePathFilter: Option[GlobPattern]): Schema = {
+    archives.iterator
+      .flatMap { f =>
+        firstArchiveEntrySchema(
+          f.getPath, conf, ignoreCorruptFiles, ignoreMissingFiles, archivePathFilter)
+      }
+      .nextOption()
+      .getOrElse {
+        // No readable schema in any archive; fall back to the loose files. With none readable
+        // there either, `inferAvroSchemaFromFiles` raises the standard "no Avro files found" error.
+        inferAvroSchemaFromFiles(nonArchives, conf, ignoreExtension, ignoreCorruptFiles)
+      }
+  }
+
+  /**
+   * Reads the Avro writer schema of `path`'s first readable entry from its [[DataFileStream]]
+   * header (records are never scanned), then closes the archive without reading further entries.
+   * Returns `None` for an empty archive, or for a missing/corrupt archive under the respective
+   * ignore flag. Because only the first entry is read, a corrupt later entry never affects
+   * inference -- matching [[inferAvroSchemaFromFiles]], which stops at the first readable file.
+   */
+  private def firstArchiveEntrySchema(
+      path: Path,
+      conf: Configuration,
+      ignoreCorruptFiles: Boolean,
+      ignoreMissingFiles: Boolean,
+      archivePathFilter: Option[GlobPattern]): Option[Schema] = {
+    try {
+      // `readArchiveEntries` returns a Closeable iterator; take the first entry's schema and close
+      // it so the archive stream is released without draining the remaining entries.
+      val entries = SupportsArchiveFormat.readArchiveEntries(
+          path, conf, archivePathFilter = archivePathFilter) { (_, in) =>
+        val stream = new DataFileStream[GenericRecord](in, new GenericDatumReader[GenericRecord]())
+        try {
+          Iterator.single(stream.getSchema)
+        } finally {
+          stream.close()
+        }
+      }
+      try {
+        if (entries.hasNext) Some(entries.next()) else None
+      } finally {
+        entries match {
+          case c: Closeable => c.close()
+          case _ =>
+        }
+      }
+    } catch {
+      case _: FileNotFoundException if ignoreMissingFiles =>
+        logWarning(log"Skipped missing archive: ${MDC(PATH, path)}")
+        None
+      case e @ (_: RuntimeException | _: IOException) if ignoreCorruptFiles =>
+        logWarning(log"Skipped the corrupted archive: ${MDC(PATH, path)}", e)
+        None
     }
   }
 
@@ -258,17 +373,28 @@ private[sql] object AvroUtils extends Logging {
    * @param positionalFieldMatch If true, perform field matching in a positional fashion
    *                             (structural comparison between schemas, ignoring names);
    *                             otherwise, perform field matching using field names.
+   * @param dataSchemaPositions The position of each `catalystSchema` field in the schema it was
+   *                            projected from, for a positional match against a projection. A
+   *                            positional match pairs a Catalyst field with the Avro field at the
+   *                            same position, and that position is the one in the full schema, so
+   *                            a read of only the third column still takes the third Avro field.
+   *                            Empty when `catalystSchema` is not a projection, in which case a
+   *                            field's own position is used.
    */
   class AvroSchemaHelper(
       avroSchema: Schema,
       catalystSchema: StructType,
       avroPath: Seq[String],
       catalystPath: Seq[String],
-      positionalFieldMatch: Boolean) {
+      positionalFieldMatch: Boolean,
+      dataSchemaPositions: Array[Int] = Array.empty) {
     if (avroSchema.getType != Schema.Type.RECORD) {
       throw new IncompatibleSchemaException(
         s"Attempting to treat ${avroSchema.getName} as a RECORD, but it was: ${avroSchema.getType}")
     }
+    require(dataSchemaPositions.isEmpty || dataSchemaPositions.length == catalystSchema.length,
+      s"Got ${dataSchemaPositions.length} data schema positions for " +
+        s"${catalystSchema.length} Catalyst fields")
 
     private[this] val avroFieldArray = avroSchema.getFields.asScala.toArray
     private[this] val fieldMap = avroSchema.getFields.asScala
@@ -292,8 +418,9 @@ private[sql] object AvroUtils extends Logging {
         if (getAvroField(sqlField.name, sqlPos).isEmpty &&
           (!ignoreNullable || !sqlField.nullable)) {
           if (positionalFieldMatch) {
-            throw new IncompatibleSchemaException("Cannot find field at position " +
-              s"$sqlPos of ${toFieldStr(avroPath)} from Avro schema (using positional matching)")
+            throw new IncompatibleSchemaException(
+              s"Cannot find field at position ${avroPosition(sqlPos)} of " +
+                s"${toFieldStr(avroPath)} from Avro schema (using positional matching)")
           } else {
             throw new IncompatibleSchemaException(
               s"Cannot find ${toFieldStr(catalystPath :+ sqlField.name)} in Avro schema")
@@ -347,11 +474,15 @@ private[sql] object AvroUtils extends Logging {
     /** Get the Avro field corresponding to the provided Catalyst field name/position, if any. */
     def getAvroField(fieldName: String, catalystPos: Int): Option[Schema.Field] = {
       if (positionalFieldMatch) {
-        avroFieldArray.lift(catalystPos)
+        avroFieldArray.lift(avroPosition(catalystPos))
       } else {
         getFieldByName(fieldName)
       }
     }
+
+    /** The Avro field position a positional match pairs the given Catalyst position with. */
+    private def avroPosition(catalystPos: Int): Int =
+      if (dataSchemaPositions.isEmpty) catalystPos else dataSchemaPositions(catalystPos)
   }
 
   /**

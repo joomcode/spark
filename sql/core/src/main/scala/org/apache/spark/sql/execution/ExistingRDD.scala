@@ -30,7 +30,6 @@ import org.apache.spark.sql.catalyst.util.truncatedString
 import org.apache.spark.sql.classic.{Dataset, SparkSession}
 import org.apache.spark.sql.connector.read.streaming.SparkDataStream
 import org.apache.spark.sql.execution.metric.SQLMetrics
-import org.apache.spark.util.collection.Utils
 
 object ExternalRDD {
 
@@ -105,7 +104,8 @@ case class LogicalRDD(
     // originStats and originConstraints are intentionally placed to "second" parameter list,
     // to prevent catalyst rules to mistakenly transform and rewrite them. Do not change this.
     originStats: Option[Statistics] = None,
-    originConstraints: Option[ExpressionSet] = None)
+    originConstraints: Option[ExpressionSet] = None,
+    fromCheckpoint: Boolean = false)
   extends LeafNode
   with StreamSourceAwareLogicalPlan
   with MultiInstanceRelation {
@@ -113,10 +113,12 @@ case class LogicalRDD(
   import LogicalRDD._
 
   override protected final def otherCopyArgs: Seq[AnyRef] =
-    session :: originStats :: originConstraints :: Nil
+    session :: originStats :: originConstraints :: Boolean.box(fromCheckpoint) :: Nil
 
   override def newInstance(): LogicalRDD.this.type = {
-    val rewrite = Utils.toMap(output, output.map(_.newInstance()))
+    // Keyed by exprId, because the attributes in the partitioning, the ordering, the stats and
+    // the constraints can differ from `output` in qualifier or nullability.
+    val rewrite = AttributeMap(output.zip(output.map(_.newInstance())))
 
     val rewrittenPartitioning = outputPartitioning match {
       case p: Expression =>
@@ -135,13 +137,14 @@ case class LogicalRDD(
     val rewrittenConstraints = originConstraints.map(rewriteConstraints(_, rewrite))
 
     LogicalRDD(
-      output.map(rewrite),
+      // Swap only the exprId, so that the columns sharing an exprId keep their own names.
+      output.map(a => a.withExprId(rewrite(a).exprId)),
       rdd,
       rewrittenPartitioning,
       rewrittenOrdering,
       isStreaming,
       stream
-    )(session, rewrittenStatistics, rewrittenConstraints).asInstanceOf[this.type]
+    )(session, rewrittenStatistics, rewrittenConstraints, fromCheckpoint).asInstanceOf[this.type]
   }
 
   override protected def stringArgs: Iterator[Any] = Iterator(output, isStreaming)
@@ -156,6 +159,8 @@ case class LogicalRDD(
     }
   }
 
+  private[sql] def isCheckpointedInput: Boolean = fromCheckpoint && rdd.isCheckpointed
+
   override lazy val constraints: ExpressionSet = originConstraints.getOrElse(ExpressionSet())
     // Subqueries can have non-deterministic results even when they only contain deterministic
     // expressions (e.g. consider a LIMIT 1 subquery without an ORDER BY). Propagating predicates
@@ -166,7 +171,7 @@ case class LogicalRDD(
     .filterNot(SubqueryExpression.hasSubquery)
 
   override def withStream(stream: SparkDataStream): LogicalRDD = {
-    copy(stream = Some(stream))(session, originStats, originConstraints)
+    copy(stream = Some(stream))(session, originStats, originConstraints, fromCheckpoint)
   }
 
   override def getStream: Option[SparkDataStream] = stream
@@ -181,7 +186,8 @@ object LogicalRDD extends Logging {
   private[sql] def fromDataset(
       rdd: RDD[InternalRow],
       originDataset: Dataset[_],
-      isStreaming: Boolean): LogicalRDD = {
+      isStreaming: Boolean,
+      fromCheckpoint: Boolean = false): LogicalRDD = {
     // Takes the first leaf partitioning whenever we see a `PartitioningCollection`. Otherwise the
     // size of `PartitioningCollection` may grow exponentially for queries involving deep inner
     // joins.
@@ -199,14 +205,41 @@ object LogicalRDD extends Logging {
 
     val (stats, constraints) = rewriteStatsAndConstraints(logicalPlan, optimizedPlan)
 
+    // The executed plan can output other attributes than `logicalPlan.output`, e.g. when
+    // `RemoveRedundantAliases` removes a same-name root alias. So map its partitioning and ordering
+    // onto `logicalPlan.output` by position, and drop the parts that still refer to other
+    // attributes, e.g. the input attributes of `SerializeFromObjectExec` or the pruned columns of
+    // `InMemoryTableScanExec`.
+    val toOutput = AttributeMap(executedPlan.output.zip(logicalPlan.output))
+    val outputSet = AttributeSet(logicalPlan.output)
+    def remap[E <: Expression](e: E): E =
+      e.transform { case a: Attribute => toOutput.getOrElse(a, a) }.asInstanceOf[E]
+    val partitioning = firstLeafPartitioning(executedPlan.outputPartitioning) match {
+      case p: Expression =>
+        val remapped = remap(p)
+        if (remapped.references.subsetOf(outputSet)) {
+          remapped
+        } else {
+          UnknownPartitioning(p.numPartitions)
+        }
+      case p => p
+    }
+    // Like `AliasAwareQueryOutputOrdering`, take the leading sort orders over the output only.
+    val ordering = executedPlan.outputOrdering.map(remap).map { order =>
+      order.children.filter(_.references.subsetOf(outputSet)) match {
+        case child +: rest => Some(order.copy(child = child, sameOrderExpressions = rest))
+        case _ => None
+      }
+    }.takeWhile(_.isDefined).flatten
+
     LogicalRDD(
       originDataset.logicalPlan.output,
       rdd,
-      firstLeafPartitioning(executedPlan.outputPartitioning),
-      executedPlan.outputOrdering,
+      partitioning,
+      ordering,
       isStreaming,
       None
-    )(originDataset.sparkSession, stats, constraints)
+    )(originDataset.sparkSession, stats, constraints, fromCheckpoint)
   }
 
   private[sql] def buildOutputAssocForRewrite(
@@ -223,7 +256,9 @@ object LogicalRDD extends Logging {
     }.toMap
 
     if (rewrite.size == source.size) {
-      Some(rewrite)
+      // Keyed by exprId, because the attributes in the stats and the constraints can differ from
+      // `source` in qualifier or nullability.
+      Some(AttributeMap(rewrite))
     } else {
       None
     }
@@ -244,7 +279,8 @@ object LogicalRDD extends Logging {
     }.toMap
 
     if (rewrite.size == source.size) {
-      Some(rewrite)
+      // Keyed by exprId, for the same reason as in `buildOutputAssocForRewrite`.
+      Some(AttributeMap(rewrite))
     } else {
       None
     }
@@ -360,23 +396,25 @@ case class OneRowRelationExec() extends LeafExecNode
   override val output: Seq[Attribute] = Nil
 
   private val rdd: RDD[InternalRow] = {
-    val numOutputRows = longMetric("numOutputRows")
     session
       .sparkContext
       .parallelize(Seq(""), 1)
       .mapPartitionsInternal { _ =>
         val proj = UnsafeProjection.create(Seq.empty[Expression])
-        Iterator(proj.apply(InternalRow.empty)).map { r =>
-          numOutputRows += 1
-          r
-        }
+        Iterator(proj.apply(InternalRow.empty))
       }
   }
 
   override lazy val metrics = Map(
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"))
 
-  protected override def doExecute(): RDD[InternalRow] = rdd
+  protected override def doExecute(): RDD[InternalRow] = {
+    val numOutputRows = longMetric("numOutputRows")
+    rdd.map { r =>
+      numOutputRows += 1
+      r
+    }
+  }
 
   override def simpleString(maxFields: Int): String = s"$nodeName[]"
 

@@ -17,10 +17,12 @@
 
 package org.apache.spark.sql.catalyst.parser
 
+import java.time.{DateTimeException, LocalDateTime}
 import java.util.{List, Locale}
 import java.util.concurrent.TimeUnit
 
-import scala.collection.mutable.{ArrayBuffer, HashMap, ListBuffer, Set}
+import scala.collection.mutable
+import scala.collection.mutable.{ArrayBuffer, HashMap, ListBuffer}
 import scala.jdk.CollectionConverters._
 
 import org.antlr.v4.runtime.{ParserRuleContext, RuleContext, Token}
@@ -42,13 +44,14 @@ import org.apache.spark.sql.catalyst.parser.SqlBaseParser._
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.trees.{CurrentOrigin, Origin}
-import org.apache.spark.sql.catalyst.trees.TreePattern.PARAMETER
+import org.apache.spark.sql.catalyst.trees.TreePattern.{PARAMETER, UNRESOLVED_IDENTIFIER}
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
-import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, CollationFactory, DateTimeUtils, EvaluateUnresolvedInlineTable, IntervalUtils}
-import org.apache.spark.sql.catalyst.util.DateTimeUtils.{convertSpecialDate, convertSpecialTimestamp, convertSpecialTimestampNTZ, getZoneId, stringToDate, stringToTime, stringToTimestamp, stringToTimestampWithoutTimeZone}
-import org.apache.spark.sql.connector.catalog.{CatalogV2Util, SupportsNamespaces, TableCatalog, TableWritePrivilege}
+import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, CollationFactory, DateTimeConstants, DateTimeUtils, EvaluateUnresolvedInlineTable, IntervalUtils, WriteDistributionAndOrdering}
+import org.apache.spark.sql.catalyst.util.DateTimeUtils.{convertSpecialDate, convertSpecialTimestamp, convertSpecialTimestampNTZ, fractionalSecondsDigits, getZoneId, stringToDate, stringToTime, stringToTimestamp, stringToTimestampLTZNanos, stringToTimestampNTZNanos, stringToTimestampWithoutTimeZone}
+import org.apache.spark.sql.connector.catalog.{CatalogV2Util, ChangelogContext, PathElement, SupportsNamespaces, TableCatalog, TableWritePrivilege, WriteDistributionMode}
+import org.apache.spark.sql.connector.catalog.ChangelogRange.{TimestampRange, UnboundedRange, VersionRange}
 import org.apache.spark.sql.connector.catalog.TableChange.ColumnPosition
-import org.apache.spark.sql.connector.expressions.{ApplyTransform, BucketTransform, DaysTransform, Expression => V2Expression, FieldReference, HoursTransform, IdentityTransform, LiteralValue, MonthsTransform, Transform, YearsTransform}
+import org.apache.spark.sql.connector.expressions.{ApplyTransform, BucketTransform, DaysTransform, Expression => V2Expression, FieldReference, HoursTransform, IdentityTransform, LiteralValue, LogicalExpressions, MonthsTransform, NullOrdering, SortDirection, SortOrder => V2SortOrder, Transform, YearsTransform}
 import org.apache.spark.sql.errors.{DataTypeErrorsBase, QueryCompilationErrors, QueryParsingErrors, SqlScriptingErrors}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.{LEGACY_BANG_EQUALS_NOT, LEGACY_CONSECUTIVE_STRING_LITERALS}
@@ -67,13 +70,26 @@ class AstBuilder extends DataTypeAstBuilder
   import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
   import ParserUtils._
 
+  // Note: Do NOT add withOrigin(ctx) to this method. Builders often create full command plans
+  // (e.g., ReplaceTable, CreateFunction), not just identifier plans. Wrapping the body with
+  // withOrigin(ctx) would set CurrentOrigin to the identifier reference for ALL code in the
+  // builder, including error-throwing validation. Since ParseException.getQueryContext() reads
+  // from CurrentOrigin, this would cause error contexts to point to the identifier instead of
+  // the full statement. If a specific call site needs the identifier Origin on the plan it
+  // creates, add withOrigin(ctx) inside that call site's builder lambda instead.
   protected def withIdentClause(
       ctx: IdentifierReferenceContext,
       builder: Seq[String] => LogicalPlan): LogicalPlan = {
     val exprCtx = ctx.expression
     if (exprCtx != null) {
-      PlanWithUnresolvedIdentifier(withOrigin(exprCtx) { expression(exprCtx) }, Nil,
-        (ident, _) => builder(ident))
+      expression(exprCtx) match {
+        case Literal(value, _: StringType) if value != null =>
+          val parts = parseMultipartIdentifier(value.toString)
+          builder(parts)
+        case expr =>
+          PlanWithUnresolvedIdentifier(withOrigin(exprCtx) { expr }, Nil,
+            (ident, _) => builder(ident))
+      }
     } else {
       builder.apply(visitMultipartIdentifier(ctx.multipartIdentifier))
     }
@@ -367,6 +383,8 @@ class AstBuilder extends DataTypeAstBuilder
           statement match {
             case SingleStatement(createVariable: CreateVariable) =>
               compoundBodyParserContext.variable(createVariable, isScope)
+            case SingleStatement(_: DeclareCursor) =>
+              compoundBodyParserContext.cursor()
             case _ => compoundBodyParserContext.statement()
           }
           buff += statement
@@ -691,6 +709,31 @@ class AstBuilder extends DataTypeAstBuilder
     visitMultipartIdentifier(ctx.multipartIdentifier)
   }
 
+  override def visitSingleTemporalTableIdentifier(
+      ctx: SingleTemporalTableIdentifierContext): TemporalIdentifier = withOrigin(ctx) {
+    visitTemporalTableIdentifier(ctx.temporalTableIdentifier)
+  }
+
+  override def visitSinglePathElementList(
+      ctx: SinglePathElementListContext): Seq[PathElement] = withOrigin(ctx) {
+    ctx.pathElement().asScala.map(visitPathElement).toSeq
+  }
+
+  override def visitPathElement(ctx: PathElementContext): PathElement = withOrigin(ctx) {
+    if (ctx.DEFAULT_PATH() != null) PathElement.DefaultPath
+    else if (ctx.SYSTEM_PATH() != null) PathElement.SystemPath
+    else if (ctx.PATH() != null) PathElement.PathRef
+    else if (ctx.CURRENT_DATABASE() != null || ctx.CURRENT_SCHEMA() != null) {
+      PathElement.CurrentSchema
+    } else {
+      val parts = visitMultipartIdentifier(ctx.multipartIdentifier())
+      if (parts.length < 2) {
+        throw QueryCompilationErrors.invalidSqlPathSchemaReferenceError(parts.mkString("."))
+      }
+      PathElement.SchemaInPath(parts)
+    }
+  }
+
   override def visitSingleDataType(ctx: SingleDataTypeContext): DataType = withOrigin(ctx) {
     typedVisit[DataType](ctx.dataType)
   }
@@ -729,7 +772,7 @@ class AstBuilder extends DataTypeAstBuilder
   private def withCTE(ctx: CtesContext, plan: LogicalPlan): LogicalPlan = {
     val ctes = ctx.namedQuery.asScala.map { nCtx =>
       val namedQuery = visitNamedQuery(nCtx)
-      val rowLevelLimit: Option[Int] = if (nCtx.integerValue() != null) {
+      val maxDepth: Option[Int] = if (nCtx.integerValue() != null) {
         if (ctx.RECURSIVE() == null) {
           operationNotAllowed("Cannot specify MAX RECURSION LEVEL when the CTE is not marked as " +
             "RECURSIVE", ctx)
@@ -738,10 +781,11 @@ class AstBuilder extends DataTypeAstBuilder
       } else {
         None
       }
-      (namedQuery.alias, namedQuery, rowLevelLimit)
+      val materialized = if (nCtx.MATERIALIZED() != null) Some(nCtx.NOT() == null) else None
+      UnresolvedCTERelation(namedQuery.alias, namedQuery, maxDepth, materialized)
     }
     // Check for duplicate names.
-    val duplicates = ctes.groupBy(_._1).filter(_._2.size > 1).keys
+    val duplicates = ctes.groupBy(_.name.toLowerCase(Locale.ROOT)).filter(_._2.size > 1).keys
     if (duplicates.nonEmpty) {
       throw QueryParsingErrors.duplicateCteDefinitionNamesError(
         duplicates.map(toSQLId).mkString(", "), ctx)
@@ -775,6 +819,7 @@ class AstBuilder extends DataTypeAstBuilder
         ctx.aggregationClause,
         ctx.havingClause,
         ctx.windowClause,
+        ctx.qualifyClause,
         plan,
         isPipeOperatorSelect = false
       )
@@ -837,7 +882,8 @@ class AstBuilder extends DataTypeAstBuilder
       withInsertInto(body.insertInto,
         withFromStatementBody(body.fromStatementBody, from).
           optionalMap(body.fromStatementBody.queryOrganization)(
-            withQueryResultClauses(_, _, forPipeOperators = false)))
+            withQueryResultClauses(_, _, forPipeOperators = false)),
+        queryAliasCtx = null)
     }
 
     // If there are multiple INSERTS just UNION them together into one query.
@@ -853,7 +899,7 @@ class AstBuilder extends DataTypeAstBuilder
    */
   override def visitSingleInsertQuery(
       ctx: SingleInsertQueryContext): LogicalPlan = withOrigin(ctx) {
-    withInsertInto(ctx.insertInto(), visitQuery(ctx.query))
+    withInsertInto(ctx.insertInto(), visitQuery(ctx.query), queryAliasCtx = ctx.queryAlias)
   }
 
   /**
@@ -865,7 +911,8 @@ class AstBuilder extends DataTypeAstBuilder
       userSpecifiedCols: Seq[String],
       partitionSpec: Map[String, Option[String]],
       ifPartitionNotExists: Boolean,
-      byName: Boolean)
+      byName: Boolean,
+      replaceCriteriaOpt: Option[InsertReplaceCriteria] = None)
 
   /**
    * Parameters used for writing query to a directory: (isLocal, CatalogStorageFormat, provider).
@@ -875,9 +922,14 @@ class AstBuilder extends DataTypeAstBuilder
   /**
    * Add an
    * {{{
-   *   INSERT OVERWRITE TABLE tableIdentifier [partitionSpec [IF NOT EXISTS]]? [identifierList]
-   *   INSERT INTO [TABLE] tableIdentifier [partitionSpec] ([BY NAME] | [identifierList])
-   *   INSERT INTO [TABLE] tableIdentifier REPLACE whereClause
+   *   INSERT [WITH SCHEMA EVOLUTION] OVERWRITE
+   *     TABLE tableIdentifier [partitionSpec [IF NOT EXISTS]]? [identifierList]
+   *   INSERT [WITH SCHEMA EVOLUTION] INTO
+   *     [TABLE] tableIdentifier [partitionSpec] ([BY NAME] | [identifierList])
+   *   INSERT [WITH SCHEMA EVOLUTION] INTO [TABLE] tableIdentifier tableAlias [BY NAME]
+   *     REPLACE (WHERE | ON) booleanExpression
+   *   INSERT [WITH SCHEMA EVOLUTION] INTO [TABLE] tableIdentifier tableAlias [BY NAME]
+   *     REPLACE USING identifierList
    *   INSERT OVERWRITE [LOCAL] DIRECTORY STRING [rowFormat] [createFileFormat]
    *   INSERT OVERWRITE [LOCAL] DIRECTORY [STRING] tableProvider [OPTIONS tablePropertyList]
    * }}}
@@ -885,55 +937,67 @@ class AstBuilder extends DataTypeAstBuilder
    */
   protected def withInsertInto(
       ctx: InsertIntoContext,
-      query: LogicalPlan): LogicalPlan = withOrigin(ctx) {
+      query: LogicalPlan,
+      queryAliasCtx: TableAliasContext): LogicalPlan = withOrigin(ctx) {
     ctx match {
-      // We cannot push withIdentClause() into the write command because:
-      //   1. `PlanWithUnresolvedIdentifier` is not a NamedRelation
-      //   2. Write commands do not hold the table logical plan as a child, and we need to add
-      //      additional resolution code to resolve identifiers inside the write commands.
       case table: InsertIntoTableContext =>
         val insertParams = visitInsertIntoTable(table)
-        withIdentClause(insertParams.relationCtx, Seq(query), (ident, otherPlans) => {
-          InsertIntoStatement(
-            table = createUnresolvedRelation(
-              ctx = insertParams.relationCtx,
-              ident = ident,
-              optionsClause = insertParams.options,
-              writePrivileges = Seq(TableWritePrivilege.INSERT),
-              isStreaming = false),
-            partitionSpec = insertParams.partitionSpec,
-            userSpecifiedCols = insertParams.userSpecifiedCols,
-            query = otherPlans.head,
-            overwrite = false,
-            ifPartitionNotExists = insertParams.ifPartitionNotExists,
-            byName = insertParams.byName)
-        })
+        createInsertIntoStatement(
+          insertParams = insertParams,
+          query = query,
+          overwrite = false,
+          withSchemaEvolution = table.EVOLUTION() != null,
+          writePrivileges = Set(TableWritePrivilege.INSERT))
       case table: InsertOverwriteTableContext =>
         val insertParams = visitInsertOverwriteTable(table)
-        withIdentClause(insertParams.relationCtx, Seq(query), (ident, otherPlans) => {
-          InsertIntoStatement(
-            table = createUnresolvedRelation(
-              ctx = insertParams.relationCtx,
-              ident = ident,
-              optionsClause = insertParams.options,
-              writePrivileges = Seq(TableWritePrivilege.INSERT, TableWritePrivilege.DELETE),
-              isStreaming = false),
-            partitionSpec = insertParams.partitionSpec,
-            userSpecifiedCols = insertParams.userSpecifiedCols,
-            query = otherPlans.head,
+        createInsertIntoStatement(
+          insertParams = insertParams,
+          query = query,
+          overwrite = true,
+          withSchemaEvolution = table.EVOLUTION() != null,
+          writePrivileges = Set(TableWritePrivilege.INSERT, TableWritePrivilege.DELETE))
+      case ctx: InsertIntoReplaceBooleanCondContext =>
+        // Although REPLACE WHERE and REPLACE ON share a unified grammar rule, they have
+        // different SQL semantics:
+        // - REPLACE WHERE deletes table rows that satisfy the given predicate.
+        // - REPLACE ON only deletes table rows that match at least one source row.
+        // For example, with an empty source query, REPLACE ON never deletes any table rows,
+        // while REPLACE WHERE still can.
+        val isInsertReplaceWhere = ctx.WHERE() != null
+        if (isInsertReplaceWhere) {
+          val insertParams = visitInsertIntoReplaceWhere(ctx)
+          createInsertIntoStatement(
+            insertParams = insertParams,
+            query = query,
             overwrite = true,
-            ifPartitionNotExists = insertParams.ifPartitionNotExists,
-            byName = insertParams.byName)
-        })
-      case ctx: InsertIntoReplaceWhereContext =>
-        val options = Option(ctx.optionsClause())
-        withIdentClause(ctx.identifierReference, Seq(query), (ident, otherPlans) => {
-          OverwriteByExpression.byPosition(
-            createUnresolvedRelation(ctx.identifierReference, ident, options,
-              Seq(TableWritePrivilege.INSERT, TableWritePrivilege.DELETE), isStreaming = false),
-            otherPlans.head,
-            expression(ctx.whereClause().booleanExpression()))
-        })
+            withSchemaEvolution = ctx.EVOLUTION() != null,
+            writePrivileges = Set(TableWritePrivilege.INSERT, TableWritePrivilege.DELETE))
+        } else {
+          val insertParams = visitInsertIntoReplaceOn(ctx)
+          val finalQuery = {
+            val queryAliasOpt =
+              getTableAliasWithoutColumnAlias(queryAliasCtx, "INSERT REPLACE ON")
+            queryAliasOpt.map { queryAlias =>
+              withOrigin(queryAliasCtx) {
+                SubqueryAlias(queryAlias, child = query)
+              }
+            }.getOrElse(query)
+          }
+          createInsertIntoStatement(
+            insertParams = insertParams,
+            query = finalQuery,
+            overwrite = true,
+            withSchemaEvolution = ctx.EVOLUTION() != null,
+            writePrivileges = Set(TableWritePrivilege.INSERT, TableWritePrivilege.DELETE))
+        }
+      case ctx: InsertIntoReplaceUsingContext =>
+        val insertParams = visitInsertIntoReplaceUsing(ctx)
+        createInsertIntoStatement(
+          insertParams = insertParams,
+          query = query,
+          overwrite = true,
+          withSchemaEvolution = ctx.EVOLUTION() != null,
+          writePrivileges = Set(TableWritePrivilege.INSERT, TableWritePrivilege.DELETE))
       case dir: InsertOverwriteDirContext =>
         val (isLocal, storage, provider) = visitInsertOverwriteDir(dir)
         InsertIntoDir(isLocal, storage, provider, query, overwrite = true)
@@ -997,6 +1061,149 @@ class AstBuilder extends DataTypeAstBuilder
   }
 
   /**
+   * Add an INSERT INTO REPLACE USING operation to the logical plan.
+   */
+  override def visitInsertIntoReplaceUsing(
+      ctx: InsertIntoReplaceUsingContext): InsertTableParams = withOrigin(ctx) {
+    if (!SQLConf.get.getConf(SQLConf.INSERT_INTO_REPLACE_USING_ENABLED)) {
+      throw QueryParsingErrors.insertReplaceUsingNotEnabled(ctx)
+    }
+    val byName = ctx.NAME() != null
+    if (byName && !SQLConf.get.getConf(SQLConf.INSERT_INTO_REPLACE_USING_BY_NAME_ENABLED)) {
+      throw QueryParsingErrors.insertReplaceUsingByNameNotEnabled(ctx)
+    }
+    val replaceUsingCols = visitIdentifierList(ctx.identifierList())
+
+    createInsertIntoReplaceParams(
+      relationCtx = ctx.identifierReference(),
+      optionsCtx = ctx.optionsClause(),
+      userSpecifiedCols = Seq.empty,
+      byName = byName,
+      replaceCriteriaOpt = Some(InsertReplaceUsing(replaceUsingCols))
+    )
+  }
+
+  /**
+   * Add an INSERT INTO REPLACE ON operation to the logical plan.
+   */
+  def visitInsertIntoReplaceOn(
+      ctx: InsertIntoReplaceBooleanCondContext): InsertTableParams = withOrigin(ctx) {
+    if (!SQLConf.get.getConf(SQLConf.INSERT_INTO_REPLACE_ON_ENABLED)) {
+      throw QueryParsingErrors.insertReplaceOnNotEnabled(ctx)
+    }
+    val byName = ctx.NAME() != null
+    if (byName && !SQLConf.get.getConf(SQLConf.INSERT_INTO_REPLACE_ON_BY_NAME_ENABLED)) {
+      throw QueryParsingErrors.insertReplaceOnByNameNotEnabled(ctx)
+    }
+    // Only REPLACE WHERE supports a column list, but the grammar rule is shared with REPLACE ON,
+    // so reject the column list here.
+    if (ctx.identifierList() != null) {
+      throw QueryParsingErrors.insertReplaceOnColumnListNotAllowed(ctx.identifierList())
+    }
+    val replaceOnCond = expression(ctx.replaceCondition)
+    val tableAliasOpt =
+      getTableAliasWithoutColumnAlias(ctx.tableAlias(), "INSERT REPLACE ON")
+
+    createInsertIntoReplaceParams(
+      relationCtx = ctx.identifierReference(),
+      optionsCtx = ctx.optionsClause(),
+      userSpecifiedCols = Seq.empty,
+      byName = byName,
+      replaceCriteriaOpt = Some(InsertReplaceOn(replaceOnCond, tableAliasOpt))
+    )
+  }
+
+  /**
+   * Add an INSERT INTO REPLACE WHERE operation to the logical plan.
+   */
+  def visitInsertIntoReplaceWhere(
+      ctx: InsertIntoReplaceBooleanCondContext): InsertTableParams = withOrigin(ctx) {
+    // The grammar rule shared with REPLACE ON accepts a table alias, but REPLACE WHERE has no
+    // use for it. Reject it explicitly for a clear parse error.
+    if (ctx.tableAlias() != null && ctx.tableAlias().strictIdentifier() != null) {
+      throw QueryParsingErrors.insertReplaceWhereTableAliasNotAllowed(ctx.tableAlias())
+    }
+    // BY NAME and a column list are mutually exclusive in the grammar.
+    val userSpecifiedCols = Option(ctx.identifierList()).map(visitIdentifierList).getOrElse(Nil)
+    if (userSpecifiedCols.nonEmpty &&
+        !SQLConf.get.getConf(SQLConf.INSERT_INTO_REPLACE_WHERE_COLUMN_LIST_ENABLED)) {
+      throw QueryParsingErrors.insertReplaceWhereColumnListNotEnabled(ctx.identifierList())
+    }
+
+    val deleteExpr = expression(ctx.replaceCondition)
+
+    createInsertIntoReplaceParams(
+      relationCtx = ctx.identifierReference(),
+      optionsCtx = ctx.optionsClause(),
+      userSpecifiedCols = userSpecifiedCols,
+      byName = ctx.NAME() != null,
+      replaceCriteriaOpt = Some(InsertReplaceWhere(deleteExpr))
+    )
+  }
+
+  private def createInsertIntoReplaceParams(
+      relationCtx: IdentifierReferenceContext,
+      optionsCtx: OptionsClauseContext,
+      userSpecifiedCols: Seq[String],
+      byName: Boolean,
+      replaceCriteriaOpt: Option[InsertReplaceCriteria]): InsertTableParams = {
+    InsertTableParams(
+      relationCtx = relationCtx,
+      options = Option(optionsCtx),
+      userSpecifiedCols = userSpecifiedCols,
+      partitionSpec = Map[String, Option[String]](),
+      ifPartitionNotExists = false,
+      byName = byName,
+      replaceCriteriaOpt = replaceCriteriaOpt)
+  }
+
+  /**
+   * Creates an INSERT plan from [[InsertTableParams]]. A dynamic target is exposed only by the
+   * temporary `UnresolvedInsert` plan. Once its identifier expression has been evaluated, analysis
+   * continues with `InsertIntoStatement`, which a static target produces directly.
+   */
+  private def createInsertIntoStatement(
+      insertParams: InsertTableParams,
+      query: LogicalPlan,
+      overwrite: Boolean,
+      withSchemaEvolution: Boolean,
+      writePrivileges: Set[TableWritePrivilege]): LogicalPlan = {
+    val tableSlot = buildWriteTableSlot(
+      insertParams.relationCtx, insertParams.options, writePrivileges)
+    val unresolvedInsert = UnresolvedInsert(
+      table = tableSlot,
+      partitionSpec = insertParams.partitionSpec,
+      userSpecifiedCols = insertParams.userSpecifiedCols,
+      query = query,
+      overwrite = overwrite,
+      ifPartitionNotExists = insertParams.ifPartitionNotExists,
+      byName = insertParams.byName,
+      replaceCriteriaOpt = insertParams.replaceCriteriaOpt,
+      withSchemaEvolution = withSchemaEvolution)
+
+    tableSlot match {
+      case target: UnresolvedInsertTarget =>
+        unresolvedInsert.toInsertIntoStatement(target.toUnresolvedRelation)
+      case _ => unresolvedInsert
+    }
+  }
+
+  /**
+   * Build the target of an INSERT. A dynamic IDENTIFIER remains inside `UnresolvedInsert` so its
+   * expression receives normal analyzer traversal. The builder produces `UnresolvedInsertTarget`
+   * rather than `UnresolvedRelation` so CTE substitution cannot interpret the target as a source.
+   */
+  private def buildWriteTableSlot(
+      ctx: IdentifierReferenceContext,
+      optionsClause: Option[OptionsClauseContext],
+      writePrivileges: Set[TableWritePrivilege]): LogicalPlan = {
+    val options = withOrigin(ctx) { resolveOptions(optionsClause) }
+    withIdentClause(ctx, parts => withOrigin(ctx) {
+      UnresolvedInsertTarget(parts, options, writePrivileges)
+    })
+  }
+
+  /**
    * Write to a directory, returning a [[InsertIntoDir]] logical plan.
    */
   override def visitInsertOverwriteDir(
@@ -1028,7 +1235,8 @@ class AstBuilder extends DataTypeAstBuilder
   override def visitDeleteFromTable(
       ctx: DeleteFromTableContext): LogicalPlan = withOrigin(ctx) {
     val table = createUnresolvedRelation(
-      ctx.identifierReference, writePrivileges = Seq(TableWritePrivilege.DELETE))
+      ctx.identifierReference, Option(ctx.optionsClause()),
+      writePrivileges = Set(TableWritePrivilege.DELETE))
     val tableAlias = getTableAliasWithoutColumnAlias(ctx.tableAlias(), "DELETE")
     val aliasedTable = tableAlias.map(SubqueryAlias(_, table)).getOrElse(table)
     val predicate = if (ctx.whereClause() != null) {
@@ -1041,7 +1249,8 @@ class AstBuilder extends DataTypeAstBuilder
 
   override def visitUpdateTable(ctx: UpdateTableContext): LogicalPlan = withOrigin(ctx) {
     val table = createUnresolvedRelation(
-      ctx.identifierReference, writePrivileges = Seq(TableWritePrivilege.UPDATE))
+      ctx.identifierReference, Option(ctx.optionsClause()),
+      writePrivileges = Set(TableWritePrivilege.UPDATE))
     val tableAlias = getTableAliasWithoutColumnAlias(ctx.tableAlias(), "UPDATE")
     val aliasedTable = tableAlias.map(SubqueryAlias(_, table)).getOrElse(table)
     val assignments = withAssignments(ctx.setClause().assignmentList())
@@ -1065,8 +1274,9 @@ class AstBuilder extends DataTypeAstBuilder
   override def visitMergeIntoTable(ctx: MergeIntoTableContext): LogicalPlan = withOrigin(ctx) {
     val withSchemaEvolution = ctx.EVOLUTION() != null
 
+    // The target and source may each carry their own dynamic table options via `WITH (...)`.
     val sourceTableOrQuery = if (ctx.source != null) {
-      createUnresolvedRelation(ctx.source)
+      createUnresolvedRelation(ctx.source, Option(ctx.sourceOptions))
     } else if (ctx.sourceQuery != null) {
       visitQuery(ctx.sourceQuery)
     } else {
@@ -1106,7 +1316,8 @@ class AstBuilder extends DataTypeAstBuilder
                 .asScala.map(attr => UnresolvedAttribute(visitMultipartIdentifier(attr)))
             val values = clause.notMatchedAction().expression().asScala.map(expression)
             if (columns.size != values.size) {
-              throw QueryParsingErrors.insertedValueNumberNotMatchFieldNumberError(clause)
+              throw QueryParsingErrors.insertedValueNumberNotMatchColumnNumberError(
+                columns.size, values.size, clause)
             }
             InsertAction(condition, columns.zip(values).map(kv => Assignment(kv._1, kv._2)).toSeq)
           }
@@ -1151,6 +1362,7 @@ class AstBuilder extends DataTypeAstBuilder
 
     val targetTable = createUnresolvedRelation(
       ctx.target,
+      Option(ctx.targetOptions),
       writePrivileges = MergeIntoTable.getWritePrivileges(
         matchedActions, notMatchedActions, notMatchedBySourceActions))
     val targetTableAlias = getTableAliasWithoutColumnAlias(ctx.targetAlias, "MERGE")
@@ -1164,6 +1376,127 @@ class AstBuilder extends DataTypeAstBuilder
       notMatchedBySourceActions,
       withSchemaEvolution)
   }
+
+  protected def buildAutoCdcInto(ctx: AutoCdcCommandContext): AutoCdcInto =
+    withOrigin(ctx) {
+      val target = UnresolvedIdentifier(visitMultipartIdentifier(ctx.target))
+      val params = parseAutoCdcParams(ctx.autoCdcParameters())
+      AutoCdcInto(
+        targetTable = target,
+        source = params.source,
+        keys = params.keys,
+        deleteCondition = params.deleteCondition,
+        sequenceByExpr = params.sequencing,
+        includeColumns = params.includeColumns,
+        excludeColumns = params.excludeColumns,
+        storedAsScdType = params.storedAsScdType,
+        trackHistoryColumns = params.trackHistoryColumns,
+        trackHistoryExceptColumns = params.trackHistoryExceptColumns,
+        ignoreNullUpdates = params.ignoreNullUpdates,
+        ignoreNullUpdatesColumns = params.ignoreNullUpdatesColumns,
+        ignoreNullUpdatesExceptColumns = params.ignoreNullUpdatesExceptColumns)
+    }
+
+  protected def parseAutoCdcParams(params: AutoCdcParametersContext): AutoCdcParams =
+    withOrigin(params) {
+      // The source is parsed as a general `relationPrimary` to allow richer streaming queries
+      // (e.g. streaming TVFs, or a STREAM(...) source with options and watermark). It must still
+      // read from a streaming source; a batch relation is not a valid AUTO CDC source.
+      val source = plan(params.source)
+      if (!source.isStreaming) {
+        withOrigin(params.source) {
+          operationNotAllowed(
+            "AUTO CDC source must be a streaming query, e.g. STREAM(<table>).", params.source)
+        }
+      }
+      val keys = visitIdentifierSeq(params.keys).map(UnresolvedAttribute.quoted)
+
+      // The optional clauses may appear in any order after `KEYS (...)`, so the grammar accepts
+      // each any number of times; reject an accidental repeat here rather than silently taking
+      // the last occurrence.
+      checkDuplicateClauses(params.autoCdcDeleteClause(), "APPLY AS DELETE WHEN", params)
+      checkDuplicateClauses(params.autoCdcSequenceByClause(), "SEQUENCE BY", params)
+      checkDuplicateClauses(params.autoCdcColumnsClause(), "COLUMNS", params)
+      checkDuplicateClauses(params.autoCdcStoredAsClause(), "STORED AS SCD TYPE", params)
+      checkDuplicateClauses(params.autoCdcTrackHistoryClause(), "TRACK HISTORY ON", params)
+      checkDuplicateClauses(params.autoCdcIgnoreNullClause(), "IGNORE NULL UPDATES", params)
+
+      val deleteCondition = params.autoCdcDeleteClause().asScala.headOption
+        .map(c => expression(c.deleteCondition))
+
+      // SEQUENCE BY is mandatory, but the grammar accepts the clauses as an unordered set, so
+      // require it explicitly here.
+      val sequenceByClause = params.autoCdcSequenceByClause().asScala.headOption.getOrElse {
+        throw QueryParsingErrors.missingClausesForOperation(params, "SEQUENCE BY", "AUTO CDC")
+      }
+      val sequencing = expression(sequenceByClause.sequence)
+
+      val columnsClause = params.autoCdcColumnsClause().asScala.headOption
+      val includeColumns = columnsClause.collect {
+        case c if c.columns != null =>
+          visitIdentifierSeq(c.columns).map(UnresolvedAttribute.quoted)
+      }
+      val excludeColumns = columnsClause.collect {
+        case c if c.exceptCols != null =>
+          visitIdentifierSeq(c.exceptCols).map(UnresolvedAttribute.quoted)
+      }
+
+      // STORED AS SCD TYPE <n>. Absent clause defaults to SCD Type 1. Only 1 and 2 are
+      // supported; reject anything else (including oversized numeric literals) with a clear
+      // error rather than a generic parse failure or NumberFormatException. Match on the token
+      // text rather than parsing to Int so an overflowing literal cannot throw.
+      val storedAsScdType = params.autoCdcStoredAsClause().asScala.headOption match {
+        case Some(c) =>
+          c.scdType.getText match {
+            case "1" => 1
+            case "2" => 2
+            case other =>
+              operationNotAllowed(
+                s"Unsupported SCD type: $other. AUTO CDC only supports STORED AS SCD TYPE 1 " +
+                  "or SCD TYPE 2.", c)
+          }
+        case None => 1
+      }
+
+      val trackHistoryClause = params.autoCdcTrackHistoryClause().asScala.headOption
+      val trackHistoryColumns = trackHistoryClause.collect {
+        case c if c.trackCols != null =>
+          visitIdentifierSeq(c.trackCols).map(UnresolvedAttribute.quoted)
+      }
+      val trackHistoryExceptColumns = trackHistoryClause.collect {
+        case c if c.nonTrackCols != null =>
+          visitIdentifierSeq(c.nonTrackCols).map(UnresolvedAttribute.quoted)
+      }
+
+      // IGNORE NULL UPDATES [ON (cols) | ON * EXCEPT (cols)]. The bare clause ignores nulls on all
+      // columns; the two subset forms are mutually exclusive by construction. `ignoreNullUpdates`
+      // records whether the clause is present at all, which distinguishes "ignore nulls on all
+      // columns" (present, no subset) from "off" (absent) when both column lists are empty.
+      val ignoreNullClause = params.autoCdcIgnoreNullClause().asScala.headOption
+      val ignoreNullUpdates = ignoreNullClause.isDefined
+      val ignoreNullUpdatesColumns = ignoreNullClause.collect {
+        case c if c.ignoreNullCols != null =>
+          visitIdentifierSeq(c.ignoreNullCols).map(UnresolvedAttribute.quoted)
+      }
+      val ignoreNullUpdatesExceptColumns = ignoreNullClause.collect {
+        case c if c.ignoreNullExceptCols != null =>
+          visitIdentifierSeq(c.ignoreNullExceptCols).map(UnresolvedAttribute.quoted)
+      }
+
+      AutoCdcParams(
+        source = source,
+        keys = keys,
+        deleteCondition = deleteCondition,
+        sequencing = sequencing,
+        includeColumns = includeColumns,
+        excludeColumns = excludeColumns,
+        storedAsScdType = storedAsScdType,
+        trackHistoryColumns = trackHistoryColumns,
+        trackHistoryExceptColumns = trackHistoryExceptColumns,
+        ignoreNullUpdates = ignoreNullUpdates,
+        ignoreNullUpdatesColumns = ignoreNullUpdatesColumns,
+        ignoreNullUpdatesExceptColumns = ignoreNullUpdatesExceptColumns)
+    }
 
   /**
    * Returns the parameters for [[UnresolvedExecuteImmediate]] logical plan.
@@ -1235,7 +1568,7 @@ class AstBuilder extends DataTypeAstBuilder
       if (pVal.DEFAULT != null) {
         throw QueryParsingErrors.defaultColumnReferencesNotAllowedInPartitionSpec(ctx)
       }
-      val name = pVal.identifier.getText
+      val name = getIdentifierText(pVal.identifier)
       val value = Option(pVal.constant).map(v => {
         visitStringConstant(v, legacyNullAsString, keepPartitionSpecAsString)
       })
@@ -1416,6 +1749,7 @@ class AstBuilder extends DataTypeAstBuilder
       ctx.aggregationClause,
       ctx.havingClause,
       ctx.windowClause,
+      ctx.qualifyClause,
       from,
       isPipeOperatorSelect = false
     )
@@ -1458,6 +1792,18 @@ class AstBuilder extends DataTypeAstBuilder
   }
 
   /**
+   * Create a logical plan using a qualify clause.
+   */
+  private def withQualifyClause(
+      ctx: QualifyClauseContext, plan: LogicalPlan): LogicalPlan = {
+    val predicate = expression(ctx.booleanExpression) match {
+      case p: Predicate => p
+      case e => Cast(e, BooleanType)
+    }
+    UnresolvedQualify(predicate, plan)
+  }
+
+  /**
    * Create a logical plan using a where clause.
    */
   private def withWhereClause(ctx: WhereClauseContext, plan: LogicalPlan): LogicalPlan = {
@@ -1479,21 +1825,23 @@ class AstBuilder extends DataTypeAstBuilder
     if (transformClause.setQuantifier != null) {
       throw QueryParsingErrors.transformNotSupportQuantifierError(transformClause.setQuantifier)
     }
-    // Create the attributes.
-    val (attributes, schemaLess) = if (transformClause.colTypeList != null) {
+    // Create the attributes. Script I/O is always unbounded STRING (Hive wire format).
+    // Declared CHAR/VARCHAR types are assigned in a Project below when first-class types
+    // are enabled, using the original schema so quoted field names are not re-parsed.
+    val (attributes, schema, schemaLess) = if (transformClause.colTypeList != null) {
       // Typed return columns.
-      val schema = createSchema(transformClause.colTypeList)
-      val replacedSchema = CharVarcharUtils.replaceCharVarcharWithStringInSchema(schema)
-      (DataTypeUtils.toAttributes(replacedSchema), false)
+      val origSchema = createSchema(transformClause.colTypeList)
+      val replacedSchema = CharVarcharUtils.replaceCharVarcharWithStringInSchemaAlways(origSchema)
+      (DataTypeUtils.toAttributes(replacedSchema), origSchema, false)
     } else if (transformClause.identifierSeq != null) {
       // Untyped return columns.
       val attrs = visitIdentifierSeq(transformClause.identifierSeq).map { name =>
         AttributeReference(name, StringType, nullable = true)()
       }
-      (attrs, false)
+      (attrs, StructType(Nil), false)
     } else {
       (Seq(AttributeReference("key", StringType)(),
-        AttributeReference("value", StringType)()), true)
+        AttributeReference("value", StringType)()), StructType(Nil), true)
     }
 
     val plan = visitCommonSelectQueryClausePlan(
@@ -1504,10 +1852,11 @@ class AstBuilder extends DataTypeAstBuilder
       aggregationClause,
       havingClause,
       windowClause,
+      qualifyClause = null,
       isDistinct = false,
       isPipeOperatorSelect = false)
 
-    ScriptTransformation(
+    val scriptTransform = ScriptTransformation(
       string(visitStringLit(transformClause.script)),
       attributes,
       plan,
@@ -1520,6 +1869,29 @@ class AstBuilder extends DataTypeAstBuilder
         schemaLess
       )
     )
+    // First-class CHAR/VARCHAR (standard semantics or preserveCharVarcharTypeInfo):
+    // assign declared types in a Project so the result matches AS (...). Flag off keeps
+    // the historical STRING result with no pad and no EXCEED_LIMIT_LENGTH. The check can
+    // be pruned like scan-side assignment when the column is unreferenced.
+    if (conf.charVarcharFirstClassTypes &&
+        schema.exists(f => CharVarcharUtils.hasCharVarchar(f.dataType))) {
+      Project(
+        attributes.zip(schema).map { case (a, field) =>
+          if (CharVarcharUtils.hasCharVarchar(field.dataType)) {
+            // Keep the raw CHAR/VARCHAR metadata, matching scan-side
+            // readSidePadding. First-class CHAR vs STRING still promotes to
+            // STRING equality, so this metadata does not pad the literal.
+            Alias(
+              CharVarcharUtils.stringLengthCheck(a, field.dataType),
+              a.name)(explicitMetadata = Some(a.metadata))
+          } else {
+            a
+          }
+        },
+        scriptTransform)
+    } else {
+      scriptTransform
+    }
   }
 
   /**
@@ -1539,6 +1911,7 @@ class AstBuilder extends DataTypeAstBuilder
       aggregationClause: AggregationClauseContext,
       havingClause: HavingClauseContext,
       windowClause: WindowClauseContext,
+      qualifyClause: QualifyClauseContext,
       relation: LogicalPlan,
       isPipeOperatorSelect: Boolean): LogicalPlan = withOrigin(ctx) {
     val isDistinct = selectClause.setQuantifier() != null &&
@@ -1552,6 +1925,7 @@ class AstBuilder extends DataTypeAstBuilder
       aggregationClause,
       havingClause,
       windowClause,
+      qualifyClause,
       isDistinct,
       isPipeOperatorSelect)
 
@@ -1567,6 +1941,7 @@ class AstBuilder extends DataTypeAstBuilder
       aggregationClause: AggregationClauseContext,
       havingClause: HavingClauseContext,
       windowClause: WindowClauseContext,
+      qualifyClause: QualifyClauseContext,
       isDistinct: Boolean,
       isPipeOperatorSelect: Boolean): LogicalPlan = {
     // Add lateral views.
@@ -1627,11 +2002,18 @@ class AstBuilder extends DataTypeAstBuilder
       createProject()
     }
 
-    // Distinct
-    val withDistinct = if (isDistinct) {
-      Distinct(withProject)
+    // Qualify
+    val withQualify = if (qualifyClause != null) {
+      withQualifyClause(qualifyClause, withProject)
     } else {
       withProject
+    }
+
+    // Distinct
+    val withDistinct = if (isDistinct) {
+      Distinct(withQualify)
+    } else {
+      withQualify
     }
 
     // Window
@@ -1662,10 +2044,9 @@ class AstBuilder extends DataTypeAstBuilder
       entry("TOK_TABLEROWFORMATNULL", ctx.nullDefinedAs) ++
       Option(ctx.linesSeparatedBy).toSeq.map { stringLitCtx =>
         val value = string(visitStringLit(stringLitCtx))
-        validate(
-          value == "\n",
-          s"LINES TERMINATED BY only supports newline '\\n' right now: $value",
-          ctx)
+        if (value != "\n") {
+          throw QueryParsingErrors.unsupportedRowFormatLinesTerminatedByError(value, ctx)
+        }
         "TOK_TABLEROWFORMATLINES" -> value
       }
 
@@ -1725,6 +2106,8 @@ class AstBuilder extends DataTypeAstBuilder
           relationPrimary match {
             case _: AliasedQueryContext =>
             case _: TableValuedFunctionContext =>
+            case _: UnnestTableContext =>
+            case _: JsonTableRelationContext =>
             case other =>
               throw QueryParsingErrors.invalidLateralJoinRelationError(other)
           }
@@ -1790,7 +2173,8 @@ class AstBuilder extends DataTypeAstBuilder
   }
 
   /**
-   * Add a [[WithWindowDefinition]] operator to a logical plan.
+   * Add a [[WithWindowDefinition]] operator to a logical plan, or for pipe SQL, substitute
+   * [[UnresolvedWindowExpression]]s with [[WindowExpression]]s directly.
    */
   private def withWindowClause(
       ctx: WindowClauseContext,
@@ -1828,7 +2212,20 @@ class AstBuilder extends DataTypeAstBuilder
 
     // Note that mapValues creates a view instead of materialized map. We force materialization by
     // mapping over identity.
-    WithWindowDefinition(windowMapView.map(identity), query, forPipeSQL)
+    val windowDefinitions = windowMapView.map(identity)
+    if (forPipeSQL) {
+      // For pipe SQL, substitute window references directly. Each pipe operator's WINDOW clause
+      // is scoped to that operator only, and the definitions and expressions are in the same
+      // grammar rule, so we can resolve them here without a WithWindowDefinition wrapper.
+      query.transformExpressions {
+        case UnresolvedWindowExpression(child, WindowSpecReference(windowName)) =>
+          val spec = windowDefinitions.getOrElse(windowName,
+            throw QueryCompilationErrors.windowSpecificationNotDefinedError(windowName))
+          WindowExpression(child, spec)
+      }
+    } else {
+      WithWindowDefinition(windowDefinitions, query)
+    }
   }
 
   /**
@@ -1958,14 +2355,21 @@ class AstBuilder extends DataTypeAstBuilder
       .flatMap(_.namedExpression.asScala)
       .map(typedVisit[Expression])
     val pivotColumn = if (ctx.pivotColumn.identifiers.size == 1) {
-      UnresolvedAttribute.quoted(ctx.pivotColumn.errorCapturingIdentifier.getText)
+      UnresolvedAttribute.quoted(getIdentifierText(ctx.pivotColumn.errorCapturingIdentifier))
     } else {
       CreateStruct(
         ctx.pivotColumn.identifiers.asScala.map(
-          identifier => UnresolvedAttribute.quoted(identifier.getText)).toSeq)
+          identifier => UnresolvedAttribute.quoted(getIdentifierText(identifier))).toSeq)
     }
     val pivotValues = ctx.pivotValues.asScala.map(visitPivotValue)
-    Pivot(None, pivotColumn, pivotValues.toSeq, aggregates, query)
+    val pivot = Pivot(None, pivotColumn, pivotValues.toSeq, aggregates, query)
+
+    if (ctx.errorCapturingIdentifier() != null) {
+      val alias = getIdentifierText(ctx.errorCapturingIdentifier())
+      SubqueryAlias(alias, pivot)
+    } else {
+      pivot
+    }
   }
 
   /**
@@ -1974,7 +2378,7 @@ class AstBuilder extends DataTypeAstBuilder
   override def visitPivotValue(ctx: PivotValueContext): Expression = withOrigin(ctx) {
     val e = expression(ctx.expression)
     if (ctx.errorCapturingIdentifier != null) {
-      Alias(e, ctx.errorCapturingIdentifier.getText)()
+      Alias(e, getIdentifierText(ctx.errorCapturingIdentifier))()
     } else {
       e
     }
@@ -2032,14 +2436,22 @@ class AstBuilder extends DataTypeAstBuilder
 
     // exclude null values by default
     val filtered = if (ctx.nullOperator == null || ctx.nullOperator.EXCLUDE() != null) {
-      Filter(IsNotNull(Coalesce(valueColumnNames.map(UnresolvedAttribute(_)))), unpivot)
+      val valueColumns = valueColumnNames.map(UnresolvedAttribute(_))
+      val condition = if (valueColumns.length == 1) {
+        // Keep the single-value plan stable; unary Coalesce does not require type coercion.
+        IsNotNull(Coalesce(valueColumns))
+      } else {
+        // Multi-value columns can have unrelated types, so test each for null independently.
+        valueColumns.map(IsNotNull).reduceLeft(Or)
+      }
+      Filter(condition, unpivot)
     } else {
       unpivot
     }
 
     // alias unpivot result
     if (ctx.errorCapturingIdentifier() != null) {
-      val alias = ctx.errorCapturingIdentifier().getText
+      val alias = getIdentifierText(ctx.errorCapturingIdentifier())
       SubqueryAlias(alias, filtered)
     } else {
       filtered
@@ -2075,6 +2487,99 @@ class AstBuilder extends DataTypeAstBuilder
         Option(ctx.unpivotAlias()).map(a => getIdentifierText(a.errorCapturingIdentifier()))
       (exprs, alias)
     }
+
+  /**
+   * Add an [[UnresolvedBinBy]] to a logical plan; the analyzer rewrites it to [[BinBy]] during
+   * analysis.
+   */
+  private def withBinBy(
+      ctx: BinByClauseContext,
+      query: LogicalPlan): LogicalPlan = withOrigin(ctx) {
+    val binWidth = expression(ctx.binWidth)
+    val originExpr = Option(ctx.origin).map(expression)
+    val rangeStart = UnresolvedAttribute(visitMultipartIdentifier(ctx.rangeStart))
+    val rangeEnd = UnresolvedAttribute(visitMultipartIdentifier(ctx.rangeEnd))
+    val distributeColumns = ctx.distributeCol.asScala
+      .map(c => UnresolvedAttribute(visitMultipartIdentifier(c))).toSeq
+    val outputAliases = BinByOutputAliases(
+      binStart = Option(ctx.binStartAlias).map(getIdentifierText),
+      binEnd = Option(ctx.binEndAlias).map(getIdentifierText),
+      binRatio = Option(ctx.binRatioAlias).map(getIdentifierText))
+
+    val binBy = UnresolvedBinBy(
+      binWidthExpr = binWidth,
+      rangeStartCol = rangeStart,
+      rangeEndCol = rangeEnd,
+      originExpr = originExpr,
+      distributeColumns = distributeColumns,
+      outputAliases = outputAliases,
+      child = query)
+
+    if (ctx.tblAlias != null) {
+      SubqueryAlias(getIdentifierText(ctx.tblAlias), binBy)
+    } else {
+      binBy
+    }
+  }
+
+  /**
+   * Add an [[UnresolvedGapFill]] to a logical plan. The feature gate is checked later, by the
+   * analyzer rule `ResolveGapFill`.
+   */
+  private def withGapFill(
+      ctx: GapFillClauseContext,
+      query: LogicalPlan): LogicalPlan = withOrigin(ctx) {
+    checkDuplicateClauses(ctx.ALIGN, "ALIGN TO", ctx)
+    checkDuplicateClauses(ctx.RANGE, "RANGE BETWEEN", ctx)
+    checkDuplicateClauses(ctx.gapFillFillClause, "FILL", ctx)
+    checkDuplicateClauses(ctx.MAX, "MAX GAP", ctx)
+    checkDuplicateClauses(ctx.BIN_START, "BIN_START", ctx)
+    checkDuplicateClauses(ctx.IS_GENERATED, "IS_GENERATED", ctx)
+
+    val gapFill = UnresolvedGapFill(
+      partitionColumns = ctx.partitionCol.asScala.map(gapFillColumnRef).toSeq,
+      timeColumn = gapFillColumnRef(ctx.timeCol),
+      binWidthExpr = expression(ctx.binWidth),
+      originExpr = Option(ctx.origin).map(expression),
+      rangeStartExpr = Option(ctx.rangeStart).map(expression),
+      rangeEndExpr = Option(ctx.rangeEnd).map(expression),
+      fillColumns = ctx.gapFillFillClause.asScala.flatMap(_.fillColumns.asScala).map { c =>
+        GapFillColumn(gapFillColumnRef(c.multipartIdentifier), toGapFillMethod(c.gapFillMethod))
+      }.toSeq,
+      maxGapExpr = Option(ctx.maxGap).map(expression),
+      binStart = ctx.BIN_START.asScala.headOption.map { _ =>
+        GapFillOutputColumn(Option(ctx.binStartAlias).map(getIdentifierText))
+      },
+      isGenerated = ctx.IS_GENERATED.asScala.headOption.map { _ =>
+        GapFillOutputColumn(Option(ctx.isGeneratedAlias).map(getIdentifierText))
+      },
+      child = query)
+
+    if (ctx.tblAlias != null) {
+      SubqueryAlias(getIdentifierText(ctx.tblAlias), gapFill)
+    } else {
+      gapFill
+    }
+  }
+
+  /** A GAP FILL column name with its own origin, so that an error about it points at it. */
+  private def gapFillColumnRef(ctx: MultipartIdentifierContext): Expression = withOrigin(ctx) {
+    UnresolvedAttribute(visitMultipartIdentifier(ctx))
+  }
+
+  private def toGapFillMethod(ctx: GapFillMethodContext): GapFillMethod = withOrigin(ctx) {
+    if (ctx.LINEAR != null) {
+      GapFillMethod.Linear
+    } else if (ctx.FFILL != null || ctx.FORWARD != null) {
+      GapFillMethod.ForwardFill
+    } else if (ctx.BFILL != null || ctx.BACKWARD != null) {
+      GapFillMethod.BackwardFill
+    } else if (ctx.fillValue != null) {
+      GapFillMethod.Constant(expression(ctx.fillValue))
+    } else {
+      GapFillMethod.Null
+    }
+  }
 
   /**
    * Add a [[Generate]] (Lateral View) to a logical plan.
@@ -2139,9 +2644,13 @@ class AstBuilder extends DataTypeAstBuilder
         withJoinRelation(extension.joinRelation(), left)
       } else if (extension.pivotClause() != null) {
         withPivot(extension.pivotClause(), left)
-      } else {
-        assert(extension.unpivotClause() != null)
+      } else if (extension.unpivotClause() != null) {
         withUnpivot(extension.unpivotClause(), left)
+      } else if (extension.gapFillClause() != null) {
+        withGapFill(extension.gapFillClause(), left)
+      } else {
+        assert(extension.binByClause() != null)
+        withBinBy(extension.binByClause(), left)
       }
     }
   }
@@ -2166,46 +2675,204 @@ class AstBuilder extends DataTypeAstBuilder
         ctx.right match {
           case _: AliasedQueryContext =>
           case _: TableValuedFunctionContext =>
+          case _: UnnestTableContext =>
+          case _: JsonTableRelationContext =>
           case other =>
             throw QueryParsingErrors.invalidLateralJoinRelationError(other)
         }
       }
 
-      // Resolve the join type and join condition
-      val (joinType, condition) = Option(ctx.joinCriteria) match {
-        case Some(c) if c.USING != null =>
-          if (ctx.LATERAL != null) {
-            throw QueryParsingErrors.lateralJoinWithUsingJoinUnsupportedError(ctx)
-          }
-          (UsingJoin(baseJoinType, visitIdentifierList(c.identifierList)), None)
-        case Some(c) if c.booleanExpression != null =>
-          (baseJoinType, Option(expression(c.booleanExpression)))
-        case Some(c) =>
-          throw SparkException.internalError(s"Unimplemented joinCriteria: $c")
-        case None if ctx.NATURAL != null =>
-          if (ctx.LATERAL != null) {
-            throw QueryParsingErrors.incompatibleJoinTypesError(
-              joinType1 = ctx.LATERAL.toString, joinType2 = ctx.NATURAL.toString, ctx = ctx
-            )
-          }
-          if (baseJoinType == Cross) {
-            throw QueryParsingErrors.incompatibleJoinTypesError(
-              joinType1 = ctx.NATURAL.toString, joinType2 = baseJoinType.toString, ctx = ctx
-            )
-          }
-          (NaturalJoin(baseJoinType), None)
-        case None =>
-          (baseJoinType, None)
-      }
-      if (ctx.LATERAL != null) {
-        if (!Seq(Inner, Cross, LeftOuter).contains(joinType)) {
-          throw QueryParsingErrors.unsupportedLateralJoinTypeError(ctx, joinType.sql)
-        }
-        LateralJoin(base, LateralSubquery(plan(ctx.right)), joinType, condition)
+      val joinPostfix = Option(ctx.joinPostfix)
+      val joinCriteriaCtx = joinPostfix.flatMap(p => Option(p.joinCriteria))
+      val nearestByClauseCtx = joinPostfix.flatMap(p => Option(p.nearestByClause))
+
+      if (ctx.asofJoinCriteria != null) {
+        withAsOfJoin(ctx, base, ctx.asofJoinCriteria)
+      } else if (nearestByClauseCtx.isDefined) {
+        withNearestByJoin(ctx, base, baseJoinType, nearestByClauseCtx.get)
       } else {
-        Join(base, plan(ctx.right), joinType, condition, JoinHint.NONE)
+        // Resolve the join type and join condition
+        val (joinType, condition) = joinCriteriaCtx match {
+          case Some(c) if c.USING != null =>
+            if (ctx.LATERAL != null) {
+              throw QueryParsingErrors.lateralJoinWithUsingJoinUnsupportedError(ctx)
+            }
+            (UsingJoin(baseJoinType, visitIdentifierList(c.identifierList)), None)
+          case Some(c) if c.booleanExpression != null =>
+            (baseJoinType, Option(expression(c.booleanExpression)))
+          case Some(c) =>
+            throw SparkException.internalError(s"Unimplemented joinCriteria: $c")
+          case None if ctx.NATURAL != null =>
+            if (ctx.LATERAL != null) {
+              throw QueryParsingErrors.incompatibleJoinTypesError(
+                joinType1 = ctx.LATERAL.toString, joinType2 = ctx.NATURAL.toString, ctx = ctx
+              )
+            }
+            if (baseJoinType == Cross) {
+              throw QueryParsingErrors.incompatibleJoinTypesError(
+                joinType1 = ctx.NATURAL.toString, joinType2 = baseJoinType.toString, ctx = ctx
+              )
+            }
+            (NaturalJoin(baseJoinType), None)
+          case None =>
+            (baseJoinType, None)
+        }
+        if (ctx.LATERAL != null) {
+          if (!Seq(Inner, Cross, LeftOuter).contains(joinType)) {
+            throw QueryParsingErrors.unsupportedLateralJoinTypeError(ctx, joinType.sql)
+          }
+          LateralJoin(base, LateralSubquery(plan(ctx.right)), joinType, condition)
+        } else {
+          Join(base, plan(ctx.right), joinType, condition, JoinHint.NONE)
+        }
       }
     }
+  }
+
+  private def asOfMatchConditionFromExpression(
+      expr: Expression,
+      ctx: ParserRuleContext): (Expression, MatchComparisonOperator, Expression) = {
+    expr match {
+      case GreaterThanOrEqual(left, right) => (left, GreaterThanOrEqualOp, right)
+      case GreaterThan(left, right) => (left, GreaterThanOp, right)
+      case LessThanOrEqual(left, right) => (left, LessThanOrEqualOp, right)
+      case LessThan(left, right) => (left, LessThanOp, right)
+      case _ =>
+        throw QueryParsingErrors.sqlAsOfJoinMatchConditionInvalidOperator(
+          asOfMatchConditionInvalidOperatorText(expr, ctx), ctx)
+    }
+  }
+
+  /**
+   * Map a rejected MATCH_CONDITION expression back to the SQL operator the user wrote.
+   *
+   * Catalyst has no `NotEqualTo` class: both `<>` and `!=` parse to `Not(EqualTo(...))`, and
+   * both `<=>` and `IS NOT DISTINCT FROM` parse to `EqualNullSafe(...)`. Walk the match
+   * expression parse tree (not `prettyName`) to recover the token the user wrote.
+   */
+  private def asOfMatchConditionInvalidOperatorText(
+      expr: Expression,
+      ctx: ParserRuleContext): String = {
+    expr match {
+      case And(_, _) => "AND"
+      case Or(_, _) => "OR"
+      case _ =>
+        findFirstComparisonContext(ctx)
+          .map(comparisonOperatorText)
+          .orElse(findPredicatedContext(ctx).flatMap(distinctFromOperatorText))
+          .getOrElse(getOriginalText(ctx).trim)
+    }
+  }
+
+  private def findFirstComparisonContext(ctx: ParserRuleContext): Option[ComparisonContext] = {
+    ctx match {
+      case comparison: ComparisonContext => Some(comparison)
+      case _ =>
+        Option(ctx.children).iterator.flatMap(_.asScala).collectFirst {
+          case child: ParserRuleContext => findFirstComparisonContext(child)
+        }.flatten
+    }
+  }
+
+  private def findPredicatedContext(ctx: ParserRuleContext): Option[PredicatedContext] = {
+    ctx match {
+      case predicated: PredicatedContext => Some(predicated)
+      case _ =>
+        Option(ctx.children).iterator.flatMap(_.asScala).collectFirst {
+          case child: ParserRuleContext => findPredicatedContext(child)
+        }.flatten
+    }
+  }
+
+  private def comparisonOperatorText(ctx: ComparisonContext): String = {
+    val operator = ctx.comparisonOperator().getChild(0).asInstanceOf[TerminalNode]
+    operator.getSymbol.getType match {
+      case SqlBaseParser.EQ => "="
+      case SqlBaseParser.NSEQ => "<=>"
+      case SqlBaseParser.NEQ => "<>"
+      case SqlBaseParser.NEQJ => "!="
+      case SqlBaseParser.LT => "<"
+      case SqlBaseParser.LTE => "<="
+      case SqlBaseParser.GT => ">"
+      case SqlBaseParser.GTE => ">="
+      case _ => source(ctx.comparisonOperator())
+    }
+  }
+
+  private def distinctFromOperatorText(predicated: PredicatedContext): Option[String] = {
+    Option(predicated.predicate).flatMap { predicate =>
+      Option(predicate.kind).filter(_.getType == SqlBaseParser.DISTINCT).map { _ =>
+        if (predicate.errorCapturingNot != null) "IS NOT DISTINCT FROM" else "IS DISTINCT FROM"
+      }
+    }
+  }
+
+  /**
+   * Build an [[AsOfJoin]] from the parsed `ASOF JOIN ... MATCH_CONDITION` clause.
+   */
+  private def withAsOfJoin(
+      ctx: JoinRelationContext,
+      base: LogicalPlan,
+      criteria: AsofJoinCriteriaContext): AsOfJoin = {
+    if (!conf.sqlAsOfJoinEnabled) {
+      throw QueryParsingErrors.sqlAsOfJoinDisabled(SQLConf.SQL_ASOF_JOIN_ENABLED.key, ctx)
+    }
+    val joinType = Option(ctx.asofJoinType) match {
+      case None => Inner
+      case Some(jt) if jt.LEFT != null => LeftOuter
+      case _ => Inner
+    }
+    val (leftExpr, operator, rightExpr) =
+      asOfMatchConditionFromExpression(expression(criteria.matchExpr), criteria.matchExpr)
+    val (condition, usingColumns) =
+      (Option(criteria.onExpr), Option(criteria.identifierList)) match {
+      case (Some(expr), None) => (Some(expression(expr)), None)
+      case (None, Some(ids)) => (None, Some(visitIdentifierList(ids)))
+      case (None, None) => (None, None)
+      case _ =>
+        throw SparkException.internalError(s"Unimplemented asofJoinCriteria: $criteria")
+    }
+    AsOfJoin.fromMatchCondition(
+      base, plan(ctx.right), leftExpr, operator, rightExpr, condition, joinType, usingColumns)
+  }
+
+  /**
+   * Build a [[NearestByJoin]] from the parsed `NEAREST BY` clause attached to a join relation.
+   * Validates that the clause is not combined with `LATERAL` and that the base join type is one
+   * of the supported types (`INNER` or `LEFT OUTER`), parses `num_results` (with bounds checks),
+   * the direction (`DISTANCE` / `SIMILARITY`), and the ranking expression.
+   */
+  private def withNearestByJoin(
+      ctx: JoinRelationContext,
+      base: LogicalPlan,
+      baseJoinType: JoinType,
+      nearestByClause: NearestByClauseContext): NearestByJoin = {
+    if (ctx.LATERAL != null) {
+      throw QueryParsingErrors.nearestByJoinWithLateralUnsupportedError(ctx)
+    }
+    if (!Seq(Inner, LeftOuter).contains(baseJoinType)) {
+      throw QueryParsingErrors.unsupportedNearestByJoinTypeError(
+        ctx, baseJoinType.sql, NearestByJoinType.supportedDisplay)
+    }
+    val clause = nearestByClause
+    val approx = clause.APPROX != null
+    val numResults = Option(clause.num).map { n =>
+      // Guard against literals that overflow Long.
+      val value = try n.getText.toLong catch {
+        case _: NumberFormatException =>
+          throw QueryParsingErrors.nearestByJoinNumResultsOutOfRangeError(
+            ctx, n.getText, NearestByJoin.MaxNumResults)
+      }
+      if (value < 1 || value > NearestByJoin.MaxNumResults) {
+        throw QueryParsingErrors.nearestByJoinNumResultsOutOfRangeError(
+          ctx, value.toString, NearestByJoin.MaxNumResults)
+      }
+      value.toInt
+    }.getOrElse(1)
+    val direction = if (clause.DISTANCE != null) NearestByDistance else NearestBySimilarity
+    val rankingExpr = expression(clause.expression)
+    NearestByJoin(
+      base, plan(ctx.right), baseJoinType, approx, numResults, rankingExpr, direction)
   }
 
   /**
@@ -2215,34 +2882,42 @@ class AstBuilder extends DataTypeAstBuilder
    * - TABLESAMPLE(x ROWS): Sample the table down to the given number of rows.
    * - TABLESAMPLE(x PERCENT) [REPEATABLE (y)]: Sample the table down to the given percentage with
    * seed 'y'. Note that percentages are defined as a number between 0 and 100.
+   * - TABLESAMPLE SYSTEM(x PERCENT): Sample by data-source-dependent blocks or file splits.
    * - TABLESAMPLE(BUCKET x OUT OF y) [REPEATABLE (z)]: Sample the table down to a 'x' divided by
    * 'y' fraction with seed 'z'.
    */
   private def withSample(ctx: SampleContext, query: LogicalPlan): LogicalPlan = withOrigin(ctx) {
+    val isSystem = ctx.sampleType != null &&
+      ctx.sampleType.getType == SqlBaseParser.SYSTEM
+
     // Create a sampled plan if we need one.
-    def sample(fraction: Double, seed: Long): Sample = {
+    def sample(fraction: Double, seed: Option[Long]): Sample = {
       // The range of fraction accepted by Sample is [0, 1]. Because Hive's block sampling
       // function takes X PERCENT as the input and the range of X is [0, 100], we need to
       // adjust the fraction.
       val eps = RandomSampler.roundingEpsilon
-      validate(fraction >= 0.0 - eps && fraction <= 1.0 + eps,
-        s"Sampling fraction ($fraction) must be on interval [0, 1]",
-        ctx)
-      Sample(0.0, fraction, withReplacement = false, seed, query)
+      if (fraction < 0.0 - eps || fraction > 1.0 + eps) {
+        throw QueryParsingErrors.invalidTableSampleFractionError(fraction, ctx)
+      }
+      val method = if (isSystem) SampleMethod.System else SampleMethod.Bernoulli
+      Sample(0.0, fraction, withReplacement = false, seed, query, method)
     }
 
     if (ctx.sampleMethod() == null) {
       throw QueryParsingErrors.emptyInputForTableSampleError(ctx)
     }
 
-    val seed = if (ctx.seed != null) {
-      ctx.seed.getText.toLong
-    } else {
-      (math.random() * 1000).toLong
+    if (isSystem && ctx.seed != null) {
+      throw QueryParsingErrors.tableSampleSystemRepeatableError(ctx)
     }
+
+    val seed: Option[Long] = Option(ctx.seed).map(_.getText.toLong)
 
     ctx.sampleMethod() match {
       case ctx: SampleByRowsContext =>
+        if (isSystem) {
+          throw QueryParsingErrors.tableSampleSystemSampleMethodError("ROWS", ctx)
+        }
         Limit(expression(ctx.expression), query)
 
       case ctx: SampleByPercentileContext =>
@@ -2254,23 +2929,32 @@ class AstBuilder extends DataTypeAstBuilder
         sample(sign * fraction / 100.0d, seed)
 
       case ctx: SampleByBytesContext =>
+        if (isSystem) {
+          throw QueryParsingErrors.tableSampleSystemSampleMethodError("BYTES", ctx)
+        }
         val bytesStr = ctx.bytes.getText
         if (bytesStr.matches("[0-9]+[bBkKmMgG]")) {
-          throw QueryParsingErrors.tableSampleByBytesUnsupportedError("byteLengthLiteral", ctx)
+          throw QueryParsingErrors.tableSampleByBytesUnsupportedError("BYTES", ctx)
         } else {
-          throw QueryParsingErrors.invalidByteLengthLiteralError(bytesStr, ctx)
+          throw QueryParsingErrors.invalidByteLengthLiteralError(source(ctx.bytes), ctx)
         }
 
       case ctx: SampleByBucketContext if ctx.ON() != null =>
+        if (isSystem) {
+          throw QueryParsingErrors.tableSampleSystemSampleMethodError("BUCKET", ctx)
+        }
         if (ctx.identifier != null) {
           throw QueryParsingErrors.tableSampleByBytesUnsupportedError(
-            "BUCKET x OUT OF y ON colname", ctx)
+            "BUCKET x OUT OF y ON column", ctx)
         } else {
           throw QueryParsingErrors.tableSampleByBytesUnsupportedError(
-            "BUCKET x OUT OF y ON function", ctx)
+            "BUCKET x OUT OF y ON function()", ctx)
         }
 
       case ctx: SampleByBucketContext =>
+        if (isSystem) {
+          throw QueryParsingErrors.tableSampleSystemSampleMethodError("BUCKET", ctx)
+        }
         sample(ctx.numerator.getText.toDouble / ctx.denominator.getText.toDouble, seed)
     }
   }
@@ -2298,11 +2982,87 @@ class AstBuilder extends DataTypeAstBuilder
    * Create an aliased table reference. This is typically used in FROM clauses.
    */
   override def visitTableName(ctx: TableNameContext): LogicalPlan = withOrigin(ctx) {
-    val relation = createUnresolvedRelation(ctx.identifierReference, Option(ctx.optionsClause))
-    val table = mayApplyAliasPlan(
-      ctx.tableAlias, relation.optionalMap(ctx.temporalClause)(withTimeTravel))
+    val ttCtx = ctx.temporalTableIdentifierReference
+    val relation = createUnresolvedRelation(ttCtx.identifierReference, Option(ctx.optionsClause))
+    val withTimeTravelSpec = withTableTimeTravel(relation, ttCtx, ctx.temporalClause)
+    val table = mayApplyAliasPlan(ctx.tableAlias, withTimeTravelSpec)
     val sample = table.optionalMap(ctx.sample)(withSample)
     sample.optionalMap(ctx.watermarkClause)(withWatermark)
+  }
+
+  /**
+   * Applies the table-name '@' time travel suffix and/or the `AS OF` clause to `relation`.
+   */
+  private def withTableTimeTravel(
+      relation: LogicalPlan,
+      ttCtx: TemporalTableIdentifierReferenceContext,
+      clause: TemporalClauseContext): LogicalPlan = {
+    val (atTimestamp, atVersion) = temporalSpec(ttCtx, ttCtx.timestamp, ttCtx.version)
+    val hasAtSpec = atTimestamp.isDefined || atVersion.isDefined
+    if (hasAtSpec && clause != null) {
+      withOrigin(clause) {
+        throw QueryParsingErrors.multipleTimeTravelSpec(clause)
+      }
+    }
+    val withAtSpec =
+      if (hasAtSpec) RelationTimeTravel(relation, atTimestamp, atVersion) else relation
+    withAtSpec.optionalMap(clause)(withTimeTravel)
+  }
+
+  override def visitTemporalTableIdentifier(
+      ctx: TemporalTableIdentifierContext): TemporalIdentifier = withOrigin(ctx) {
+    val (timestamp, version) = temporalSpec(ctx, ctx.timestamp, ctx.version)
+    TemporalIdentifier(visitMultipartIdentifier(ctx.id), timestamp, version)
+  }
+
+  /**
+   * Parse the digits of an '@' time travel timestamp (format yyyyMMddHHmmssSSS) to
+   * microseconds since epoch in the session time zone.
+   */
+  private def parseAtSyntaxTimestamp(text: String, ctx: ParserRuleContext): Long = {
+    val format = TemporalIdentifier.TimestampFormat
+    if (text.length != format.length) {
+      throw QueryParsingErrors.invalidAtSyntaxTimestamp(text, format, ctx)
+    }
+    try {
+      val localDateTime = LocalDateTime.of(
+        text.substring(0, 4).toInt,
+        text.substring(4, 6).toInt,
+        text.substring(6, 8).toInt,
+        text.substring(8, 10).toInt,
+        text.substring(10, 12).toInt,
+        text.substring(12, 14).toInt,
+        text.substring(14, 17).toInt * DateTimeConstants.NANOS_PER_MILLIS.toInt)
+      DateTimeUtils.instantToMicros(
+        localDateTime.atZone(getZoneId(conf.sessionLocalTimeZone)).toInstant)
+    } catch {
+      case _: DateTimeException =>
+        throw QueryParsingErrors.invalidAtSyntaxTimestamp(text, format, ctx)
+    }
+  }
+
+  /**
+   * Extract the optional '@' time travel suffix of a table identifier: '@<timestamp>'
+   * (format yyyyMMddHHmmssSSS) or '@v<version>'.
+   */
+  private def temporalSpec(
+      ctx: ParserRuleContext,
+      timestampToken: Token,
+      versionCtx: VersionContext): (Option[Expression], Option[String]) = {
+    if (timestampToken == null && versionCtx == null) {
+      (None, None)
+    } else {
+      if (!conf.getConf(SQLConf.TIME_TRAVEL_AT_SYNTAX_ENABLED)) {
+        throw QueryParsingErrors.timeTravelAtSyntaxDisabled(
+          SQLConf.TIME_TRAVEL_AT_SYNTAX_ENABLED.key, ctx)
+      }
+      if (timestampToken != null) {
+        val micros = parseAtSyntaxTimestamp(timestampToken.getText, ctx)
+        (Some(Literal(micros, TimestampType)), None)
+      } else {
+        (None, visitVersion(versionCtx))
+      }
+    }
   }
 
   override def visitVersion(ctx: VersionContext): Option[String] = {
@@ -2335,10 +3095,130 @@ class AstBuilder extends DataTypeAstBuilder
     val version = visitVersion(ctx.version)
     val timestamp = Option(ctx.timestamp).map(expression)
     if (timestamp.exists(_.references.nonEmpty)) {
-      throw QueryParsingErrors.invalidTimeTravelSpec(
-        "timestamp expression cannot refer to any columns", ctx.timestamp)
+      throw QueryParsingErrors.timeTravelTimestampReferencesColumnsError(ctx.timestamp)
     }
     RelationTimeTravel(plan, timestamp, version)
+  }
+
+  /**
+   * Create a changelog (CDC) relation from: table CHANGES FROM VERSION/TIMESTAMP ...
+   */
+  override def visitChangelogTableName(ctx: ChangelogTableNameContext): LogicalPlan =
+    withOrigin(ctx) {
+      val relation = createUnresolvedRelation(ctx.identifierReference, Option(ctx.optionsClause))
+      val options = resolveOptions(Option(ctx.optionsClause))
+      val changelogContext = buildChangelogContext(ctx.changesClause, options)
+      val result = RelationChanges(relation, changelogContext)
+      mayApplyAliasPlan(ctx.tableAlias, result)
+    }
+
+  /**
+   * Build a [[ChangelogContext]] from a batch changesClause context and optional WITH options.
+   */
+  private def buildChangelogContext(
+      ctx: ChangesClauseContext,
+      options: CaseInsensitiveStringMap): ChangelogContext = {
+    val startExclusive = ctx.startExclusive != null
+    val endExclusive = ctx.endExclusive != null
+    val startInclusive = !startExclusive
+    val endInclusive = !endExclusive
+
+    val range = if (ctx.startingVersion != null) {
+      // Version-based range
+      val startVersion = visitVersion(ctx.startingVersion).get
+      val endVersion = visitVersion(ctx.endingVersion)
+      new VersionRange(
+        startVersion,
+        java.util.Optional.ofNullable(endVersion.orNull),
+        startInclusive,
+        endInclusive)
+    } else {
+      // Timestamp-based range
+      val startTs = expression(ctx.startingTimestamp)
+      if (startTs.references.nonEmpty) {
+        throw QueryParsingErrors.timeTravelTimestampReferencesColumnsError(ctx.startingTimestamp)
+      }
+      if (SubqueryExpression.hasSubquery(startTs)) {
+        throw QueryCompilationErrors.invalidCdcOptionInvalidTimestampExpr()
+      }
+      val endTs = Option(ctx.endingTimestamp).map(expression)
+      if (endTs.exists(_.references.nonEmpty)) {
+        throw QueryParsingErrors.timeTravelTimestampReferencesColumnsError(ctx.endingTimestamp)
+      }
+      if (endTs.exists(SubqueryExpression.hasSubquery)) {
+        throw QueryCompilationErrors.invalidCdcOptionInvalidTimestampExpr()
+      }
+      val startTsValue = resolveTimestampForChanges(startTs)
+      val endTsValue = endTs.map(resolveTimestampForChanges)
+      new TimestampRange(
+        startTsValue,
+        endTsValue.map(java.lang.Long.valueOf)
+          .map(java.util.Optional.of[java.lang.Long])
+          .getOrElse(java.util.Optional.empty[java.lang.Long]),
+        startInclusive,
+        endInclusive)
+    }
+
+    val (deduplicationMode, computeUpdates) = resolveChangelogOptions(options)
+    new ChangelogContext(range, deduplicationMode, computeUpdates)
+  }
+
+  /**
+   * Build a [[ChangelogContext]] from a streaming streamChangesClause context and optional
+   * WITH options.
+   */
+  private def buildStreamChangelogContext(
+      ctx: StreamChangesClauseContext,
+      options: CaseInsensitiveStringMap): ChangelogContext = {
+    val startExclusive = ctx.startExclusive != null
+    val startInclusive = !startExclusive
+
+    val range = if (ctx.startingVersion != null) {
+      val startVersion = visitVersion(ctx.startingVersion).get
+      new VersionRange(
+        startVersion,
+        java.util.Optional.empty(),
+        startInclusive,
+        true)
+    } else if (ctx.startingTimestamp != null) {
+      val startTs = expression(ctx.startingTimestamp)
+      if (startTs.references.nonEmpty) {
+        throw QueryParsingErrors.timeTravelTimestampReferencesColumnsError(ctx.startingTimestamp)
+      }
+      if (SubqueryExpression.hasSubquery(startTs)) {
+        throw QueryCompilationErrors.invalidCdcOptionInvalidTimestampExpr()
+      }
+      val startTsValue = resolveTimestampForChanges(startTs)
+      new TimestampRange(
+        startTsValue,
+        java.util.Optional.empty(),
+        startInclusive,
+        true)
+    } else {
+      new UnboundedRange()
+    }
+
+    val (deduplicationMode, computeUpdates) = resolveChangelogOptions(options)
+    new ChangelogContext(range, deduplicationMode, computeUpdates)
+  }
+
+  /**
+   * Extract deduplicationMode and computeUpdates from WITH options for CDC queries.
+   * Defaults: DROP_CARRYOVERS for deduplicationMode, false for computeUpdates.
+   */
+  private def resolveChangelogOptions(
+      options: CaseInsensitiveStringMap): (ChangelogContext.DeduplicationMode, Boolean) = {
+    val deduplicationMode = ChangelogContextUtils.parseDeduplicationMode(options)
+    val computeUpdates = options.getBoolean("computeUpdates", false)
+    (deduplicationMode, computeUpdates)
+  }
+
+  /**
+   * Resolve a timestamp expression to a Long (microseconds since epoch) for CDC queries.
+   * Delegates to shared utility in [[TimeTravelSpec]].
+   */
+  private def resolveTimestampForChanges(ts: Expression): Long = {
+    TimeTravelSpec.resolveTimestampExpression(ts, conf.sessionLocalTimeZone)
   }
 
   /**
@@ -2366,30 +3246,17 @@ class AstBuilder extends DataTypeAstBuilder
       }
       partitionByExpressions = p.partition.asScala.map(expression).toSeq
       orderByExpressions = p.sortItem.asScala.map(visitSortItem).toSeq
-      def invalidPartitionOrOrderingExpression(clause: String): String = {
-        "The table function call includes a table argument with an invalid " +
-          s"partitioning/ordering specification: the $clause clause included multiple " +
-          "expressions without parentheses surrounding them; please add parentheses around " +
-          "these expressions and then retry the query again"
+      Option(p.invalidMultiPartitionExpression).foreach { invalidCtx =>
+        throw QueryParsingErrors.invalidTableFunctionTableArgumentPartitioningError(
+          "PARTITION BY",
+          invalidCtx)
       }
-      validate(
-        Option(p.invalidMultiPartitionExpression).isEmpty,
-        message = invalidPartitionOrOrderingExpression("PARTITION BY"),
-        ctx = p.invalidMultiPartitionExpression)
-      validate(
-        Option(p.invalidMultiSortItem).isEmpty,
-        message = invalidPartitionOrOrderingExpression("ORDER BY"),
-        ctx = p.invalidMultiSortItem)
+      Option(p.invalidMultiSortItem).foreach { invalidCtx =>
+        throw QueryParsingErrors.invalidTableFunctionTableArgumentPartitioningError(
+          "ORDER BY",
+          invalidCtx)
+      }
     }
-    validate(
-      !(withSinglePartition && partitionByExpressions.nonEmpty),
-      message = "WITH SINGLE PARTITION cannot be specified if PARTITION BY is also present",
-      ctx = ctx.tableArgumentPartitioning)
-    validate(
-      !(orderByExpressions.nonEmpty && partitionByExpressions.isEmpty && !withSinglePartition),
-      message = "ORDER BY cannot be specified unless either " +
-        "PARTITION BY or WITH SINGLE PARTITION is also present",
-      ctx = ctx.tableArgumentPartitioning)
     FunctionTableSubqueryArgumentExpression(
       plan = p,
       partitionByExpressions = partitionByExpressions,
@@ -2412,26 +3279,26 @@ class AstBuilder extends DataTypeAstBuilder
   }
 
   /**
-   * Create a table-valued function call with arguments, e.g. range(1000)
+   * Build an UnresolvedTableValuedFunction from a tableFunctionCall context.
+   * Used by both visitTableValuedFunction and stream TVF visitors.
    */
-  override def visitTableValuedFunction(ctx: TableValuedFunctionContext)
-      : LogicalPlan = withOrigin(ctx) {
-    val func = ctx.functionTable
-    val aliases = if (func.tableAlias.identifierList != null) {
-      visitIdentifierList(func.tableAlias.identifierList)
+  private def buildTvfFromTableFunctionCall(
+      funcCallCtx: TableFunctionCallContext,
+      tableAliasCtx: TableAliasContext,
+      watermarkClauseCtx: WatermarkClauseContext): LogicalPlan = {
+    val aliases = if (tableAliasCtx != null && tableAliasCtx.identifierList != null) {
+      visitIdentifierList(tableAliasCtx.identifierList)
     } else {
       Seq.empty
     }
-
     withFuncIdentClause(
-      func.functionName,
+      funcCallCtx.funcName,
       Nil,
       (ident, _) => {
-        if (ident.length > 1) {
-          throw QueryParsingErrors.invalidTableValuedFunctionNameError(ident, ctx)
-        }
-        val funcName = func.functionName.getText
-        val args = func.functionTableArgument.asScala.map { e =>
+        // Allow qualified table-valued function names (e.g., builtin.range, system.session.my_tvf)
+        // Removed artificial restriction on multi-part identifiers
+        val funcName = funcCallCtx.funcName.getText
+        val args = funcCallCtx.functionTableArgument.asScala.map { e =>
           Option(e.functionArgument).map(extractNamedArgument(_, funcName))
             .getOrElse {
               extractFunctionTableNamedArgument(e.functionTableReferenceArgument, funcName)
@@ -2441,25 +3308,183 @@ class AstBuilder extends DataTypeAstBuilder
         val tvf = UnresolvedTableValuedFunction(ident, args)
 
         val tvfAliases = if (aliases.nonEmpty) UnresolvedTVFAliases(ident, tvf, aliases) else tvf
-
-        val watermarkClause = func.watermarkClause()
-        val tvfWithWatermark = tvfAliases.optionalMap(watermarkClause)(withWatermark)
-        tvfWithWatermark.optionalMap(func.tableAlias.strictIdentifier)(aliasPlan)
-      })
+        val tvfWithWatermark = tvfAliases.optionalMap(watermarkClauseCtx)(withWatermark)
+        Option(tableAliasCtx).map { c =>
+          tvfWithWatermark.optionalMap(c.strictIdentifier)(aliasPlan)
+        }.getOrElse {
+          tvfWithWatermark
+        }
+      }
+    )
   }
 
-  override def visitStreamTableName(ctx: StreamTableNameContext): LogicalPlan = {
-    val ident = visitMultipartIdentifier(ctx.multipartIdentifier)
-    val tableStreamingRelation = createUnresolvedRelation(
-      ctx = ctx,
-      ident = ident,
-      optionsClause = Option(ctx.optionsClause),
-      writePrivileges = Seq.empty,
-      isStreaming = true)
-
-    val tableWithWatermark = tableStreamingRelation.optionalMap(ctx.watermarkClause)(withWatermark)
-    mayApplyAliasPlan(ctx.tableAlias, tableWithWatermark)
+  /**
+   * Create a table-valued function call with arguments, e.g. range(1000)
+   */
+  override def visitTableValuedFunction(ctx: TableValuedFunctionContext)
+      : LogicalPlan = withOrigin(ctx) {
+    // IDENTIFIED BY is only valid for streaming TVFs
+    if (ctx.tableFunctionCallWithTrailingClauses.identifiedByClause != null) {
+      operationNotAllowed("IDENTIFIED BY clause is only supported for streaming sources", ctx)
+    }
+    visitTableFunctionCallWithTrailingClauses(ctx.tableFunctionCallWithTrailingClauses)
   }
+
+  /**
+   * Create a table-valued function call with optional trailing clauses.
+   */
+  override def visitTableFunctionCallWithTrailingClauses(
+      ctx: TableFunctionCallWithTrailingClausesContext): LogicalPlan = withOrigin(ctx) {
+    buildTvfFromTableFunctionCall(ctx.tableFunctionCall, ctx.tableAlias, ctx.watermarkClause)
+  }
+
+  /**
+   * Create a plan for the ANSI SQL `UNNEST(array [, array ...]) [WITH ORDINALITY]` relation used
+   * in the FROM clause. It is desugared into a [[Generate]] over a [[OneRowRelation]] backed by the
+   * [[Unnest]] generator, then wrapped with the optional table/column aliases via the shared
+   * FROM-clause aliasing helper. Correlated references (e.g. `FROM t, LATERAL UNNEST(t.arr)`) are
+   * handled by the surrounding `LATERAL` machinery, exactly like generator table functions such as
+   * `explode`.
+   */
+  override def visitUnnestTable(ctx: UnnestTableContext): LogicalPlan = withOrigin(ctx) {
+    val unnest = ctx.unnest
+    val expressions = expressionList(unnest.expression)
+    val withOrdinality = unnest.ORDINALITY != null
+    val generate = Generate(
+      Unnest(expressions, withOrdinality),
+      unrequiredChildIndex = Nil,
+      outer = false,
+      qualifier = None,
+      generatorOutput = Nil,
+      child = OneRowRelation())
+    mayApplyAliasPlan(unnest.tableAlias, generate)
+  }
+
+  /**
+   * Create a plan for the SQL:2016 `JSON_TABLE` table-valued function. This builds a
+   * [[Generate]] over the [[JsonTable]] generator (reusing the existing Generate operator), so a
+   * downstream `SELECT` sees one output column per COLUMNS entry.
+   */
+  override def visitJsonTableRelation(
+      ctx: JsonTableRelationContext): LogicalPlan = withOrigin(ctx) {
+    val jt = ctx.jsonTable
+    val jsonExpr = expression(jt.jsonExpr)
+    val rowPath = string(visitStringLit(jt.rowPath))
+
+    val columns = jt.jsonTableColumn.asScala.map(buildJsonTableColumn).toSeq
+    // Column names must be unique within a single JSON_TABLE. Whether two names that differ only
+    // in case collide follows the configured resolver, so `a` and `A` stay distinct under
+    // `spark.sql.caseSensitive`.
+    val normalize: String => String =
+      if (conf.caseSensitiveAnalysis) identity else _.toLowerCase(Locale.ROOT)
+    val duplicate = columns.groupBy(c => normalize(c.name)).collectFirst {
+      case (_, cols) if cols.length > 1 => cols.head.name
+    }
+    duplicate.foreach { name =>
+      throw QueryParsingErrors.duplicateJsonTableColumnError(name, jt)
+    }
+
+    val errorMode = if (jt.jsonTableOnErrorClause != null && jt.jsonTableOnErrorClause.ERROR != null
+        && jt.jsonTableOnErrorClause.NULL == null) {
+      JsonTableErrorMode.ErrorOnError
+    } else {
+      JsonTableErrorMode.NullOnError
+    }
+
+    val generator = JsonTable(jsonExpr, rowPath, columns, errorMode)
+    val generate = Generate(
+      generator,
+      unrequiredChildIndex = Nil,
+      outer = false,
+      qualifier = None,
+      generatorOutput = columns.map(c => UnresolvedAttribute.quoted(c.name)),
+      child = OneRowRelation())
+    mayApplyAliasPlan(jt.tableAlias, generate)
+  }
+
+  /**
+   * The implicit JSON path for a column with no explicit PATH: the column name as a single JSON
+   * object key. Bracket syntax (`$['name']`) is used rather than `$.name` so a column name that
+   * contains a dot (e.g. `a.b`) reads the literal key `"a.b"` instead of the nested path `a.b`. A
+   * name containing a single quote cannot be represented and yields an unparseable path, which
+   * `JsonTable.checkInputDataTypes` rejects (such a column must use an explicit PATH).
+   */
+  private def implicitJsonTablePath(name: String): String = s"$$['$name']"
+
+  /**
+   * Build a single [[JsonTableColumn]] from a `jsonTableColumn` grammar context. A value column
+   * with no explicit PATH gets an implicit path derived from its name (see
+   * [[implicitJsonTablePath]]), matching the SQL standard / Oracle behavior.
+   */
+  private def buildJsonTableColumn(ctx: JsonTableColumnContext): JsonTableColumn = withOrigin(ctx) {
+    ctx match {
+      case ord: JsonTableOrdinalityColumnContext =>
+        JsonTableColumn(
+          name = getIdentifierText(ord.colName),
+          dataType = LongType,
+          path = None,
+          kind = JsonTableColumnKind.Ordinality)
+      case ex: JsonTableExistsColumnContext =>
+        val name = getIdentifierText(ex.colName)
+        val path = Option(ex.path).map(p => string(visitStringLit(p)))
+          .getOrElse(implicitJsonTablePath(name))
+        JsonTableColumn(
+          name = name,
+          // A column value is produced by a `Cast` to the declared type, so normalize CHAR/VARCHAR
+          // to STRING exactly as `visitCast` does; a raw CHAR/VARCHAR target has no encoder.
+          dataType = CharVarcharUtils.replaceCharVarcharWithStringForCast(
+            typedVisit[DataType](ex.dataType)),
+          path = Some(path),
+          kind = JsonTableColumnKind.Exists)
+      case v: JsonTableValueColumnContext =>
+        val name = getIdentifierText(v.colName)
+        val path = Option(v.path).map(p => string(visitStringLit(p)))
+          .getOrElse(implicitJsonTablePath(name))
+        JsonTableColumn(
+          name = name,
+          dataType = CharVarcharUtils.replaceCharVarcharWithStringForCast(
+            typedVisit[DataType](v.dataType)),
+          path = Some(path),
+          kind = JsonTableColumnKind.Value)
+    }
+  }
+
+  /**
+   * Extract the source name from an identifiedByClause context.
+   */
+  private def extractSourceName(ctx: IdentifiedByClauseContext): Option[String] = {
+    Option(ctx).map(c => c.sourceName.identifier.getText)
+  }
+
+  override def visitStreamRelation(ctx: StreamRelationContext): LogicalPlan =
+    withOrigin(ctx) {
+      val sourceName = extractSourceName(ctx.identifiedByClause)
+      Option(ctx.multipartIdentifier).map { multipartIdentifier =>
+        val ident = visitMultipartIdentifier(multipartIdentifier)
+        var relation: LogicalPlan = createUnresolvedRelation(
+          ctx = ctx,
+          ident = ident,
+          optionsClause = Option(ctx.optionsClause),
+          writePrivileges = Set.empty,
+          isStreaming = true)
+
+        Option(ctx.streamChangesClause).foreach { changesCtx =>
+          val options = resolveOptions(Option(ctx.optionsClause))
+          val changelogContext = buildStreamChangelogContext(changesCtx, options)
+          relation = RelationChanges(relation, changelogContext)
+        }
+        relation = NamedStreamingRelation.withUserProvidedName(relation, sourceName)
+        relation = mayApplyAliasPlan(ctx.tableAlias, relation)
+        relation.optionalMap(ctx.watermarkClause)(withWatermark)
+      }.getOrElse {
+        val tvfPlan = buildTvfFromTableFunctionCall(
+          ctx.tableFunctionCall, ctx.tableAlias, ctx.watermarkClause)
+        tvfPlan.transformUp {
+          case tvf: UnresolvedTableValuedFunction =>
+            NamedStreamingRelation.withUserProvidedName(tvf.copy(isStreaming = true), sourceName)
+        }
+      }
+    }
 
   /**
    * Create an inline table (a virtual table in Hive parlance).
@@ -2471,8 +3496,14 @@ class AstBuilder extends DataTypeAstBuilder
         // inline table comes in two styles:
         // style 1: values (1), (2), (3)  -- multiple columns are supported
         // style 2: values 1, 2, 3  -- only a single column is supported here
-        case struct: CreateNamedStruct => struct.valExprs // style 1
-        case child => Seq(child)                          // style 2
+        // Strip Alias wrappers from row values - CreateStruct.apply preserves them for
+        // expressions like `(1 AS id, 'a' AS name)`, but they are redundant here since
+        // column names are determined by the table alias or generated defaults.
+        case struct: CreateNamedStruct => struct.valExprs.map {
+          case a: Alias => a.child
+          case other => other
+        } // style 1
+        case child => Seq(child) // style 2
       }
     }
 
@@ -2483,12 +3514,72 @@ class AstBuilder extends DataTypeAstBuilder
     }
 
     val unresolvedTable = UnresolvedInlineTable(aliases, rows.toSeq)
-    val table = if (conf.getConf(SQLConf.EAGER_EVAL_OF_UNRESOLVED_INLINE_TABLE_ENABLED)) {
-      EvaluateUnresolvedInlineTable.evaluate(unresolvedTable)
+    val table = if (canEagerlyEvaluateInlineTable(ctx, unresolvedTable)) {
+      EvaluateUnresolvedInlineTable.evaluate(
+        unresolvedTable, ignoreCollation = isInlineTableInsideInsertValuesClause(ctx))
     } else {
       unresolvedTable
     }
     table.optionalMap(ctx.tableAlias.strictIdentifier)(aliasPlan)
+  }
+
+  /**
+   * Returns whether we can eagerly evaluate the given inline table at parse time.
+   *
+   * Eager evaluation is not allowed if the config is disabled, or if the inline table is part of
+   * a `CREATE TABLE/VIEW` statement and contains expressions that need default collation
+   * resolution (e.g., string literals or casts to string types). In those cases, the default
+   * collation of the object must be applied during analysis, so the inline table cannot be
+   * eagerly evaluated.
+   */
+  private def canEagerlyEvaluateInlineTable(
+      ctx: InlineTableContext, table: UnresolvedInlineTable): Boolean = {
+    def isDefaultCollationApplicable: Boolean = {
+      isInsideCreateObjectWithDefaultCollationSupport(ctx) &&
+        ApplyDefaultCollation.needsResolution(table.expressions)
+    }
+
+    conf.getConf(SQLConf.EAGER_EVAL_OF_UNRESOLVED_INLINE_TABLE_ENABLED) &&
+      !isDefaultCollationApplicable
+  }
+
+  // Checks if the VALUES clause is directly part of an INSERT statement (e.g.,
+  // `INSERT INTO t VALUES (...)`) by walking up the parser context tree. Returns false if a
+  // FROM clause is found first, meaning the VALUES is inside a subquery
+  // (e.g., `INSERT INTO t SELECT * FROM VALUES (...) AS T`).
+  private def isInlineTableInsideInsertValuesClause(ctx: InlineTableContext): Boolean = {
+    var currentContext: ParserRuleContext = ctx
+    while (currentContext != null) {
+      currentContext match {
+        case c: SingleInsertQueryContext =>
+          c.insertInto() match {
+            case _: InsertIntoTableContext | _: InsertOverwriteTableContext |
+                 _: InsertIntoReplaceUsingContext | _: InsertIntoReplaceBooleanCondContext =>
+              return true
+            case _ =>
+              return false
+          }
+        case _: FromClauseContext =>
+          return false
+        case _ =>
+          currentContext = currentContext.getParent
+      }
+    }
+    false
+  }
+
+  private def isInsideCreateObjectWithDefaultCollationSupport(
+      ctx: ParserRuleContext): Boolean = {
+    var currentContext = ctx
+    while (currentContext != null) {
+      currentContext match {
+        case _: CreateTableContext | _: ReplaceTableContext | _: CreateViewContext =>
+          return true
+        case _ =>
+          currentContext = currentContext.getParent
+      }
+    }
+    false
   }
 
   /**
@@ -2541,7 +3632,7 @@ class AstBuilder extends DataTypeAstBuilder
    */
   private def mayApplyAliasPlan(tableAlias: TableAliasContext, plan: LogicalPlan): LogicalPlan = {
     if (tableAlias.strictIdentifier != null) {
-      val alias = tableAlias.strictIdentifier.getText
+      val alias = getIdentifierText(tableAlias.strictIdentifier)
       if (tableAlias.identifierList != null) {
         val columnNames = visitIdentifierList(tableAlias.identifierList)
         SubqueryAlias(alias, UnresolvedSubqueryColumnAliases(columnNames, plan))
@@ -2811,7 +3902,8 @@ class AstBuilder extends DataTypeAstBuilder
         expr: Expression,
         patterns: Seq[UTF8String]): (Expression, Seq[UTF8String]) = ctx.kind.getType match {
       // scalastyle:off caselocale
-      case SqlBaseParser.ILIKE => (Lower(expr), patterns.map(_.toLowerCase))
+      case SqlBaseParser.ILIKE =>
+        (Lower(expr), patterns.map(pattern => Option(pattern).map(_.toLowerCase).orNull))
       // scalastyle:on caselocale
       case _ => (expr, patterns)
     }
@@ -2819,6 +3911,18 @@ class AstBuilder extends DataTypeAstBuilder
     def getLike(expr: Expression, pattern: Expression): Expression = ctx.kind.getType match {
       case SqlBaseParser.ILIKE => new ILike(expr, pattern)
       case _ => new Like(expr, pattern)
+    }
+
+    def buildBalanced(
+        expressions: Seq[Expression],
+        combine: (Expression, Expression) => Expression): Expression = {
+      assert(expressions.nonEmpty)
+      if (expressions.length == 1) {
+        expressions.head
+      } else {
+        val (left, right) = expressions.splitAt(expressions.length / 2)
+        combine(buildBalanced(left, combine), buildBalanced(right, combine))
+      }
     }
 
     val withNot = blockBang(ctx.errorCapturingNot)
@@ -2837,13 +3941,22 @@ class AstBuilder extends DataTypeAstBuilder
       case SqlBaseParser.IN if ctx.query != null =>
         invertIfNotDefined(InSubquery(getValueExpressions(e), ListQuery(plan(ctx.query))))
       case SqlBaseParser.IN =>
+        // Validate that IN clause is not empty
+        if (ctx.expression.isEmpty) {
+          throw QueryParsingErrors.emptyInPredicateError(ctx)
+        }
         invertIfNotDefined(In(e, ctx.expression.asScala.map(expression).toSeq))
       case SqlBaseParser.LIKE | SqlBaseParser.ILIKE =>
         Option(ctx.quantifier).map(_.getType) match {
           case Some(SqlBaseParser.ANY) | Some(SqlBaseParser.SOME) =>
-            validate(!ctx.expression.isEmpty, "Expected something between '(' and ')'.", ctx)
+            if (ctx.expression.isEmpty) {
+              throw QueryParsingErrors.emptyQuantifiedPatternError(ctx)
+            }
             val expressions = expressionList(ctx.expression)
-            if (expressions.forall(_.foldable) && expressions.forall(_.dataType == StringType)) {
+            if (expressions.forall(_.foldable) &&
+                expressions.forall(
+                  expression => expression.resolved &&
+                    DataTypeUtils.isDefaultStringCharOrVarcharType(expression.dataType))) {
               // If there are many pattern expressions, will throw StackOverflowError.
               // So we use LikeAny or NotLikeAny instead.
               val patterns = expressions.map(_.eval(EmptyRow).asInstanceOf[UTF8String])
@@ -2853,13 +3966,19 @@ class AstBuilder extends DataTypeAstBuilder
                 case _ => NotLikeAny(expr, pat)
               }
             } else {
-              ctx.expression.asScala.map(expression)
-                .map(p => invertIfNotDefined(getLike(e, p))).toSeq.reduceLeft(Or)
+              buildBalanced(
+                expressions.map(p => invertIfNotDefined(getLike(e, p))),
+                Or.apply)
             }
           case Some(SqlBaseParser.ALL) =>
-            validate(!ctx.expression.isEmpty, "Expected something between '(' and ')'.", ctx)
+            if (ctx.expression.isEmpty) {
+              throw QueryParsingErrors.emptyQuantifiedPatternError(ctx)
+            }
             val expressions = expressionList(ctx.expression)
-            if (expressions.forall(_.foldable) && expressions.forall(_.dataType == StringType)) {
+            if (expressions.forall(_.foldable) &&
+                expressions.forall(
+                  expression => expression.resolved &&
+                    DataTypeUtils.isDefaultStringCharOrVarcharType(expression.dataType))) {
               // If there are many pattern expressions, will throw StackOverflowError.
               // So we use LikeAll or NotLikeAll instead.
               val patterns = expressions.map(_.eval(EmptyRow).asInstanceOf[UTF8String])
@@ -2869,8 +3988,9 @@ class AstBuilder extends DataTypeAstBuilder
                 case _ => NotLikeAll(expr, pat)
               }
             } else {
-              ctx.expression.asScala.map(expression)
-                .map(p => invertIfNotDefined(getLike(e, p))).toSeq.reduceLeft(And)
+              buildBalanced(
+                expressions.map(p => invertIfNotDefined(getLike(e, p))),
+                And.apply)
             }
           case _ =>
             val escapeChar = Option(ctx.escapeChar)
@@ -2988,16 +4108,22 @@ class AstBuilder extends DataTypeAstBuilder
           CurrentDate()
         case SqlBaseParser.CURRENT_TIMESTAMP =>
           CurrentTimestamp()
-        case SqlBaseParser.CURRENT_TIME =>
+        case SqlBaseParser.CURRENT_TIME | SqlBaseParser.LOCALTIME =>
           CurrentTime()
+        case SqlBaseParser.CURRENT_PATH =>
+          CurrentPath()
         case SqlBaseParser.CURRENT_USER | SqlBaseParser.USER | SqlBaseParser.SESSION_USER =>
           CurrentUser()
       }
     } else {
-      // If the parser is not in ansi mode, we should return `UnresolvedAttribute`, in case there
-      // are columns named `CURRENT_DATE` or `CURRENT_TIMESTAMP` or `CURRENT_TIME`.
-      // ctx.name is a token, not an identifier context.
-      UnresolvedAttribute.quoted(ctx.name.getText)
+      ctx.name.getType match {
+        case SqlBaseParser.CURRENT_PATH =>
+          CurrentPath()
+        case _ =>
+          // If the parser is not in ansi mode, we should return `UnresolvedAttribute`, in case
+          // there are columns named `CURRENT_DATE` or `CURRENT_TIMESTAMP` or `CURRENT_TIME`.
+          UnresolvedAttribute.quoted(ctx.name.getText)
+      }
     }
   }
 
@@ -3006,16 +4132,14 @@ class AstBuilder extends DataTypeAstBuilder
    */
   override def visitCollate(ctx: CollateContext): Expression = withOrigin(ctx) {
     val collationName = visitCollateClause(ctx.collateClause())
-
-    Collate(expression(ctx.primaryExpression), UnresolvedCollation(collationName))
+    val unresolvedCollation = withOrigin(ctx.collateClause().collationName) {
+      UnresolvedCollation(collationName)
+    }
+    Collate(expression(ctx.primaryExpression), unresolvedCollation)
   }
 
   override def visitCollateClause(ctx: CollateClauseContext): Seq[String] = withOrigin(ctx) {
-    val collationName = visitMultipartIdentifier(ctx.collationName)
-    if (!SQLConf.get.trimCollationEnabled && collationName.last.toUpperCase().contains("TRIM")) {
-      throw QueryCompilationErrors.trimCollationNotEnabledError()
-    }
-    collationName
+    visitMultipartIdentifier(ctx.collationName)
   }
 
   /**
@@ -3138,6 +4262,275 @@ class AstBuilder extends DataTypeAstBuilder
   }
 
   /**
+   * Resolve a `jsonValueBehavior` clause (`NULL` / `ERROR` / `DEFAULT <expr>`) into a
+   * [[JsonValueBehavior]] and, for the `DEFAULT` case, its expression.
+   */
+  private def buildJsonValueBehavior(
+      ctx: JsonValueBehaviorContext): (JsonValueBehavior, Option[Expression]) = ctx match {
+    case _: JsonValueBehaviorNullContext => (JsonValueBehavior.Null, None)
+    case _: JsonValueBehaviorErrorContext => (JsonValueBehavior.Error, None)
+    case d: JsonValueBehaviorDefaultContext =>
+      (JsonValueBehavior.Default, Some(expression(d.defaultExpr)))
+  }
+
+  // Whether `ctx` is a lexical value of an enclosing JSON constructor (a JSON_ARRAY element or a
+  // JSON_OBJECT value). A clause-free call there still routes, but as a routed wrapper, so the
+  // parent stays a JSON constructor that decides the splice once this call's owner is known. A
+  // JSON_OBJECT key is excluded: keys are never spliced, so a call there is a plain function call.
+  // Transparent wrappers (parentheses, a postfix COLLATE, a bare predicate) are walked through.
+  private def isDirectJsonConstructorArgument(ctx: RuleContext): Boolean = {
+    @scala.annotation.tailrec
+    def loop(prev: RuleContext, parent: RuleContext): Boolean = parent match {
+      case null => false
+      case _: JsonArrayValueContext => true
+      case m: JsonObjectMemberContext => prev eq m.valueExpr
+      case m: JsonObjectCommaMemberContext => prev eq m.valueExpr
+      case _: ExpressionContext | _: ValueExpressionDefaultContext |
+          _: ParenthesizedExpressionContext | _: CollateContext =>
+        loop(parent, parent.getParent)
+      case p: PredicatedContext if p.predicate() == null =>
+        loop(parent, parent.getParent)
+      case _ => false
+    }
+    loop(ctx, ctx.getParent)
+  }
+
+  /**
+   * Create a [[JsonValue]] expression for the SQL:2016 `JSON_VALUE` scalar function. The `ON EMPTY`
+   * / `ON ERROR` clauses default to `NULL` when absent, per the standard.
+   */
+  override def visitJsonValue(ctx: JsonValueContext): Expression = withOrigin(ctx) {
+    val jsonExpr = expression(ctx.jsonExpr)
+    val path = string(visitStringLit(ctx.path))
+    if (ctx.returning == null && ctx.emptyBehavior == null && ctx.errorBehavior == null) {
+      UnresolvedFunction("json_value", Seq(jsonExpr, Literal(path)), isDistinct = false)
+    } else {
+      // Default RETURNING type is STRING. Normalize CHAR/VARCHAR to STRING for the cast, as the
+      // value is produced by a `Cast` to the declared type (a raw CHAR/VARCHAR target has no
+      // encoder).
+      val returning = Option(ctx.returning)
+        .map(dt => CharVarcharUtils.replaceCharVarcharWithStringForCast(typedVisit[DataType](dt)))
+        .getOrElse(StringType)
+      val (onEmpty, emptyDefault) = Option(ctx.emptyBehavior)
+        .map(buildJsonValueBehavior).getOrElse((JsonValueBehavior.Null, None))
+      val (onError, errorDefault) = Option(ctx.errorBehavior)
+        .map(buildJsonValueBehavior).getOrElse((JsonValueBehavior.Null, None))
+      JsonValue(jsonExpr, path, returning, onEmpty, onError, emptyDefault, errorDefault)
+    }
+  }
+
+  /**
+   * Create a [[JsonExists]] expression for the SQL:2016 `JSON_EXISTS` predicate. The `ON ERROR`
+   * clause defaults to `FALSE` when absent, per the standard.
+   */
+  override def visitJsonExists(ctx: JsonExistsContext): Expression = withOrigin(ctx) {
+    val jsonExpr = expression(ctx.jsonExpr)
+    val path = string(visitStringLit(ctx.path))
+    if (ctx.errorBehavior == null) {
+      UnresolvedFunction("json_exists", Seq(jsonExpr, Literal(path)), isDistinct = false)
+    } else {
+      val onError = Option(ctx.errorBehavior).map { b =>
+        if (b.TRUE != null) JsonExistsBehavior.True
+        else if (b.FALSE != null) JsonExistsBehavior.False
+        else if (b.UNKNOWN != null) JsonExistsBehavior.Unknown
+        else JsonExistsBehavior.Error
+      }.getOrElse(JsonExistsBehavior.False)
+      JsonExists(jsonExpr, path, onError)
+    }
+  }
+
+  /**
+   * Resolve a `jsonQueryBehavior` clause (`NULL` / `ERROR` / `EMPTY ARRAY` / `EMPTY OBJECT`) into a
+   * [[JsonQueryBehavior]].
+   */
+  private def buildJsonQueryBehavior(ctx: JsonQueryBehaviorContext): JsonQueryBehavior = ctx match {
+    case _: JsonQueryBehaviorNullContext => JsonQueryBehavior.Null
+    case _: JsonQueryBehaviorErrorContext => JsonQueryBehavior.Error
+    case _: JsonQueryBehaviorEmptyArrayContext => JsonQueryBehavior.EmptyArray
+    case _: JsonQueryBehaviorEmptyObjectContext => JsonQueryBehavior.EmptyObject
+  }
+
+  /**
+   * Create a [[JsonQuery]] expression for the SQL:2016 `JSON_QUERY` function. The array wrapper
+   * defaults to `WITHOUT ARRAY WRAPPER`, quotes to `KEEP QUOTES`, and both `ON EMPTY` / `ON ERROR`
+   * to `NULL`, per the standard. `OMIT QUOTES` cannot be combined with an array wrapper.
+   */
+  override def visitJsonQuery(ctx: JsonQueryContext): Expression = withOrigin(ctx) {
+    val jsonExpr = expression(ctx.jsonExpr)
+    val path = string(visitStringLit(ctx.path))
+    if (ctx.returning == null && ctx.wrapper == null && ctx.quotes == null &&
+        ctx.emptyBehavior == null && ctx.errorBehavior == null) {
+      if (isDirectJsonConstructorArgument(ctx)) {
+        UnresolvedRoutedJsonQuery(jsonExpr, path)
+      } else {
+        UnresolvedFunction("json_query", Seq(jsonExpr, Literal(path)), isDistinct = false)
+      }
+    } else {
+      // Default RETURNING is STRING. JSON_QUERY returns the fragment verbatim (no length-enforcing
+      // cast), so a CHAR/VARCHAR RETURNING is normalized to STRING: the result type must not
+      // advertise a length it cannot enforce. CharVarcharUtils is unusable here -- it honors
+      // spark.sql.preserveCharVarcharTypeInfo and would keep the VARCHAR(n) length. A non-string
+      // RETURNING is left intact for checkInputDataTypes to reject.
+      val returning = Option(ctx.returning).map(typedVisit[DataType]).map {
+        case c: CharType => c.toStringType
+        case v: VarcharType => v.toStringType
+        case other => other
+      }.getOrElse(StringType)
+      val wrapper = Option(ctx.wrapper).map {
+        case _: JsonQueryWrapperWithoutContext => JsonQueryWrapper.Without
+        case w: JsonQueryWrapperWithContext =>
+          if (w.wrapperType != null && w.wrapperType.getType == SqlBaseParser.CONDITIONAL) {
+            JsonQueryWrapper.Conditional
+          } else {
+            JsonQueryWrapper.Unconditional
+          }
+      }.getOrElse(JsonQueryWrapper.Without)
+      val quotes = Option(ctx.quotes).map {
+        case _: JsonQueryQuotesKeepContext => JsonQueryQuotes.Keep
+        case _: JsonQueryQuotesOmitContext => JsonQueryQuotes.Omit
+      }.getOrElse(JsonQueryQuotes.Keep)
+      // The OMIT QUOTES + array-wrapper invariant is enforced in JsonQuery.checkInputDataTypes so
+      // it holds for directly-constructed expressions too, not only this parser path.
+      val onEmpty =
+        Option(ctx.emptyBehavior).map(buildJsonQueryBehavior).getOrElse(JsonQueryBehavior.Null)
+      val onError =
+        Option(ctx.errorBehavior).map(buildJsonQueryBehavior).getOrElse(JsonQueryBehavior.Null)
+      JsonQuery(jsonExpr, path, returning, wrapper, quotes, onEmpty, onError)
+    }
+  }
+
+  /**
+   * Resolve a `jsonConstructorNullBehavior` clause (`NULL` / `ABSENT`) into a
+   * [[JsonConstructorNullBehavior]].
+   */
+  private def buildJsonConstructorNullBehavior(
+      ctx: JsonConstructorNullBehaviorContext): JsonConstructorNullBehavior =
+    ctx match {
+      case _: JsonConstructorNullBehaviorNullContext =>
+        JsonConstructorNullBehavior.Null
+      case _: JsonConstructorNullBehaviorAbsentContext =>
+        JsonConstructorNullBehavior.Absent
+    }
+
+  /**
+   * Create a [[JsonArray]] expression for the SQL:2016 `JSON_ARRAY` constructor function.
+   * The `ON NULL` clause defaults to `ABSENT ON NULL` (drops NULL elements), and RETURNING
+   * defaults to STRING.
+   */
+  override def visitJsonArray(ctx: JsonArrayContext): Expression = withOrigin(ctx) {
+    val arrayValues = ctx.values.asScala.map(v => expression(v.value)).toSeq
+    // A clause-free call (no RETURNING, no ON NULL, no explicit FORMAT JSON) routes through
+    // function resolution, so a routine can shadow it.
+    val clauseFree = ctx.returning == null && ctx.nullBehavior == null &&
+      !ctx.values.asScala.exists(_.FORMAT() != null)
+    if (clauseFree && !arrayValues.exists(ImplicitlyFormattedAsJson.isImplicitlyJson) &&
+        !isDirectJsonConstructorArgument(ctx)) {
+      UnresolvedFunction("json_array", arrayValues, isDistinct = false)
+    } else if (clauseFree) {
+      // A nested JSON producer argument, or a call that is itself a constructor's value: the call
+      // still routes, but the wrapper keeps the splice flags for the built-in.
+      UnresolvedRoutedJsonArray(
+        arrayValues, arrayValues.map(ImplicitlyFormattedAsJson.isLexicallySpliced))
+    } else {
+      // The parser's FORMAT JSON flags; analysis can still add a splice for a resolved
+      // qualified or routed constructor (see [[StockJsonConstructor]]):
+      //  - `formatJson`: splice the value -- an explicit `FORMAT JSON` or a nested constructor.
+      //  - `needsValidation`: validate the text at eval -- an explicit `FORMAT JSON` on a value
+      //    that is not a constructor.
+      val formatArgs = ctx.values.asScala.zip(arrayValues).map { case (v, expr) =>
+        val explicit = v.FORMAT() != null
+        val implicitlyJson = ImplicitlyFormattedAsJson.isLexicallySpliced(expr)
+        (explicit || implicitlyJson, explicit && !implicitlyJson)
+      }.toSeq
+      val formatJson = formatArgs.map(_._1)
+      val needsValidation = formatArgs.map(_._2)
+      // Default RETURNING type is STRING; the result is JSON text. A CHAR/VARCHAR RETURNING is
+      // normalized to STRING unconditionally: JSON_ARRAY serializes the fragment itself and never
+      // advertises a CHAR/VARCHAR length it does not enforce. The CharVarcharUtils helpers cannot
+      // be used here -- they honor spark.sql.preserveCharVarcharTypeInfo and would leave a
+      // VARCHAR(n) length in the output type when that flag is set. A non-string RETURNING is left
+      // intact for checkInputDataTypes to fail.
+      val returning = Option(ctx.returning).map(typedVisit[DataType]).map {
+        case c: CharType => c.toStringType
+        case v: VarcharType => v.toStringType
+        case other => other
+      }.getOrElse(StringType)
+      // Default ON NULL behavior is ABSENT ON NULL (drop NULL elements).
+      val nullBehavior = Option(ctx.nullBehavior)
+        .map(buildJsonConstructorNullBehavior)
+        .getOrElse(JsonConstructorNullBehavior.Absent)
+      UnresolvedJsonArray(arrayValues, formatJson, needsValidation, nullBehavior, returning)
+    }
+  }
+
+  /**
+   * Create a [[JsonObjectExpr]] expression for the SQL:2016 `JSON_OBJECT` constructor function.
+   * The `ON NULL` clause defaults to `NULL` when absent, per the standard.
+   */
+  override def visitJsonObject(ctx: JsonObjectContext): Expression = withOrigin(ctx) {
+    val body = ctx.jsonObjectConstructor()
+    // Parse key-value pairs, tagging each value's explicit `FORMAT JSON` flag. The standard
+    // `key VALUE value` / `key : value` forms and the compatibility `key, value` form are separate
+    // grammar alternatives, so only one list is populated for a single constructor. Only the
+    // standard forms carry `FORMAT JSON`; the comma form never does.
+    val standardMembers = body.jsonObjectMember().asScala.map { memberCtx =>
+      val keyCtx = Option(memberCtx.keyExpr).getOrElse(memberCtx.colonKey.keyExpr)
+      (expression(keyCtx), expression(memberCtx.valueExpr), memberCtx.FORMAT() != null)
+    }.toSeq
+    val taggedMembers = if (standardMembers.nonEmpty) {
+      standardMembers
+    } else {
+      body.jsonObjectCommaMember().asScala.map { memberCtx =>
+        (expression(memberCtx.keyExpr), expression(memberCtx.valueExpr), false)
+      }.toSeq
+    }
+    val members = taggedMembers.map { case (k, v, _) => (k, v) }
+    // The parser's splice flags; analysis can still add a splice for a resolved qualified or
+    // routed producer (see [[StockJsonConstructor]]):
+    //  - `rawJson`: spliced raw as already-JSON text -- an explicit `FORMAT JSON`, or a lexically
+    //    nested built-in-owned JSON constructor (seen through a pass-through `COLLATE` but not a
+    //    `CAST(... AS STRING)`, which cancels splicing). A routed one is decided after resolution.
+    //  - `needsValidation`: raw text is arbitrary user input to JSON-validate at eval -- only an
+    //    explicit `FORMAT JSON` on a non-constructor; a nested constructor is trusted.
+    val formatArgs = taggedMembers.map { case (_, v, explicit) =>
+      val implicitlyJson = ImplicitlyFormattedAsJson.isLexicallySpliced(v)
+      (explicit || implicitlyJson, explicit && !implicitlyJson)
+    }
+    val rawJson = formatArgs.map(_._1)
+    val needsValidation = formatArgs.map(_._2)
+    // As in JSON_ARRAY, a clause-free call routes so a routine can shadow it, in every spelling
+    // (comma, VALUE, colon). A call with a nested producer, or one that is itself a constructor's
+    // value, keeps its splice flags in a wrapper.
+    // Explicit FORMAT JSON stays with the built-in, since its validation flag cannot be passed as
+    // an ordinary argument.
+    val hasExplicitFormatJson = taggedMembers.exists(_._3)
+    val routeThroughResolution =
+      body.returning == null && body.nullBehavior == null && !hasExplicitFormatJson
+    val mayHoldJsonProducer =
+      members.exists { case (_, v) => ImplicitlyFormattedAsJson.isImplicitlyJson(v) }
+    if (routeThroughResolution && !mayHoldJsonProducer && !isDirectJsonConstructorArgument(ctx)) {
+      UnresolvedFunction("json_object", members.flatMap { case (k, v) => Seq(k, v) },
+        isDistinct = false)
+    } else if (routeThroughResolution) {
+      UnresolvedRoutedJsonObject(members, rawJson)
+    } else {
+      // Default RETURNING is STRING (the result is JSON text). A CHAR/VARCHAR RETURNING is
+      // normalized to STRING: JSON_OBJECT serializes the fragment itself and never advertises a
+      // length it does not enforce (CharVarcharUtils honors preserveCharVarcharTypeInfo, so it
+      // cannot be used). A non-string RETURNING is left for checkInputDataTypes to reject.
+      val returning = Option(body.returning).map(typedVisit[DataType]).map {
+        case c: CharType => c.toStringType
+        case v: VarcharType => v.toStringType
+        case other => other
+      }.getOrElse(StringType)
+      // JSON_OBJECT defaults to NULL ON NULL per the standard (emits keys with null values).
+      val nullBehavior = Option(body.nullBehavior)
+        .map(buildJsonConstructorNullBehavior).getOrElse(JsonConstructorNullBehavior.Null)
+      UnresolvedJsonObject(members, rawJson, needsValidation, nullBehavior, returning)
+    }
+  }
+
+  /**
    * Create a (windowed) Function expression.
    */
   override def visitFunctionCall(ctx: FunctionCallContext): Expression = withOrigin(ctx) {
@@ -3158,7 +4551,7 @@ class AstBuilder extends DataTypeAstBuilder
     val order = ctx.sortItem.asScala.map(visitSortItem)
     val filter = Option(ctx.where).map(expression(_))
     val ignoreNulls =
-      Option(ctx.nullsOption).map(_.getType == SqlBaseParser.IGNORE).getOrElse(false)
+      Option(ctx.nullsOption).map(_.getType == SqlBaseParser.IGNORE)
 
     // Is this an IDENTIFIER clause instead of a function call?
     if (ctx.functionName.identFunc != null &&
@@ -3229,7 +4622,7 @@ class AstBuilder extends DataTypeAstBuilder
    */
   override def visitLambda(ctx: LambdaContext): Expression = withOrigin(ctx) {
     val arguments = ctx.identifier().asScala.map { name =>
-      UnresolvedNamedLambdaVariable(UnresolvedAttribute.quoted(name.getText).nameParts)
+      UnresolvedNamedLambdaVariable(UnresolvedAttribute.quoted(getIdentifierText(name)).nameParts)
     }
     val function = expression(ctx.expression).transformUp {
       case a: UnresolvedAttribute => UnresolvedNamedLambdaVariable(a.nameParts)
@@ -3278,9 +4671,9 @@ class AstBuilder extends DataTypeAstBuilder
   override def visitFrameBound(ctx: FrameBoundContext): Expression = withOrigin(ctx) {
     def value: Expression = {
       val e = expression(ctx.expression)
-      validate(
-        e.resolved && e.foldable || e.isInstanceOf[Parameter],
-        "Frame bound value must be a literal.", ctx)
+      if (!(e.resolved && e.foldable || e.isInstanceOf[Parameter])) {
+        throw QueryParsingErrors.invalidWindowFrameBoundError(ctx)
+      }
       e
     }
 
@@ -3408,7 +4801,10 @@ class AstBuilder extends DataTypeAstBuilder
     val path = if (field.startsWith("[")) "$" + field else s"$$.$field"
     val parsedPath = JsonPathParser.parse(path)
     if (parsedPath.isEmpty) {
-      throw new ParseException(errorClass = "PARSE_SYNTAX_ERROR", ctx = ctx)
+      throw new ParseException(
+        errorClass = "PARSE_SYNTAX_ERROR",
+        messageParameters = Map("error" -> s"'$field'", "hint" -> ""),
+        ctx = ctx)
     }
     val potentialAlias = parsedPath.get.collect { case Named(name) => name }.lastOption
     val node = SemiStructuredExtract(expression(ctx.col), path)
@@ -3494,18 +4890,66 @@ class AstBuilder extends DataTypeAstBuilder
       specialTs.getOrElse(toLiteral(stringToTimestamp(_, zoneId), TimestampType))
     }
 
+    // ANSI SQL (ISO/IEC 9075-2, Subclause 5.3, Syntax Rule 27): the fractional-seconds precision
+    // of a typed timestamp literal is the number of digits in its `<seconds fraction>`. When the
+    // nanosecond preview is enabled and the literal carries 7-9 fractional digits, build a
+    // nanosecond-capable literal with precision `p` equal to that digit count. Literals with <= 6
+    // fractional digits keep the microsecond behavior; more than 9 digits is rejected.
+    def constructTimestampNTZNanosLiteral(p: Int): Literal =
+      toLiteral(stringToTimestampNTZNanos(_, p), TimestampNTZNanosType(p))
+
+    def constructTimestampLTZNanosLiteral(p: Int): Literal = {
+      val zoneId = getZoneId(conf.sessionLocalTimeZone)
+      toLiteral(stringToTimestampLTZNanos(_, p, zoneId), TimestampLTZNanosType(p))
+    }
+
+    // Returns Some(literal) when the nanos preview flag is on and the literal has 7-9 fractional
+    // digits; throws when there are more than 9; returns None (fall back to the micro path) when
+    // the flag is off or there are <= 6 fractional digits.
+    def nanosLiteralOpt(construct: Int => Literal): Option[Literal] = {
+      if (!SQLConf.get.timestampNanosTypesEnabled) {
+        None
+      } else {
+        val p = fractionalSecondsDigits(value)
+        // With the flag off, >9 fractional digits silently truncate to microseconds via
+        // the fall-through path. Strict validation is intentionally flag-gated.
+        if (p > TimestampNTZNanosType.MAX_PRECISION) {
+          throw QueryParsingErrors.timestampLiteralPrecisionExceedsMaxError(value, ctx)
+        } else if (p >= TimestampNTZNanosType.MIN_PRECISION) {
+          Some(construct(p))
+        } else {
+          None
+        }
+      }
+    }
+
     valueType match {
       case DATE =>
         val zoneId = getZoneId(conf.sessionLocalTimeZone)
         val specialDate = convertSpecialDate(value, zoneId).map(Literal(_, DateType))
         specialDate.getOrElse(toLiteral(stringToDate, DateType))
-      case TIME => toLiteral(stringToTime, TimeType())
+      case TIME =>
+        // ANSI SQL (ISO/IEC 9075-2, Subclause 5.3, Syntax Rule 26): the fractional-seconds
+        // precision of a time literal is the number of digits in its seconds fraction. A literal
+        // with 7-9 fractional digits becomes a nanosecond-precision literal; <= 6 digits keep the
+        // default microsecond precision; more than 9 digits is rejected.
+        val p = fractionalSecondsDigits(value)
+        if (p > TimeType.MAX_PRECISION) {
+          throw QueryParsingErrors.timeLiteralPrecisionExceedsMaxError(value, ctx)
+        } else if (p > TimeType.MICROS_PRECISION) {
+          toLiteral(stringToTime, TimeType(p))
+        } else {
+          toLiteral(stringToTime, TimeType())
+        }
       case TIMESTAMP_NTZ =>
-        convertSpecialTimestampNTZ(value, getZoneId(conf.sessionLocalTimeZone))
-          .map(Literal(_, TimestampNTZType))
-          .getOrElse(toLiteral(stringToTimestampWithoutTimeZone, TimestampNTZType))
+        nanosLiteralOpt(constructTimestampNTZNanosLiteral).getOrElse {
+          convertSpecialTimestampNTZ(value, getZoneId(conf.sessionLocalTimeZone))
+            .map(Literal(_, TimestampNTZType))
+            .getOrElse(toLiteral(stringToTimestampWithoutTimeZone, TimestampNTZType))
+        }
       case TIMESTAMP_LTZ =>
-        constructTimestampLTZLiteral(value)
+        nanosLiteralOpt(constructTimestampLTZNanosLiteral)
+          .getOrElse(constructTimestampLTZLiteral(value))
       case TIMESTAMP =>
         SQLConf.get.timestampType match {
           case TimestampNTZType =>
@@ -3517,14 +4961,17 @@ class AstBuilder extends DataTypeAstBuilder
                 // If the input string contains time zone part, return a timestamp with local time
                 // zone literal.
                 if (containsTimeZonePart) {
-                  constructTimestampLTZLiteral(value)
+                  nanosLiteralOpt(constructTimestampLTZNanosLiteral)
+                    .getOrElse(constructTimestampLTZLiteral(value))
                 } else {
-                  toLiteral(stringToTimestampWithoutTimeZone, TimestampNTZType)
+                  nanosLiteralOpt(constructTimestampNTZNanosLiteral)
+                    .getOrElse(toLiteral(stringToTimestampWithoutTimeZone, TimestampNTZType))
                 }
               }
 
           case TimestampType =>
-            constructTimestampLTZLiteral(value)
+            nanosLiteralOpt(constructTimestampLTZNanosLiteral)
+              .getOrElse(constructTimestampLTZLiteral(value))
         }
 
       case INTERVAL =>
@@ -3542,7 +4989,7 @@ class AstBuilder extends DataTypeAstBuilder
             .split("\\s")
             .map(_.toLowerCase(Locale.ROOT).stripSuffix("s"))
             .filter(s => s != "interval" && s.matches("[a-z]+"))
-          constructMultiUnitsIntervalLiteral(ctx, interval, units.toImmutableArraySeq)
+          constructMultiUnitsIntervalLiteral(ctx, interval, units.toImmutableArraySeq, value)
         } else {
           Literal(interval, CalendarIntervalType)
         }
@@ -3755,7 +5202,7 @@ class AstBuilder extends DataTypeAstBuilder
   private def createUnresolvedRelation(
       ctx: IdentifierReferenceContext,
       optionsClause: Option[OptionsClauseContext] = None,
-      writePrivileges: Seq[TableWritePrivilege] = Nil): LogicalPlan = withOrigin(ctx) {
+      writePrivileges: Set[TableWritePrivilege] = Set.empty): LogicalPlan = withOrigin(ctx) {
     val options = resolveOptions(optionsClause)
     withIdentClause(ctx, parts => {
       val relation = new UnresolvedRelation(parts, options, isStreaming = false)
@@ -3770,7 +5217,7 @@ class AstBuilder extends DataTypeAstBuilder
       ctx: ParserRuleContext,
       ident: Seq[String],
       optionsClause: Option[OptionsClauseContext],
-      writePrivileges: Seq[TableWritePrivilege],
+      writePrivileges: Set[TableWritePrivilege],
       isStreaming: Boolean): UnresolvedRelation = withOrigin(ctx) {
     val options = resolveOptions(optionsClause)
     val relation = new UnresolvedRelation(ident, options, isStreaming)
@@ -3787,7 +5234,7 @@ class AstBuilder extends DataTypeAstBuilder
   /**
    * Create an [[UnresolvedTable]] from an identifier reference.
    */
-  private def createUnresolvedTable(
+  protected def createUnresolvedTable(
       ctx: IdentifierReferenceContext,
       commandName: String,
       suggestAlternative: Boolean = false): LogicalPlan = withOrigin(ctx) {
@@ -3811,8 +5258,12 @@ class AstBuilder extends DataTypeAstBuilder
   protected def createUnresolvedTableOrView(
       ctx: IdentifierReferenceContext,
       commandName: String,
-      allowTempView: Boolean = true): LogicalPlan = withOrigin(ctx) {
-    withIdentClause(ctx, UnresolvedTableOrView(_, commandName, allowTempView))
+      allowTempView: Boolean = true,
+      tableNotFoundSearchPathMode: UnresolvedTableOrViewSearchPathMode =
+        UnresolvedTableOrViewSearchPathMode.Ddl): LogicalPlan = withOrigin(ctx) {
+    withIdentClause(
+      ctx,
+      UnresolvedTableOrView(_, commandName, allowTempView, tableNotFoundSearchPathMode))
   }
 
   private def createUnresolvedTableOrView(
@@ -3824,33 +5275,36 @@ class AstBuilder extends DataTypeAstBuilder
   }
 
   /**
-   * Create an [[UnresolvedFunction]] from a multi-part identifier.
+   * Create an [[UnresolvedFunctionName]] from a multi-part identifier with proper origin.
    */
   private def createUnresolvedFunctionName(
       ctx: ParserRuleContext,
       ident: Seq[String],
-      commandName: String,
-      requirePersistent: Boolean = false,
-      funcTypeMismatchHint: Option[String] = None,
-      possibleQualifiedName: Option[Seq[String]] = None): UnresolvedFunctionName = withOrigin(ctx) {
-    UnresolvedFunctionName(
-      ident,
-      commandName,
-      requirePersistent,
-      funcTypeMismatchHint,
-      possibleQualifiedName)
+      commandName: String): UnresolvedFunctionName = withOrigin(ctx) {
+    UnresolvedFunctionName(ident, commandName)
+  }
+
+  /**
+   * Create an [[UnresolvedIdentifier]] from a multi-part identifier with proper origin.
+   */
+  protected def createUnresolvedIdentifier(
+      ctx: ParserRuleContext,
+      ident: Seq[String]): UnresolvedIdentifier = withOrigin(ctx) {
+    UnresolvedIdentifier(ident)
   }
 
   /**
    * Construct an [[Literal]] from [[CalendarInterval]] and
    * units represented as a [[Seq]] of [[String]].
+   * `intervalString` is the interval text without the INTERVAL keyword, used in errors.
    */
   private def constructMultiUnitsIntervalLiteral(
       ctx: ParserRuleContext,
       calendarInterval: CalendarInterval,
-      units: Seq[String]): Literal = {
-    val yearMonthFields = Set.empty[Byte]
-    val dayTimeFields = Set.empty[Byte]
+      units: Seq[String],
+      intervalString: => String): Literal = {
+    val yearMonthFields = mutable.Set.empty[Byte]
+    val dayTimeFields = mutable.Set.empty[Byte]
     for (unit <- units) {
       if (YearMonthIntervalType.stringToField.contains(unit)) {
         yearMonthFields += YearMonthIntervalType.stringToField(unit)
@@ -3865,8 +5319,7 @@ class AstBuilder extends DataTypeAstBuilder
     }
     if (yearMonthFields.nonEmpty) {
       if (dayTimeFields.nonEmpty) {
-        val literalStr = source(ctx)
-        throw QueryParsingErrors.mixedIntervalUnitsError(literalStr, ctx)
+        throw QueryParsingErrors.mixedIntervalUnitsError(intervalString, ctx)
       }
       Literal(
         calendarInterval.months,
@@ -3907,10 +5360,10 @@ class AstBuilder extends DataTypeAstBuilder
         Literal(micros, DayTimeIntervalType(start, end))
       }
     } else if (ctx.errorCapturingMultiUnitsInterval != null && !conf.legacyIntervalEnabled) {
-      val units =
-        ctx.errorCapturingMultiUnitsInterval.body.unit.asScala.map(
-          _.getText.toLowerCase(Locale.ROOT).stripSuffix("s")).toSeq
-      constructMultiUnitsIntervalLiteral(ctx, calendarInterval, units)
+      val body = ctx.errorCapturingMultiUnitsInterval.body
+      val units = body.unit.asScala.map(_.getText.toLowerCase(Locale.ROOT).stripSuffix("s")).toSeq
+      constructMultiUnitsIntervalLiteral(
+        ctx, calendarInterval, units, multiUnitsIntervalString(body).trim)
     } else {
       Literal(calendarInterval, CalendarIntervalType)
     }
@@ -3923,8 +5376,7 @@ class AstBuilder extends DataTypeAstBuilder
     if (ctx.errorCapturingMultiUnitsInterval != null) {
       val innerCtx = ctx.errorCapturingMultiUnitsInterval
       if (innerCtx.unitToUnitInterval != null) {
-        throw QueryParsingErrors.moreThanOneFromToUnitInIntervalLiteralError(
-          innerCtx.unitToUnitInterval)
+        throw QueryParsingErrors.fromToIntervalWithOtherUnitsError(innerCtx.unitToUnitInterval)
       }
       visitMultiUnitsInterval(innerCtx.multiUnitsInterval)
     } else {
@@ -3932,10 +5384,43 @@ class AstBuilder extends DataTypeAstBuilder
       val innerCtx = ctx.errorCapturingUnitToUnitInterval
       if (innerCtx.error1 != null || innerCtx.error2 != null) {
         val errorCtx = if (innerCtx.error1 != null) innerCtx.error1 else innerCtx.error2
-        throw QueryParsingErrors.moreThanOneFromToUnitInIntervalLiteralError(errorCtx)
+        throw QueryParsingErrors.fromToIntervalWithOtherUnitsError(errorCtx)
       }
       visitUnitToUnitInterval(innerCtx.body)
     }
+  }
+
+  /**
+   * Returns the interval string of multiple unit value pairs, e.g. " 1 YEAR -2 DAYS" for
+   * INTERVAL 1 YEAR '-2' DAYS.
+   */
+  private def multiUnitsIntervalString(ctx: MultiUnitsIntervalContext): String = {
+    val units = ctx.unit.asScala
+    val values = ctx.intervalValue().asScala
+    assert(units.length == values.length)
+    units.indices.map { i =>
+      val u = units(i).getText
+      val v = if (values(i).stringLit() != null) {
+        val value = string(visitStringLit(values(i).stringLit()))
+        // SPARK-32840: For invalid cases, e.g. INTERVAL '1 day 2' hour,
+        // INTERVAL 'interval 1' day, we need to check ahead before they are concatenated with
+        // units and become valid ones, e.g. '1 day 2 hour'.
+        // Ideally, we only ensure the value parts don't contain any units here.
+        if (value.exists(Character.isLetter)) {
+          throw QueryParsingErrors.invalidIntervalFormError(value, ctx)
+        }
+        if (values(i).MINUS() == null) {
+          value
+        } else if (value.startsWith("-")) {
+          value.replaceFirst("-", "")
+        } else {
+          s"-$value"
+        }
+      } else {
+        values(i).getText
+      }
+      " " + v + " " + u
+    }.mkString
   }
 
   /**
@@ -3943,34 +5428,8 @@ class AstBuilder extends DataTypeAstBuilder
    */
   override def visitMultiUnitsInterval(ctx: MultiUnitsIntervalContext): CalendarInterval = {
     withOrigin(ctx) {
-      val units = ctx.unit.asScala
-      val values = ctx.intervalValue().asScala
       try {
-        assert(units.length == values.length)
-        val kvs = units.indices.map { i =>
-          val u = units(i).getText
-          val v = if (values(i).stringLit() != null) {
-            val value = string(visitStringLit(values(i).stringLit()))
-            // SPARK-32840: For invalid cases, e.g. INTERVAL '1 day 2' hour,
-            // INTERVAL 'interval 1' day, we need to check ahead before they are concatenated with
-            // units and become valid ones, e.g. '1 day 2 hour'.
-            // Ideally, we only ensure the value parts don't contain any units here.
-            if (value.exists(Character.isLetter)) {
-              throw QueryParsingErrors.invalidIntervalFormError(value, ctx)
-            }
-            if (values(i).MINUS() == null) {
-              value
-            } else if (value.startsWith("-")) {
-              value.replaceFirst("-", "")
-            } else {
-              s"-$value"
-            }
-          } else {
-            values(i).getText
-          }
-          UTF8String.fromString(" " + v + " " + u)
-        }
-        IntervalUtils.stringToInterval(UTF8String.concat(kvs: _*))
+        IntervalUtils.stringToInterval(UTF8String.fromString(multiUnitsIntervalString(ctx)))
       } catch {
         case st: SparkThrowable => throw st
         case i: IllegalArgumentException =>
@@ -4248,11 +5707,15 @@ class AstBuilder extends DataTypeAstBuilder
     }
 
   /**
-   * Create a generation expression string.
+   * Create a generation expression.
    */
-  override def visitGeneratedColumn(ctx: GeneratedColumnContext): String =
+  override def visitGeneratedColumn(ctx: GeneratedColumnContext): GeneratedColumnExpression =
     withOrigin(ctx) {
-      getDefaultExpression(ctx.expression(), "GENERATED").originalSQL
+      val expr = expression(ctx.expression())
+      if (expr.containsPattern(PARAMETER)) {
+        throw QueryParsingErrors.parameterMarkerNotAllowed("GENERATED", expr.origin)
+      }
+      GeneratedColumnExpression(expr, getOriginalText(ctx.expression()))
     }
 
   /**
@@ -4271,7 +5734,7 @@ class AstBuilder extends DataTypeAstBuilder
     if (!SQLConf.get.objectLevelCollationsEnabled) {
       throw QueryCompilationErrors.objectLevelCollationsNotEnabledError()
     }
-    val collationName = ctx.identifier.getText
+    val collationName = getIdentifierText(ctx.identifier)
     CollationFactory.fetchCollation(collationName).collationName
   }
 
@@ -4506,11 +5969,19 @@ class AstBuilder extends DataTypeAstBuilder
   }
 
   override def visitPartitionTransform(
-      ctx: PartitionTransformContext): Transform = withOrigin(ctx) {
+      ctx: PartitionTransformContext): Transform = {
+    visitTransform(ctx.transform)
+  }
+
+  /**
+   * Build a [[Transform]] from a transform context. Shared by partitioning (PARTITIONED BY) and by
+   * the write ordering (ORDERED BY), which allow the same transform syntax.
+   */
+  private def visitTransform(ctx: TransformContext): Transform = withOrigin(ctx) {
     def getFieldReference(
         ctx: ApplyTransformContext,
         arg: V2Expression): FieldReference = {
-      lazy val name: String = ctx.identifier.getText
+      lazy val name: String = getIdentifierText(ctx.identifier)
       arg match {
         case ref: FieldReference =>
           ref
@@ -4522,7 +5993,7 @@ class AstBuilder extends DataTypeAstBuilder
     def getSingleFieldReference(
         ctx: ApplyTransformContext,
         arguments: Seq[V2Expression]): FieldReference = {
-      lazy val name: String = ctx.identifier.getText
+      lazy val name: String = getIdentifierText(ctx.identifier)
       if (arguments.size > 1) {
         throw QueryParsingErrors.wrongNumberArgumentsForTransformError(name, arguments.size, ctx)
       } else if (arguments.isEmpty) {
@@ -4532,7 +6003,7 @@ class AstBuilder extends DataTypeAstBuilder
       }
     }
 
-    ctx.transform match {
+    ctx match {
       case identityCtx: IdentityTransformContext =>
         IdentityTransform(FieldReference(typedVisit[Seq[String]](identityCtx.qualifiedName)))
 
@@ -4807,11 +6278,11 @@ class AstBuilder extends DataTypeAstBuilder
           string(visitStringLit(c.outFmt)))))
       // Expected format: SEQUENCEFILE | TEXTFILE | RCFILE | ORC | PARQUET | AVRO
       case (c: GenericFileFormatContext, null) =>
-        SerdeInfo(storedAs = Some(c.identifier.getText))
+        SerdeInfo(storedAs = Some(c.simpleIdentifier.getText))
       case (null, storageHandler) =>
         invalidStatement("STORED BY", ctx)
       case _ =>
-        throw QueryParsingErrors.storedAsAndStoredByBothSpecifiedError(ctx)
+        throw QueryParsingErrors.storedAsAndStoredByBothSpecifiedError()
     }
   }
 
@@ -4869,10 +6340,9 @@ class AstBuilder extends DataTypeAstBuilder
           entry("mapkey.delim", ctx.keysTerminatedBy) ++
           Option(ctx.linesSeparatedBy).toSeq.map { token =>
             val value = string(visitStringLit(token))
-            validate(
-              value == "\n",
-              s"LINES TERMINATED BY only supports newline '\\n' right now: $value",
-              ctx)
+            if (value != "\n") {
+              throw QueryParsingErrors.unsupportedRowFormatLinesTerminatedByError(value, ctx)
+            }
             "line.delim" -> value
           }
     SerdeInfo(serdeProperties = entries.toMap)
@@ -4897,7 +6367,7 @@ class AstBuilder extends DataTypeAstBuilder
     (rowFormatCtx, createFileFormatCtx.fileFormat) match {
       case (_, ffTable: TableFileFormatContext) => // OK
       case (rfSerde: RowFormatSerdeContext, ffGeneric: GenericFileFormatContext) =>
-        ffGeneric.identifier.getText.toLowerCase(Locale.ROOT) match {
+        ffGeneric.simpleIdentifier.getText.toLowerCase(Locale.ROOT) match {
           case ("sequencefile" | "textfile" | "rcfile") => // OK
           case fmt =>
             operationNotAllowed(
@@ -4905,7 +6375,7 @@ class AstBuilder extends DataTypeAstBuilder
               parentCtx)
         }
       case (rfDelimited: RowFormatDelimitedContext, ffGeneric: GenericFileFormatContext) =>
-        ffGeneric.identifier.getText.toLowerCase(Locale.ROOT) match {
+        ffGeneric.simpleIdentifier.getText.toLowerCase(Locale.ROOT) match {
           case "textfile" => // OK
           case fmt => operationNotAllowed(
             s"ROW FORMAT DELIMITED is only compatible with 'textfile', not '$fmt'", parentCtx)
@@ -4942,7 +6412,7 @@ class AstBuilder extends DataTypeAstBuilder
     checkDuplicateClauses(ctx.clusterBySpec(), "CLUSTER BY", ctx)
     checkDuplicateClauses(ctx.locationSpec, "LOCATION", ctx)
 
-    if (ctx.skewSpec.size > 0) {
+    if (!ctx.skewSpec.isEmpty) {
       invalidStatement("CREATE TABLE ... SKEWED BY", ctx)
     }
 
@@ -4972,6 +6442,78 @@ class AstBuilder extends DataTypeAstBuilder
 
     (partTransforms, partCols, bucketSpec, cleanedProperties, cleanedOptions, newLocation, comment,
       collation, serdeInfo, clusterBySpec)
+  }
+
+  /**
+   * Parse the optional write distribution and ordering clauses of a CREATE/REPLACE TABLE statement:
+   * `DISTRIBUTED BY PARTITION` and `[LOCALLY] ORDERED BY ... | UNORDERED`.
+   *
+   * Returns the distribution mode and the ordering. The mode is null when the statement did not ask
+   * for one, which leaves the choice to the catalog; `NONE` is an explicit request. An explicit
+   * `DISTRIBUTED BY PARTITION` decides the mode, which leaves `LOCALLY` with no effect beside it.
+   * `DISTRIBUTED BY PARTITION` is rejected beside CLUSTER BY, and when `partitioning` has no
+   * partitioning by `WriteDistributionAndOrdering.hasPartitioning`.
+   */
+  private def writeSpecsFrom(
+      ctx: CreateTableClausesContext,
+      partitioning: Seq[Transform]): (WriteDistributionMode, Seq[V2SortOrder]) = {
+    checkDuplicateClauses(ctx.writeDistributionSpec, "DISTRIBUTED BY PARTITION", ctx)
+    checkDuplicateClauses(ctx.writeOrderingSpec, "ORDERED BY/UNORDERED", ctx)
+
+    val distributionSpec = ctx.writeDistributionSpec.asScala.headOption.orNull
+    val orderingSpec = ctx.writeOrderingSpec.asScala.headOption.orNull
+    if (distributionSpec != null) {
+      if (!ctx.clusterBySpec.isEmpty) {
+        throw QueryParsingErrors.clusterByWithDistributedByPartition(ctx)
+      }
+      if (!WriteDistributionAndOrdering.hasPartitioning(partitioning)) {
+        throw QueryParsingErrors.distributedByPartitionWithoutPartitioningError(ctx)
+      }
+    }
+    val mode = if (distributionSpec != null) {
+      WriteDistributionMode.HASH
+    } else if (orderingSpec == null) {
+      null
+    } else if (orderingSpec.UNORDERED != null || orderingSpec.LOCALLY != null) {
+      WriteDistributionMode.NONE
+    } else {
+      WriteDistributionMode.RANGE
+    }
+    (mode, toOrdering(orderingSpec))
+  }
+
+  private def toOrdering(orderingSpec: WriteOrderingSpecContext): Seq[V2SortOrder] = {
+    if (orderingSpec != null && orderingSpec.writeOrder != null) {
+      orderingSpec.writeOrder.fields.asScala.map(visitWriteOrderField).toSeq
+    } else {
+      Seq.empty
+    }
+  }
+
+  /**
+   * Create a v2 sort order for one field of a write ordering.
+   */
+  override def visitWriteOrderField(ctx: WriteOrderFieldContext): V2SortOrder = withOrigin(ctx) {
+    val direction = if (ctx.DESC != null) {
+      SortDirection.DESCENDING
+    } else {
+      SortDirection.ASCENDING
+    }
+
+    val nullOrdering = if (ctx.FIRST != null) {
+      NullOrdering.NULLS_FIRST
+    } else if (ctx.LAST != null) {
+      NullOrdering.NULLS_LAST
+    } else {
+      direction.defaultNullOrdering
+    }
+
+    // A plain column, also when written as `identity(col)`, is passed as a bare reference.
+    val key = visitTransform(ctx.transform) match {
+      case IdentityTransform(ref) => ref
+      case t => t
+    }
+    LogicalExpressions.sort(key, direction, nullOrdering)
   }
 
   protected def getSerdeInfo(
@@ -5082,10 +6624,16 @@ class AstBuilder extends DataTypeAstBuilder
    *     [COMMENT table_comment]
    *     [DEFAULT COLLATION collation_name]
    *     [TBLPROPERTIES (property_name=property_value, ...)]
+   *     [DISTRIBUTED BY PARTITION]
+   *     [[LOCALLY] ORDERED BY write_order_fields | UNORDERED]
    *
    *   partition_fields:
    *     col_name, transform(col_name), transform(constant, col_name), ... |
    *     col_name data_type [NOT NULL] [COMMENT col_comment], ...
+   *
+   *   write_order_fields:
+   *     [(] {col_name | transform(col_name | constant, ...)} [ASC|DESC] [NULLS FIRST|LAST], ...
+   *     [)]
    * }}}
    */
   override def visitCreateTable(ctx: CreateTableContext): LogicalPlan = withOrigin(ctx) {
@@ -5114,37 +6662,51 @@ class AstBuilder extends DataTypeAstBuilder
         bucketSpec.map(_.asTransform) ++
         clusterBySpec.map(_.asTransform)
 
-    val asSelectPlan = Option(ctx.query).map(plan).toSeq
-    withIdentClause(identifierContext, asSelectPlan, (identifiers, otherPlans) => {
-      val namedConstraints =
-        constraints.map(c => c.withTableName(identifiers.last))
-      val tableSpec = UnresolvedTableSpec(properties, provider, options, location, comment,
-        collation, serdeInfo, external, namedConstraints)
-      val identifier = withOrigin(identifierContext) {
-        UnresolvedIdentifier(identifiers)
-      }
-      otherPlans.headOption match {
-        case Some(_) if columns.nonEmpty =>
+    val (writeDistributionMode, writeOrdering) =
+      writeSpecsFrom(ctx.createTableClauses(), partitioning)
+
+    Option(ctx.query).map(plan) match {
+      case Some(query) =>
+        // CTAS path: push the identifier placeholder into the `name` slot so that
+        // `CTESubstitution` sees the `CreateTableAsSelect` (a `CTEInChildren`) directly
+        // and places `WithCTE` on its children (SPARK-46625). CTAS disallows constraints /
+        // user-specified columns / non-reference partition columns, so we don't need the
+        // identifier parts at parse time.
+        if (columns.nonEmpty) {
           operationNotAllowed(
-            "Schema may not be specified in a Create Table As Select (CTAS) statement",
-            ctx)
-
-        case Some(_) if partCols.nonEmpty =>
-          // non-reference partition columns are not allowed because schema can't be specified
+            "Schema may not be specified in a Create Table As Select (CTAS) statement", ctx)
+        }
+        if (partCols.nonEmpty) {
           operationNotAllowed(
-            "Partition column types may not be specified in Create Table As Select (CTAS)",
-            ctx)
-
-        case Some(query) =>
-          CreateTableAsSelect(identifier, partitioning, query, tableSpec, Map.empty, ifNotExists)
-
-        case _ =>
+            "Partition column types may not be specified in Create Table As Select (CTAS)", ctx)
+        }
+        if (constraints.nonEmpty) {
+          operationNotAllowed(
+            "Constraints may not be specified in a Create Table As Select (CTAS) statement", ctx)
+        }
+        val tableSpec = UnresolvedTableSpec(properties, provider, options, location, comment,
+          collation, serdeInfo, external, constraints = Nil)
+        val nameSlot = withIdentClause(identifierContext, identifiers =>
+          withOrigin(identifierContext) { UnresolvedIdentifier(identifiers) })
+        CreateTableAsSelect(nameSlot, partitioning, query, tableSpec, Map.empty, ifNotExists,
+          writeDistributionMode = writeDistributionMode, writeOrdering = writeOrdering)
+      case None =>
+        withIdentClause(identifierContext, identifiers => {
+          val namedConstraints =
+            constraints.map(c => c.withTableName(identifiers.last))
+          val tableSpec = UnresolvedTableSpec(properties, provider, options, location, comment,
+            collation, serdeInfo, external, namedConstraints)
+          val identifier = withOrigin(identifierContext) {
+            UnresolvedIdentifier(identifiers)
+          }
           // Note: table schema includes both the table columns list and the partition columns
           // with data type.
           val allColumns = columns ++ partCols
-          CreateTable(identifier, allColumns, partitioning, tableSpec, ignoreIfExists = ifNotExists)
-      }
-    })
+          CreateTable(identifier, allColumns, partitioning, tableSpec,
+            ignoreIfExists = ifNotExists,
+            writeDistributionMode = writeDistributionMode, writeOrdering = writeOrdering)
+        })
+    }
   }
 
   /**
@@ -5170,10 +6732,16 @@ class AstBuilder extends DataTypeAstBuilder
    *     [COMMENT table_comment]
    *     [DEFAULT COLLATION collation_name]
    *     [TBLPROPERTIES (property_name=property_value, ...)]
+   *     [DISTRIBUTED BY PARTITION]
+   *     [[LOCALLY] ORDERED BY write_order_fields | UNORDERED]
    *
    *   partition_fields:
    *     col_name, transform(col_name), transform(constant, col_name), ... |
    *     col_name data_type [NOT NULL] [COMMENT col_comment], ...
+   *
+   *   write_order_fields:
+   *     [(] {col_name | transform(col_name | constant, ...)} [ASC|DESC] [NULLS FIRST|LAST], ...
+   *     [)]
    * }}}
    */
   override def visitReplaceTable(ctx: ReplaceTableContext): LogicalPlan = withOrigin(ctx) {
@@ -5193,38 +6761,47 @@ class AstBuilder extends DataTypeAstBuilder
         clusterBySpec.map(_.asTransform)
 
     val identifierContext = ctx.replaceTableHeader().identifierReference()
-    val asSelectPlan = Option(ctx.query).map(plan).toSeq
-    withIdentClause(identifierContext, asSelectPlan, (identifiers, otherPlans) => {
-      val namedConstraints =
-        constraints.map(c => c.withTableName(identifiers.last))
-      val tableSpec = UnresolvedTableSpec(properties, provider, options, location, comment,
-        collation, serdeInfo, external = false, namedConstraints)
-      val identifier = withOrigin(identifierContext) {
-        UnresolvedIdentifier(identifiers)
-      }
-      otherPlans.headOption match {
-        case Some(_) if columns.nonEmpty =>
+    val (writeDistributionMode, writeOrdering) =
+      writeSpecsFrom(ctx.createTableClauses(), partitioning)
+
+    Option(ctx.query).map(plan) match {
+      case Some(query) =>
+        // RTAS path: push the identifier placeholder into the `name` slot (see CTAS above).
+        if (columns.nonEmpty) {
           operationNotAllowed(
-            "Schema may not be specified in a Replace Table As Select (RTAS) statement",
-            ctx)
-
-        case Some(_) if partCols.nonEmpty =>
-          // non-reference partition columns are not allowed because schema can't be specified
+            "Schema may not be specified in a Replace Table As Select (RTAS) statement", ctx)
+        }
+        if (partCols.nonEmpty) {
           operationNotAllowed(
-            "Partition column types may not be specified in Replace Table As Select (RTAS)",
-            ctx)
-
-        case Some(query) =>
-          ReplaceTableAsSelect(identifier, partitioning, query, tableSpec,
-            writeOptions = Map.empty, orCreate = orCreate)
-
-        case _ =>
+            "Partition column types may not be specified in Replace Table As Select (RTAS)", ctx)
+        }
+        if (constraints.nonEmpty) {
+          operationNotAllowed(
+            "Constraints may not be specified in a Replace Table As Select (RTAS) statement", ctx)
+        }
+        val tableSpec = UnresolvedTableSpec(properties, provider, options, location, comment,
+          collation, serdeInfo, external = false, constraints = Nil)
+        val nameSlot = withIdentClause(identifierContext, identifiers =>
+          withOrigin(identifierContext) { UnresolvedIdentifier(identifiers) })
+        ReplaceTableAsSelect(nameSlot, partitioning, query, tableSpec,
+          writeOptions = Map.empty, orCreate = orCreate,
+          writeDistributionMode = writeDistributionMode, writeOrdering = writeOrdering)
+      case None =>
+        withIdentClause(identifierContext, identifiers => {
+          val namedConstraints =
+            constraints.map(c => c.withTableName(identifiers.last))
+          val tableSpec = UnresolvedTableSpec(properties, provider, options, location, comment,
+            collation, serdeInfo, external = false, namedConstraints)
+          val identifier = withOrigin(identifierContext) {
+            UnresolvedIdentifier(identifiers)
+          }
           // Note: table schema includes both the table columns list and the partition columns
           // with data type.
           val allColumns = columns ++ partCols
-          ReplaceTable(identifier, allColumns, partitioning, tableSpec, orCreate = orCreate)
-      }
-    })
+          ReplaceTable(identifier, allColumns, partitioning, tableSpec, orCreate = orCreate,
+            writeDistributionMode = writeDistributionMode, writeOrdering = writeOrdering)
+        })
+    }
   }
 
   /**
@@ -5503,13 +7080,10 @@ class AstBuilder extends DataTypeAstBuilder
     val columnNameParts = typedVisit[Seq[String]](ctx.colName)
     if (!conf.resolver(columnNameParts.last,
         getIdentifierText(ctx.colType().colName))) {
-      throw QueryParsingErrors.operationInHiveStyleCommandUnsupportedError("Renaming column",
-        "ALTER COLUMN", ctx, Some("please run RENAME COLUMN instead"))
+      throw QueryParsingErrors.changeColumnRenameUnsupportedError(ctx)
     }
     if (ctx.colType.NULL != null) {
-      throw QueryParsingErrors.operationInHiveStyleCommandUnsupportedError(
-        "NOT NULL", "ALTER COLUMN", ctx,
-        Some("please run ALTER COLUMN ... SET/DROP NOT NULL instead"))
+      throw QueryParsingErrors.changeColumnNotNullUnsupportedError(ctx)
     }
 
     AlterColumns(
@@ -5534,20 +7108,17 @@ class AstBuilder extends DataTypeAstBuilder
       ctx.columns.qualifiedColTypeWithPosition.asScala.map { colType =>
         val name = typedVisit[Seq[String]](colType.name)
         if (name.length > 1) {
-          throw QueryParsingErrors.operationInHiveStyleCommandUnsupportedError(
-            "Replacing with a nested column", "REPLACE COLUMNS", ctx)
+          throw QueryParsingErrors.replaceColumnsNestedColumnUnsupportedError(name, ctx)
         }
         var commentSpec: Option[CommentSpecContext] = None
         colType.colDefinitionDescriptorWithPosition.asScala.foreach { opt =>
           blockBang(opt.errorCapturingNot)
 
           if (opt.NULL != null) {
-            throw QueryParsingErrors.operationInHiveStyleCommandUnsupportedError(
-              "NOT NULL", "REPLACE COLUMNS", ctx)
+            throw QueryParsingErrors.replaceColumnsNotNullUnsupportedError(ctx)
           }
           if (opt.colPosition != null) {
-            throw QueryParsingErrors.operationInHiveStyleCommandUnsupportedError(
-              "Column position", "REPLACE COLUMNS", ctx)
+            throw QueryParsingErrors.replaceColumnsColumnPositionUnsupportedError(ctx)
           }
           if (Option(opt.defaultExpression()).map(visitDefaultExpression).isDefined) {
             throw QueryParsingErrors.defaultColumnNotImplementedYetError(ctx)
@@ -5649,6 +7220,26 @@ class AstBuilder extends DataTypeAstBuilder
         condition = condition)
     }
 
+  /**
+   * Whether a write that parses the condition of a CHECK constraint again can resolve it
+   * differently from the ALTER TABLE, so that the constraint keeps its predicate; see
+   * `CheckConstraint.withPredicateDecision`. A keyword such as `current_date` or `user` without
+   * parentheses parses as a name, or as the function under
+   * `spark.sql.ansi.enforceReservedKeywords`, which is the only way the parser builds these
+   * functions.
+   */
+  private def keepsCheckPredicate(condition: Expression): Boolean = {
+    val names = condition.collect {
+      case u: UnresolvedAttribute => u.nameParts
+      case v: UnresolvedNamedLambdaVariable => v.nameParts
+    }
+    condition.containsAnyPattern(PARAMETER, UNRESOLVED_IDENTIFIER) ||
+      names.exists(n => n.length > 1 || LiteralFunctionResolution.isLiteralFunction(n)) ||
+      condition.exists {
+        case _: CurrentDate | _: CurrentTimestamp | _: CurrentTime | _: CurrentUser => true
+        case _ => false
+      }
+  }
 
   override def visitUniqueConstraint(ctx: UniqueConstraintContext): TableConstraint =
     withOrigin(ctx) {
@@ -5711,7 +7302,8 @@ class AstBuilder extends DataTypeAstBuilder
           case c: CheckConstraint =>
             val relation = createUnresolvedRelation(ctx.identifierReference)
             val child = Filter(Not(c.child), relation)
-            AddCheckConstraint(child, c)
+            val check = if (keepsCheckPredicate(c.child)) c.copy(omitPredicate = Some(false)) else c
+            AddCheckConstraint(child, check)
           case _ =>
             val child = UnresolvedTable(identifiers, "ALTER TABLE ... ADD CONSTRAINT")
             AddConstraint(child, namedConstraint)
@@ -5847,9 +7439,9 @@ class AstBuilder extends DataTypeAstBuilder
             log"${MDC(PARTITION_SPECIFICATION, ctx.partitionSpec.getText)}")
       }
     }
-    if (ctx.identifier != null &&
-        ctx.identifier.getText.toLowerCase(Locale.ROOT) != "noscan") {
-      throw QueryParsingErrors.computeStatisticsNotExpectedError(ctx.identifier())
+    if (ctx.simpleIdentifier != null &&
+        ctx.simpleIdentifier.getText.toLowerCase(Locale.ROOT) != "noscan") {
+      throw QueryParsingErrors.computeStatisticsNotExpectedError(ctx.simpleIdentifier)
     }
 
     if (ctx.ALL() != null) {
@@ -5870,7 +7462,7 @@ class AstBuilder extends DataTypeAstBuilder
           "ANALYZE TABLE",
           allowTempView = false),
         partitionSpec,
-        noScan = ctx.identifier != null)
+        noScan = ctx.simpleIdentifier != null)
     } else {
       checkPartitionSpec()
       AnalyzeColumn(
@@ -5888,16 +7480,16 @@ class AstBuilder extends DataTypeAstBuilder
    * }}}
    */
   override def visitAnalyzeTables(ctx: AnalyzeTablesContext): LogicalPlan = withOrigin(ctx) {
-    if (ctx.identifier != null &&
-      ctx.identifier.getText.toLowerCase(Locale.ROOT) != "noscan") {
-      throw QueryParsingErrors.computeStatisticsNotExpectedError(ctx.identifier())
+    if (ctx.simpleIdentifier != null &&
+      ctx.simpleIdentifier.getText.toLowerCase(Locale.ROOT) != "noscan") {
+      throw QueryParsingErrors.computeStatisticsNotExpectedError(ctx.simpleIdentifier())
     }
     val ns = if (ctx.identifierReference() != null) {
       withIdentClause(ctx.identifierReference, UnresolvedNamespace(_))
     } else {
       CurrentNamespace
     }
-    AnalyzeTables(ns, noScan = ctx.identifier != null)
+    AnalyzeTables(ns, noScan = ctx.simpleIdentifier != null)
   }
 
   /**
@@ -5966,35 +7558,74 @@ class AstBuilder extends DataTypeAstBuilder
    * }}}
    */
   override def visitCacheTable(ctx: CacheTableContext): LogicalPlan = withOrigin(ctx) {
-    val query = Option(ctx.query).map(plan)
-    withIdentClause(ctx.identifierReference, query.toSeq, (ident, children) => {
-      if (query.isDefined && ident.length > 1) {
-        val catalogAndNamespace = ident.init
-        throw QueryParsingErrors.addCatalogInCacheTableAsSelectNotAllowedError(
-          catalogAndNamespace.quoted, ctx)
-      }
-      val options = Option(ctx.options).map(visitPropertyKeyValues).getOrElse(Map.empty)
-      val isLazy = ctx.LAZY != null
-      if (query.isDefined) {
+    val options = Option(ctx.options).map(visitPropertyKeyValues).getOrElse(Map.empty)
+    val isLazy = ctx.LAZY != null
+    Option(ctx.query).map(plan) match {
+      case Some(query) =>
         // Disallow parameter markers in the query of the cache.
         // We need this limitation because we store the original query text, pre substitution.
-        // To lift this we would need to reconstitute the query with parameter markers replaced with
-        // the values given at CACHE TABLE time, or we would need to store the parameter values
-        // alongside the text.
-        // The same rule can be found in CREATE VIEW builder.
-        checkInvalidParameter(query.get, "the query of CACHE TABLE")
-        CacheTableAsSelect(ident.head, children.head, source(ctx.query()), isLazy, options)
-      } else {
-        CacheTable(
-          createUnresolvedRelation(
-            ctx.identifierReference,
-            ident,
-            None,
-            writePrivileges = Nil,
-            isStreaming = false),
-          ident, isLazy, options)
+        // To lift this we would need to reconstitute the query with parameter markers replaced
+        // with the values given at CACHE TABLE time, or we would need to store the parameter
+        // values alongside the text. The same rule can be found in CREATE VIEW builder.
+        checkInvalidParameter(query, "the query of CACHE TABLE")
+        // `CacheTableAsSelect.tempViewName` is an `Expression` slot: a `Literal` for direct
+        // identifiers and `IDENTIFIER('literal-string')`, or an
+        // `ExpressionWithUnresolvedIdentifier` for `IDENTIFIER(<non-literal>)`. Building the name
+        // as an expression avoids the wrap-the-whole-command form (where the
+        // `PlanWithUnresolvedIdentifier` would wrap the entire `CacheTableAsSelect`), which is the
+        // last shape that motivated the `WithCTE(<command>, _)` workaround chain in SPARK-46625.
+        val nameExpr = buildCacheTableAsSelectName(ctx.identifierReference, ctx)
+        CacheTableAsSelect(nameExpr, query, source(ctx.query()), isLazy, options)
+      case None =>
+        withIdentClause(ctx.identifierReference, ident => {
+          CacheTable(
+            createUnresolvedRelation(
+              ctx.identifierReference,
+              ident,
+              None,
+              writePrivileges = Set.empty,
+              isStreaming = false),
+            ident, isLazy, options)
+        })
+    }
+  }
+
+  /**
+   * Build the `tempViewName` expression for a `CACHE TABLE ... AS SELECT` command from an
+   * `identifierReference` context.
+   *
+   * `CacheTableAsSelect` requires a single-part temp view name (no catalog/namespace). For direct
+   * identifiers and `IDENTIFIER('literal-string')` we validate this at parse time and produce a
+   * non-null string `Literal`. For `IDENTIFIER(<non-literal>)` we emit an
+   * `ExpressionWithUnresolvedIdentifier` whose builder validates the single-part invariant when
+   * the identifier expression is resolved.
+   */
+  private def buildCacheTableAsSelectName(
+      ctx: IdentifierReferenceContext,
+      parentCtx: CacheTableContext): Expression = {
+    // Use the outer `parentCtx` for the multi-part error so the query context points at the
+    // whole `CACHE TABLE ... AS ...` statement, not just the identifier reference. The caller
+    // (`visitCacheTable`) already has `withOrigin(parentCtx)` in scope.
+    def singlePart(parts: Seq[String]): String = {
+      if (parts.length > 1) {
+        throw QueryParsingErrors.addCatalogInCacheTableAsSelectNotAllowedError(
+          parts, parentCtx)
       }
-    })
+      parts.head
+    }
+    val exprCtx = ctx.expression
+    if (exprCtx != null) {
+      expression(exprCtx) match {
+        case Literal(value, _: StringType) if value != null =>
+          Literal(singlePart(parseMultipartIdentifier(value.toString)))
+        case expr =>
+          new ExpressionWithUnresolvedIdentifier(
+            withOrigin(exprCtx) { expr },
+            parts => Literal(singlePart(parts)))
+      }
+    } else {
+      Literal(singlePart(visitMultipartIdentifier(ctx.multipartIdentifier)))
+    }
   }
 
   /**
@@ -6318,23 +7949,14 @@ class AstBuilder extends DataTypeAstBuilder
           Seq(describeFuncName.getText)
         }
       DescribeFunction(
-        createUnresolvedFunctionName(
-          ctx.describeFuncName(),
-          functionName,
-          "DESCRIBE FUNCTION",
-          requirePersistent = false,
-          funcTypeMismatchHint = None),
+        createUnresolvedFunctionName(describeFuncName, functionName, "DESCRIBE FUNCTION"),
         EXTENDED != null)
     } else {
       DescribeFunction(
         withIdentClause(
           describeFuncName.identifierReference(),
-          createUnresolvedFunctionName(
-            describeFuncName.identifierReference,
-            _,
-            "DESCRIBE FUNCTION",
-            requirePersistent = false,
-            funcTypeMismatchHint = None)),
+          createUnresolvedFunctionName(describeFuncName.identifierReference, _, "DESCRIBE FUNCTION")
+        ),
         EXTENDED != null)
     }
   }
@@ -6376,15 +7998,9 @@ class AstBuilder extends DataTypeAstBuilder
   }
 
   override def visitRefreshFunction(ctx: RefreshFunctionContext): LogicalPlan = withOrigin(ctx) {
+    val identCtx = ctx.identifierReference
     RefreshFunction(
-      withIdentClause(
-        ctx.identifierReference,
-        createUnresolvedFunctionName(
-          ctx.identifierReference,
-          _,
-          "REFRESH FUNCTION",
-          requirePersistent = true,
-          funcTypeMismatchHint = None)))
+      withIdentClause(identCtx, createUnresolvedIdentifier(identCtx, _)))
   }
 
   override def visitCommentNamespace(ctx: CommentNamespaceContext): LogicalPlan = withOrigin(ctx) {
@@ -6395,6 +8011,54 @@ class AstBuilder extends DataTypeAstBuilder
   override def visitCommentTable(ctx: CommentTableContext): LogicalPlan = withOrigin(ctx) {
     val comment = visitComment(ctx.comment)
     CommentOnTable(createUnresolvedTable(ctx.identifierReference, "COMMENT ON TABLE"), comment)
+  }
+
+  override def visitCommentColumn(ctx: CommentColumnContext): LogicalPlan = withOrigin(ctx) {
+    // Each column comment is either a new comment value, or `IS NULL` which removes the existing
+    // comment. `IS NULL` and `IS ''` are distinguished here: the former yields None (removal), the
+    // latter Some("") (an empty comment). The `comment` grammar rule is `stringLit | NULL`, so a
+    // missing `stringLit()` means `IS NULL`.
+    def commentOf(c: CommentContext): Option[String] =
+      Option(c.stringLit()).map(s => string(visitStringLit(s)))
+
+    def alterColumnSpec(column: Seq[String], comment: Option[String]): AlterColumnSpec =
+      AlterColumnSpec(
+        UnresolvedFieldName(column),
+        newDataType = None,
+        newNullability = None,
+        newComment = comment,
+        newPosition = None,
+        newDefaultExpression = None,
+        dropComment = comment.isEmpty)
+
+    // Only tables are supported: downstream rules (ResolveFieldNameAndPosition, CheckAnalysis,
+    // DataSourceV2Strategy) all expect a ResolvedTable, so a view target must be rejected during
+    // resolution. UnresolvedTable resolves only to a table and reports EXPECT_TABLE_NOT_VIEW
+    // otherwise, matching COMMENT ON TABLE and ALTER TABLE ... ALTER COLUMN.
+    if (ctx.columnComment != null) {
+      // COMMENT ON COLUMN table.column IS 'comment'
+      val identifiers = visitMultipartIdentifier(ctx.columnComment.column)
+      if (identifiers.size < 2) {
+        throw new ParseException("INVALID_SQL_SYNTAX.COMMENT_ON_COLUMN_INCORRECT_IDENTIFIER", ctx)
+      }
+      val tableId = identifiers.dropRight(1)
+      val columnId = identifiers.takeRight(1)
+      val spec = alterColumnSpec(columnId, commentOf(ctx.columnComment.comment))
+      AlterColumns(
+        UnresolvedTable(tableId, "COMMENT ON COLUMN"), Seq(spec), fromCommentOn = true)
+    } else {
+      // COMMENT ON TABLE table COLUMN (column1 IS 'comment1', column2 IS 'comment2', ...)
+      // The table target is an identifierReference, so it also supports IDENTIFIER(...) clauses.
+      val specs = ctx.columns.columnComment.asScala.map { c =>
+        alterColumnSpec(visitMultipartIdentifier(c.column), commentOf(c.comment))
+      }.toSeq
+      withIdentClause(
+        ctx.identifierReference,
+        tableId =>
+          AlterColumns(
+            UnresolvedTable(tableId, "COMMENT ON TABLE ... COLUMN"), specs,
+            fromCommentOn = true))
+    }
   }
 
   override def visitComment (ctx: CommentContext): String = {
@@ -6443,7 +8107,7 @@ class AstBuilder extends DataTypeAstBuilder
    * }}}
    */
   override def visitDropIndex(ctx: DropIndexContext): LogicalPlan = withOrigin(ctx) {
-    val indexName = ctx.identifier.getText
+    val indexName = getIdentifierText(ctx.identifier)
     DropIndex(
       createUnresolvedTable(ctx.identifierReference, "DROP INDEX"),
       indexName,
@@ -6548,11 +8212,13 @@ class AstBuilder extends DataTypeAstBuilder
       dataTypeOpt.map { dt => default.copy(child = Cast(default.child, dt)) }.getOrElse(default)
     }
     CreateVariable(
-      ctx.identifierReferences.asScala.map (
-        identifierReference => {
-          withIdentClause(identifierReference, UnresolvedIdentifier(_))
-        }
-      ).toSeq,
+      ctx.identifierReferences.asScala.map { identifierReference =>
+        // Give each `UnresolvedIdentifier` its own origin pointing at the variable name
+        // fragment so analyzer-time errors (e.g. UNRESOLVED_VARIABLE) can highlight just
+        // that identifier rather than the whole `DECLARE ...` statement.
+        withIdentClause(identifierReference, parts =>
+          withOrigin(identifierReference) { UnresolvedIdentifier(parts) })
+      }.toSeq,
       defaultExpression,
       ctx.REPLACE() != null
     )
@@ -6568,9 +8234,122 @@ class AstBuilder extends DataTypeAstBuilder
    */
   override def visitDropVariable(ctx: DropVariableContext): LogicalPlan = withOrigin(ctx) {
     DropVariable(
-      withIdentClause(ctx.identifierReference(), UnresolvedIdentifier(_)),
+      withIdentClause(ctx.identifierReference(), parts =>
+        withOrigin(ctx.identifierReference()) { UnresolvedIdentifier(parts) }),
       ctx.EXISTS() != null
     )
+  }
+
+  /**
+   * Create a [[DeclareCursor]] command wrapped in SingleStatement.
+   *
+   * For example:
+   * {{{
+   *   DECLARE cursor_name CURSOR FOR SELECT * FROM table;
+   * }}}
+   */
+  override def visitDeclareCursorStatement(
+      ctx: DeclareCursorStatementContext): LogicalPlan = withOrigin(ctx) {
+    if (!conf.getConf(SQLConf.SQL_SCRIPTING_CURSOR_ENABLED)) {
+      throw SqlScriptingErrors.cursorNotSupported(CurrentOrigin.get)
+    }
+
+    val cursorName = getIdentifierText(ctx.name)
+    // Extract original SQL text to preserve parameter markers
+    val queryText = getOriginalText(ctx.query())
+
+    val asensitive = ctx.INSENSITIVE() == null
+    DeclareCursor(cursorName, queryText, asensitive)
+  }
+
+  /**
+   * Helper method to create an UnresolvedCursor with validation.
+   * Validates that cursor references have at most one qualifier (label.cursor).
+   *
+   * @param nameParts The cursor name parts from multipartIdentifier
+   * @return UnresolvedCursor instance
+   * @throws ParseException if more than two name parts are provided
+   */
+  private def createUnresolvedCursor(nameParts: Seq[String]): UnresolvedCursor = {
+    if (nameParts.length > 2) {
+      throw QueryParsingErrors.cursorInvalidQualifierError(nameParts.mkString("."))
+    }
+    UnresolvedCursor(nameParts)
+  }
+
+  /**
+   * Create an [[OpenCursor]] command.
+   *
+   * For example:
+   * {{{
+   *   OPEN cursor_name;
+   *   OPEN cursor_name USING expr1, expr2;
+   *   OPEN cursor_name USING (expr1 AS param1, expr2 AS param2);
+   * }}}
+   */
+  override def visitOpenCursorStatement(
+      ctx: OpenCursorStatementContext): LogicalPlan = withOrigin(ctx) {
+    if (!conf.getConf(SQLConf.SQL_SCRIPTING_CURSOR_ENABLED)) {
+      throw SqlScriptingErrors.cursorNotSupported(CurrentOrigin.get)
+    }
+
+    // Create UnresolvedCursor from the cursor name
+    val nameParts = visitMultipartIdentifier(ctx.multipartIdentifier())
+    val cursor = createUnresolvedCursor(nameParts)
+
+    // Parse optional USING clause parameters
+    // Extract names from Alias nodes at parse time since Alias nodes may not survive analysis.
+    // The shared ParameterBindingUtils will use these pre-extracted names at execution time.
+    val (args, paramNames) = Option(ctx.params).map { params =>
+      params.namedExpression().asScala.toSeq.map(visitNamedExpression).map {
+        case alias: Alias => (alias.child, alias.name)
+        case expr => (expr, "")
+      }.unzip
+    }.getOrElse((Seq.empty, Seq.empty))
+
+    OpenCursor(cursor, args, paramNames)
+  }
+
+  /**
+   * Create a [[FetchCursor]] command.
+   *
+   * For example:
+   * {{{
+   *   FETCH cursor_name INTO var1, var2;
+   * }}}
+   */
+  override def visitFetchCursorStatement(
+      ctx: FetchCursorStatementContext): LogicalPlan = withOrigin(ctx) {
+    if (!conf.getConf(SQLConf.SQL_SCRIPTING_CURSOR_ENABLED)) {
+      throw SqlScriptingErrors.cursorNotSupported(CurrentOrigin.get)
+    }
+
+    // Create UnresolvedCursor from the cursor name
+    val nameParts = visitMultipartIdentifier(ctx.cursorName)
+    val cursor = createUnresolvedCursor(nameParts)
+
+    val targetVariables = visitMultipartIdentifierList(ctx.targets)
+    FetchCursor(cursor, targetVariables)
+  }
+
+  /**
+   * Create a [[CloseCursor]] command.
+   *
+   * For example:
+   * {{{
+   *   CLOSE cursor_name;
+   * }}}
+   */
+  override def visitCloseCursorStatement(
+      ctx: CloseCursorStatementContext): LogicalPlan = withOrigin(ctx) {
+    if (!conf.getConf(SQLConf.SQL_SCRIPTING_CURSOR_ENABLED)) {
+      throw SqlScriptingErrors.cursorNotSupported(CurrentOrigin.get)
+    }
+
+    // Create UnresolvedCursor from the cursor name
+    val nameParts = visitMultipartIdentifier(ctx.multipartIdentifier())
+    val cursor = createUnresolvedCursor(nameParts)
+    CloseCursor(cursor)
   }
 
   private def visitSetVariableImpl(
@@ -6581,7 +8360,7 @@ class AstBuilder extends DataTypeAstBuilder
       // The SET variable source is a query
       val variables = multipartIdentifierList.multipartIdentifier.asScala.map { variableIdent =>
         val varName = visitMultipartIdentifier(variableIdent)
-        UnresolvedAttribute(varName)
+        withOrigin(variableIdent) { UnresolvedAttribute(varName) }
       }.toSeq
       SetVariable(variables, visitQuery(query))
     } else {
@@ -6593,7 +8372,7 @@ class AstBuilder extends DataTypeAstBuilder
           case n: NamedExpression => n
           case e => Alias(e, varIdent.last)()
         }
-        (UnresolvedAttribute(varIdent), varNamedExpr)
+        (withOrigin(assign.key) { UnresolvedAttribute(varIdent) }, varNamedExpr)
       }.toSeq.unzip
       SetVariable(variables, Project(values, OneRowRelation()))
     }
@@ -6636,6 +8415,7 @@ class AstBuilder extends DataTypeAstBuilder
         aggregationClause = ctx.aggregationClause,
         havingClause = null,
         windowClause = ctx.windowClause,
+        qualifyClause = null,
         relation = left,
         isPipeOperatorSelect = true)
     }.getOrElse(Option(ctx.EXTEND).map { _ =>
@@ -6649,6 +8429,11 @@ class AstBuilder extends DataTypeAstBuilder
               a.copy(
                 child = PipeExpression(a.child, isAggregate = false, PipeOperators.extendClause))(
                 a.exprId, a.qualifier, a.explicitMetadata, a.nonInheritableMetadataKeys)
+            case (m: MultiAlias, _) =>
+              CurrentOrigin.withOrigin(m.origin) {
+                m.copy(
+                  child = PipeExpression(m.child, isAggregate = false, PipeOperators.extendClause))
+              }
             case (e: Expression, aliasFunc) =>
               UnresolvedAlias(
                 PipeExpression(e, isAggregate = false, PipeOperators.extendClause), aliasFunc)
@@ -6656,16 +8441,17 @@ class AstBuilder extends DataTypeAstBuilder
         }.get
       val projectList: Seq[NamedExpression] = Seq(UnresolvedStar(None)) ++ extendExpressions
       Project(projectList, left)
-    }.getOrElse(Option(ctx.SET).map { _ =>
-      visitOperatorPipeSet(ctx, left)
+    }.getOrElse(Option(ctx.SET).orElse(Option(ctx.EVAL)).map { _ =>
+      visitOperatorPipeSetOrEval(ctx, left, appendMissingColumns = ctx.EVAL != null)
     }.getOrElse(Option(ctx.DROP).map { _ =>
-      val ids: Seq[String] = visitIdentifierSeq(ctx.identifierSeq())
+      val ids: Seq[Seq[String]] = ctx.multipartIdentifierList().multipartIdentifier.asScala
+        .toSeq.map(visitMultipartIdentifier)
       val projectList: Seq[NamedExpression] =
         Seq(UnresolvedStarExceptOrReplace(
-          target = None, excepts = ids.map(s => Seq(s)), replacements = None))
+          target = None, excepts = ids, replacements = None))
       Project(projectList, left)
     }.getOrElse(Option(ctx.AS).map { _ =>
-      SubqueryAlias(ctx.errorCapturingIdentifier().getText, left)
+      SubqueryAlias(getIdentifierText(ctx.errorCapturingIdentifier()), left)
     }.getOrElse(Option(ctx.whereClause).map { c =>
       if (ctx.windowClause() != null) {
         throw QueryParsingErrors.windowClauseInPipeOperatorWhereClauseNotAllowedError(ctx)
@@ -6681,6 +8467,10 @@ class AstBuilder extends DataTypeAstBuilder
         throw QueryParsingErrors.unpivotWithPivotInFromClauseNotAllowedError(ctx)
       }
       withUnpivot(c, left)
+    }.getOrElse(Option(ctx.binByClause()).map { c =>
+      withBinBy(c, left)
+    }.getOrElse(Option(ctx.gapFillClause()).map { c =>
+      withGapFill(c, left)
     }.getOrElse(Option(ctx.sample).map { c =>
       withSample(c, left)
     }.getOrElse(Option(ctx.joinRelation()).map { c =>
@@ -6692,30 +8482,43 @@ class AstBuilder extends DataTypeAstBuilder
       withQueryResultClauses(c, PipeOperator(left), forPipeOperators = true)
     }.getOrElse(
       visitOperatorPipeAggregate(ctx, left)
-    ))))))))))))
+    ))))))))))))))
   }
 
-  private def visitOperatorPipeSet(
-      ctx: OperatorPipeRightSideContext, left: LogicalPlan): LogicalPlan = {
+  /**
+   * Builds the pipe operator SET, or EVAL if `appendMissingColumns`. Both replace an assigned
+   * column that exists in place. EVAL appends a column that does not exist, as EXTEND would, where
+   * SET fails.
+   */
+  private def visitOperatorPipeSetOrEval(
+      ctx: OperatorPipeRightSideContext,
+      left: LogicalPlan,
+      appendMissingColumns: Boolean): LogicalPlan = {
+    val clause = if (appendMissingColumns) PipeOperators.evalClause else PipeOperators.setClause
+    val assignments = ctx.operatorPipeSetAssignmentSeq()
+    withOrigin(assignments) {
+      if (!assignments.DOT.isEmpty) {
+        operationNotAllowed(
+          s"SQL pipe syntax |> $clause operator with multi-part assignment key " +
+            s"(only single-part keys are allowed)", assignments)
+      }
+    }
     val (setIdentifiers: Seq[String], setTargets: Seq[Expression]) =
-      visitOperatorPipeSetAssignmentSeq(ctx.operatorPipeSetAssignmentSeq())
+      visitOperatorPipeSetAssignmentSeq(assignments)
     var plan = left
     setIdentifiers.zip(setTargets).foreach {
-      case (_, _: Alias) =>
-        operationNotAllowed(
-          "SQL pipe syntax |> SET operator with an alias assigned with [AS] aliasName", ctx)
       case (ident, target) =>
-        // Add an UnresolvedStarExceptOrReplace to exclude the SET expression name from the relation
-        // and add the new SET expression to the projection list.
-        // Use a PipeSelect expression to make sure it does not contain any aggregate functions.
-        val replacement =
-          Alias(PipeExpression(target, isAggregate = false, PipeOperators.setClause), ident)()
+        // Add an UnresolvedStarExceptOrReplace to exclude the assigned column from the relation
+        // and add the new expression to the projection list.
+        // Use a PipeExpression to make sure it does not contain any aggregate functions.
+        val replacement = Alias(PipeExpression(target, isAggregate = false, clause), ident)()
         val projectList: Seq[NamedExpression] =
           Seq(UnresolvedStarExceptOrReplace(
-            target = None, excepts = Seq(Seq(ident)), replacements = Some(Seq(replacement))))
-        // Add a projection to implement the SET operator using the UnresolvedStarExceptOrReplace
-        // expression. We do this once per SET assignment to allow for multiple SET assignments with
-        // optional lateral references to previous ones.
+            target = None, excepts = Seq(Seq(ident)), replacements = Some(Seq(replacement)),
+            appendMissingReplacements = appendMissingColumns))
+        // Add a projection using the UnresolvedStarExceptOrReplace expression. We do this once per
+        // assignment to allow for multiple assignments with optional lateral references to
+        // previous ones.
         plan = Project(projectList, plan)
     }
     plan
@@ -6724,12 +8527,8 @@ class AstBuilder extends DataTypeAstBuilder
   override def visitOperatorPipeSetAssignmentSeq(
       ctx: OperatorPipeSetAssignmentSeqContext): (Seq[String], Seq[Expression]) = {
     withOrigin(ctx) {
-      if (!ctx.DOT.isEmpty) {
-        operationNotAllowed(
-          s"SQL pipe syntax |> SET operator with multi-part assignment key " +
-            s"(only single-part keys are allowed)", ctx)
-      }
-      val setIdentifiers: Seq[String] = ctx.errorCapturingIdentifier().asScala.map(_.getText).toSeq
+      val setIdentifiers: Seq[String] =
+        ctx.errorCapturingIdentifier().asScala.map(getIdentifierText).toSeq
       val setTargets: Seq[Expression] = ctx.expression().asScala.map(typedVisit[Expression]).toSeq
       (setIdentifiers, setTargets)
     }
@@ -6752,6 +8551,11 @@ class AstBuilder extends DataTypeAstBuilder
             a.copy(child =
               PipeExpression(a.child, isAggregate = true, PipeOperators.aggregateClause))(
               a.exprId, a.qualifier, a.explicitMetadata, a.nonInheritableMetadataKeys)
+          case (m: MultiAlias, _) =>
+            CurrentOrigin.withOrigin(m.origin) {
+              m.copy(
+                child = PipeExpression(m.child, isAggregate = true, PipeOperators.aggregateClause))
+            }
           case (e: Expression, aliasFunc) =>
             UnresolvedAlias(
               PipeExpression(e, isAggregate = true, PipeOperators.aggregateClause), aliasFunc)
@@ -6769,6 +8573,17 @@ class AstBuilder extends DataTypeAstBuilder
             case Seq(key: UnresolvedAttribute) if key.equalsIgnoreCase("ALL") =>
               error("GROUP BY ALL")
             case _ =>
+          }
+          // With `spark.sql.groupByOrdinal` enabled, an integer literal is a GROUP BY ordinal, so
+          // an alias on it is ambiguous with grouping by the constant. Point the error at the
+          // aliased grouping expression rather than the whole clause.
+          if (conf.groupByOrdinal &&
+              !conf.getConf(SQLConf.LEGACY_ALLOW_ALIASED_PIPE_AGGREGATE_ORDINALS)) {
+            a.groupingExpressions.foreach {
+              case alias @ Alias(Literal(_: Int, IntegerType), _) =>
+                CurrentOrigin.withOrigin(alias.origin) { error("aliases on GROUP BY ordinals") }
+              case _ =>
+            }
           }
           def visit(e: Expression): Unit = {
             e match {
@@ -6800,9 +8615,12 @@ class AstBuilder extends DataTypeAstBuilder
             // grouping and aggregate expressions, respectively. This will let the
             // [[ResolveOrdinalInOrderByAndGroupBy]] rule detect the ordinal in the aggregate list
             // and replace it with the corresponding attribute from the child operator.
-            case UnresolvedOrdinal(v: Int) =>
+            case ordinal @ UnresolvedOrdinal(v: Int) =>
               newGroupingExpressions += UnresolvedOrdinal(newAggregateExpressions.length + 1)
-              newAggregateExpressions += UnresolvedAlias(UnresolvedPipeAggregateOrdinal(v), None)
+              // Preserve the ordinal's origin so an out-of-range error points at the position
+              // itself, not the whole pipe statement (matching regular GROUP BY).
+              newAggregateExpressions +=
+                CurrentOrigin.withOrigin(ordinal.origin) { UnresolvedPipeAggregateOrdinal(v) }
             case e: Expression =>
               newGroupingExpressions += e
               newAggregateExpressions += UnresolvedAlias(e, None)
@@ -6892,3 +8710,20 @@ class AstBuilder extends DataTypeAstBuilder
     }
   }
 }
+
+/**
+ * Parameters parsed from an AUTO CDC clause.
+ */
+case class AutoCdcParams(
+    source: LogicalPlan,
+    keys: Seq[UnresolvedAttribute],
+    deleteCondition: Option[Expression],
+    sequencing: Expression,
+    includeColumns: Option[Seq[UnresolvedAttribute]],
+    excludeColumns: Option[Seq[UnresolvedAttribute]],
+    storedAsScdType: Int,
+    trackHistoryColumns: Option[Seq[UnresolvedAttribute]],
+    trackHistoryExceptColumns: Option[Seq[UnresolvedAttribute]],
+    ignoreNullUpdates: Boolean,
+    ignoreNullUpdatesColumns: Option[Seq[UnresolvedAttribute]],
+    ignoreNullUpdatesExceptColumns: Option[Seq[UnresolvedAttribute]])

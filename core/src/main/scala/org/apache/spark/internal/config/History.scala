@@ -28,9 +28,20 @@ private[spark] object History {
 
   val HISTORY_LOG_DIR = ConfigBuilder("spark.history.fs.logDirectory")
     .version("1.1.0")
-    .doc("Directory where app logs are stored")
+    .doc("Directory where app logs are stored. Multiple directories can be specified " +
+      "as a comma-separated list to monitor event logs from multiple paths.")
     .stringConf
+    .checkValue(v => v.split(",").map(_.trim).exists(_.nonEmpty),
+      "must specify at least one non-empty directory")
     .createWithDefault(DEFAULT_LOG_DIR)
+
+  val HISTORY_LOG_DIR_NAMES = ConfigBuilder("spark.history.fs.logDirectory.names")
+    .version("4.2.0")
+    .doc("Optional comma-separated list of display names for the log directories specified " +
+      "in spark.history.fs.logDirectory. Names correspond to directories by position. " +
+      "If not set, the full path is shown in the UI.")
+    .stringConf
+    .createOptional
 
   val SAFEMODE_CHECK_INTERVAL_S = ConfigBuilder("spark.history.fs.safemodeCheck.interval")
     .version("1.6.0")
@@ -53,6 +64,22 @@ private[spark] object History {
     .intConf
     .checkValue(v => v > 0, "The update batchSize should be a positive integer.")
     .createWithDefault(Int.MaxValue)
+
+  val SCAN_DISABLED_PATH_PATTERNS =
+    ConfigBuilder("spark.history.fs.update.scanDisabledPathPatterns")
+      .doc("Comma-separated list of regular expressions matched against log directory " +
+        "paths. Directories whose full path matches any pattern will not be scanned " +
+        "periodically. Applications in these directories rely on on-demand loading " +
+        "instead of scanning and will not appear in the listing until accessed by appId. " +
+        "When accessed, accurate metadata is populated immediately. Logs that are never " +
+        "accessed are not subject to the cleaner; use external lifecycle management " +
+        "(e.g., S3 Lifecycle Policies) for those. " +
+        "Example: \"s3a://.*,gs://.*\" disables scanning for all S3 and GCS directories.")
+      .version("4.2.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .stringConf
+      .toSequence
+      .createWithDefault(Nil)
 
   val CLEANER_ENABLED = ConfigBuilder("spark.history.fs.cleaner.enabled")
     .version("1.4.0")
@@ -138,6 +165,29 @@ private[spark] object History {
       .bytesConf(ByteUnit.BYTE)
       .createWithDefaultString("1m")
 
+  val EVENT_LOG_MAX_LINE_LENGTH_LIMIT: Int = 512 * 1024 * 1024
+
+  val EVENT_LOG_MAX_LINE_LENGTH =
+    ConfigBuilder("spark.history.fs.eventLog.maxLineLength")
+      .doc("Maximum UTF-8 byte length of a single event log line during replay, excluding " +
+        "the line ending. Longer lines are skipped with a warning, bounding the " +
+        "memory replay can use when an event log is corrupt or unexpectedly large. Buffer " +
+        "growth, UTF-16 storage and JSON parsing can require several times this limit in heap " +
+        "space. Buffer capacity grows in steps: reducing 256m to 200m or 150m may not reduce " +
+        "the retained buffer; use 128m to reach a smaller capacity. Values at or below 0, " +
+        s"or above $EVENT_LOG_MAX_LINE_LENGTH_LIMIT, use the maximum supported limit of " +
+        s"$EVENT_LOG_MAX_LINE_LENGTH_LIMIT bytes (512 MiB). This cap avoids JVM array-size " +
+        "limits but does not guarantee sufficient heap space. If a longer line is in the " +
+        "event log files to compact, compaction of the rolling event log files of that " +
+        "application is skipped until the limit is increased and a new event log file is " +
+        "rolled. " +
+        "Introduced in 4.3.0; also available in 3.5.10, 4.0.5, 4.1.4 and 4.2.1; and in " +
+        "all versions after 4.3.0.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefaultString("256m")
+
   private[spark] val EVENT_LOG_ROLLING_MAX_FILES_TO_RETAIN =
     ConfigBuilder("spark.history.fs.eventLog.rolling.maxFilesToRetain")
       .doc("The maximum number of event log files which will be retained as non-compacted. " +
@@ -163,6 +213,14 @@ private[spark] object History {
     ConfigBuilder("spark.history.fs.eventLog.rolling.onDemandLoadEnabled")
       .doc("Whether to look up rolling event log locations on demand manner before listing files.")
       .version("4.1.0")
+      .booleanConf
+      .createWithDefault(true)
+
+  val EVENT_LOG_SINGLE_ON_DEMAND_LOAD_ENABLED =
+    ConfigBuilder("spark.history.fs.eventLog.onDemandLoadEnabled")
+      .doc("Whether to look up single event log locations on demand manner before listing files.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
       .createWithDefault(true)
 

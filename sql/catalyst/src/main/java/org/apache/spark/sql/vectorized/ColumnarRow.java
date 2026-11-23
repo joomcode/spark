@@ -16,17 +16,20 @@
  */
 package org.apache.spark.sql.vectorized;
 
+import java.util.Map;
+
 import org.apache.spark.SparkUnsupportedOperationException;
 import org.apache.spark.annotation.Evolving;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
+import org.apache.spark.sql.catalyst.expressions.SpecializedGettersReader;
 import org.apache.spark.sql.catalyst.types.*;
 import org.apache.spark.sql.types.*;
 import org.apache.spark.unsafe.types.CalendarInterval;
+import org.apache.spark.unsafe.types.TimestampNanosVal;
 import org.apache.spark.unsafe.types.UTF8String;
 import org.apache.spark.unsafe.types.VariantVal;
-import org.apache.spark.unsafe.types.GeographyVal;
-import org.apache.spark.unsafe.types.GeometryVal;
+import org.apache.spark.unsafe.types.BinaryView;
 
 /**
  * Row abstraction in {@link ColumnVector}.
@@ -40,10 +43,18 @@ public final class ColumnarRow extends InternalRow {
   private final int numFields;
 
   public ColumnarRow(ColumnVector data, int rowId) {
-    assert (data.dataType() instanceof StructType);
     this.data = data;
     this.rowId = rowId;
-    this.numFields = ((StructType) data.dataType()).size();
+    DataType dt = data.dataType();
+    if (dt instanceof StructType) {
+      this.numFields = ((StructType) dt).size();
+    } else {
+      // Struct-backed framework types map to PhysicalStructType but are not StructType.
+      PhysicalDataType pdt = PhysicalDataType.apply(dt);
+      assert pdt instanceof PhysicalStructType :
+        "ColumnarRow requires a struct-backed type, got: " + dt;
+      this.numFields = ((PhysicalStructType) pdt).fields().length;
+    }
   }
 
   @Override
@@ -79,10 +90,8 @@ public final class ColumnarRow extends InternalRow {
           row.update(i, getUTF8String(i).copy());
         } else if (pdt instanceof PhysicalBinaryType) {
           row.update(i, getBinary(i));
-        } else if (pdt instanceof PhysicalGeographyType) {
-          row.update(i, getGeography(i));
-        } else if (pdt instanceof PhysicalGeometryType) {
-          row.update(i, getGeometry(i));
+        } else if (pdt instanceof PhysicalBinaryViewType) {
+          row.update(i, getBinaryView(i).copy());
         } else if (pdt instanceof PhysicalDecimalType t) {
           row.setDecimal(i, getDecimal(i, t.precision(), t.scale()), t.precision());
         } else if (pdt instanceof PhysicalStructType t) {
@@ -93,6 +102,11 @@ public final class ColumnarRow extends InternalRow {
           row.update(i, getMap(i).copy());
         } else if (pdt instanceof PhysicalVariantType) {
           row.update(i, getVariant(i));
+        } else if (pdt instanceof PhysicalTimestampNTZNanosType) {
+          // TimestampNanosVal is immutable, so it can be shared without copying.
+          row.update(i, getTimestampNTZNanos(i));
+        } else if (pdt instanceof PhysicalTimestampLTZNanosType) {
+          row.update(i, getTimestampLTZNanos(i));
         } else {
           throw new RuntimeException("Not implemented. " + dt);
         }
@@ -146,18 +160,23 @@ public final class ColumnarRow extends InternalRow {
   }
 
   @Override
-  public GeographyVal getGeography(int ordinal) {
-    return data.getChild(ordinal).getGeography(rowId);
-  }
-
-  @Override
-  public GeometryVal getGeometry(int ordinal) {
-    return data.getChild(ordinal).getGeometry(rowId);
+  public BinaryView getBinaryView(int ordinal) {
+    return data.getChild(ordinal).getBinaryView(rowId);
   }
 
   @Override
   public CalendarInterval getInterval(int ordinal) {
     return data.getChild(ordinal).getInterval(rowId);
+  }
+
+  @Override
+  public TimestampNanosVal getTimestampNTZNanos(int ordinal) {
+    return data.getChild(ordinal).getTimestampNTZNanos(rowId);
+  }
+
+  @Override
+  public TimestampNanosVal getTimestampLTZNanos(int ordinal) {
+    return data.getChild(ordinal).getTimestampLTZNanos(rowId);
   }
 
   @Override
@@ -209,6 +228,10 @@ public final class ColumnarRow extends InternalRow {
       return getLong(ordinal);
     } else if (dataType instanceof TimestampNTZType) {
       return getLong(ordinal);
+    } else if (dataType instanceof TimestampNTZNanosType) {
+      return getTimestampNTZNanos(ordinal);
+    } else if (dataType instanceof TimestampLTZNanosType) {
+      return getTimestampLTZNanos(ordinal);
     } else if (dataType instanceof ArrayType) {
       return getArray(ordinal);
     } else if (dataType instanceof StructType) {
@@ -217,8 +240,19 @@ public final class ColumnarRow extends InternalRow {
       return getMap(ordinal);
     } else if (dataType instanceof VariantType) {
       return getVariant(ordinal);
+    } else if (dataType instanceof UserDefinedType<?> udt) {
+      return get(ordinal, udt.sqlType());
     } else {
-      throw new SparkUnsupportedOperationException("_LEGACY_ERROR_TEMP_3155");
+      // Read any other type that has a physical type through it: framework types (e.g. a
+      // struct-backed type as PhysicalStructType), and types not matched above, such as TIME,
+      // CalendarIntervalType, GeometryType and GeographyType. Types without a physical type,
+      // and NullType, keep the error.
+      PhysicalDataType pdt = PhysicalDataType.apply(dataType);
+      if (pdt != UninitializedPhysicalType$.MODULE$ && pdt != PhysicalNullType$.MODULE$) {
+        return SpecializedGettersReader.read(this, ordinal, dataType, false, false);
+      }
+      throw new SparkUnsupportedOperationException(
+        "_LEGACY_ERROR_TEMP_3155", Map.of("dataType", String.valueOf(dataType)));
     }
   }
 

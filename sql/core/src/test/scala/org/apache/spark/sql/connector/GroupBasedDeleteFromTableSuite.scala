@@ -18,9 +18,12 @@
 package org.apache.spark.sql.connector
 
 import org.apache.spark.sql.{AnalysisException, Row}
+import org.apache.spark.sql.catalyst.expressions.InSubquery
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.tags.DataSourceV2Test
 
+@DataSourceV2Test
 class GroupBasedDeleteFromTableSuite extends DeleteFromTableSuiteBase {
 
   import testImplicits._
@@ -46,6 +49,34 @@ class GroupBasedDeleteFromTableSuite extends DeleteFromTableSuiteBase {
     checkLastWriteLog(
       writeWithMetadataLogEntry(metadata = Row("hr", 1), data = Row(3, 3, "hr")),
       writeWithMetadataLogEntry(metadata = Row("hr", 2), data = Row(4, 4, "hr")))
+    checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 2)
+  }
+
+  test("SPARK-60667: delete with type coercion preserves metadata columns for " +
+    "carried-over records") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |{ "pk": 3, "id": 3, "dep": "hr" }
+        |{ "pk": 4, "id": 4, "dep": "hr" }
+        |""".stripMargin)
+
+    // the condition references a metadata column and needs type coercion (`id < 1.5`),
+    // so the DELETE is resolved only in a later iteration of the analyzer
+    sql(s"DELETE FROM $tableNameAsString WHERE _partition = 'hr' AND id < 1.5")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(2, 2, "software") :: Row(3, 3, "hr") :: Row(4, 4, "hr") :: Nil)
+
+    checkLastWriteInfo(
+      expectedRowSchema = table.schema,
+      expectedMetadataSchema = Some(StructType(Array(PARTITION_FIELD, INDEX_FIELD))))
+
+    checkLastWriteLog(
+      writeWithMetadataLogEntry(metadata = Row("hr", 1), data = Row(3, 3, "hr")),
+      writeWithMetadataLogEntry(metadata = Row("hr", 2), data = Row(4, 4, "hr")))
+    checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 2)
   }
 
   test("delete with nondeterministic conditions") {
@@ -85,6 +116,49 @@ class GroupBasedDeleteFromTableSuite extends DeleteFromTableSuiteBase {
       Row(2, 150, "software") :: Row(3, 120, "hr") :: Nil)
 
     checkReplacedPartitions(Seq("hr"))
+    checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+  }
+
+  test("SPARK-61480: delete with a CHAR column stored without padding") {
+    createTable("pk INT NOT NULL, c CHAR(3), dep STRING")
+    // read-side padding also covers values that are not padded in the storage
+    withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") {
+      append("pk INT NOT NULL, c STRING, dep STRING",
+        """{ "pk": 1, "c": "a", "dep": "hr" }
+          |{ "pk": 2, "c": "b", "dep": "software" }
+          |{ "pk": 3, "c": "x", "dep": "hr" }
+          |{ "pk": 4, "c": "y", "dep": "finance" }
+          |""".stripMargin)
+    }
+
+    // the runtime group filter must compare the padded values as the condition does
+    sql(s"DELETE FROM $tableNameAsString WHERE c IN ('a', 'b', 'c')")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(3, "x  ", "hr") :: Row(4, "y  ", "finance") :: Nil)
+    checkReplacedPartitions(Seq("hr", "software"))
+  }
+
+  test("SPARK-61480: delete with a CHAR partition column stored without padding") {
+    createTable("pk INT NOT NULL, dep CHAR(8)")
+    withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") {
+      append("pk INT NOT NULL, dep STRING",
+        """{ "pk": 1, "dep": "hr" }
+          |{ "pk": 2, "dep": "software" }
+          |{ "pk": 3, "dep": "hr" }
+          |{ "pk": 4, "dep": "finance" }
+          |""".stripMargin)
+    }
+
+    // a filter on the partition column that compares the stored values with the padded literals,
+    // in the group filter or in the scan, would skip the group of the rows to delete
+    sql(s"DELETE FROM $tableNameAsString WHERE dep IN ('hr', 'it')")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(2, "software") :: Row(4, "finance ") :: Nil)
+    checkReplacedPartitions(Seq("hr"))
   }
 
   test("delete with subqueries and runtime group filtering") {
@@ -115,6 +189,28 @@ class GroupBasedDeleteFromTableSuite extends DeleteFromTableSuiteBase {
       checkAnswer(
         sql(s"SELECT * FROM $tableNameAsString"),
         Row(1, 300, "hr") :: Row(3, 120, "hr") :: Row(4, 150, "software") :: Nil)
+
+      checkReplacedPartitions(Seq("software"))
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+    }
+  }
+
+  test("SPARK-60878: delete with a NOT EXISTS subquery on the group key") {
+    withTempView("kept_dep") {
+      createAndInitTable("id INT, salary INT, dep STRING",
+        """{ "id": 1, "salary": 300, "dep": 'hr' }
+          |{ "id": 2, "salary": 150, "dep": 'software' }
+          |{ "id": 3, "salary": 120, "dep": 'hr' }
+          |""".stripMargin)
+
+      Seq("hr").toDF("d").createOrReplaceTempView("kept_dep")
+
+      sql(s"DELETE FROM $tableNameAsString t " +
+        "WHERE NOT EXISTS (SELECT 1 FROM kept_dep WHERE d = t.dep)")
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, 300, "hr") :: Row(3, 120, "hr") :: Nil)
 
       checkReplacedPartitions(Seq("software"))
     }
@@ -165,6 +261,72 @@ class GroupBasedDeleteFromTableSuite extends DeleteFromTableSuiteBase {
         Row(2, 150, "software") :: Row(3, 120, "hr") :: Nil)
 
       checkReplacedPartitions(Seq("hr"))
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+    }
+  }
+
+  test("delete does not double plan table (group filter enabled)") {
+    withSQLConf(SQLConf.RUNTIME_ROW_LEVEL_OPERATION_GROUP_FILTER_ENABLED.key -> "true") {
+      createAndInitTable("id INT, salary INT, dep STRING",
+        """{ "id": 1, "salary": 300, "dep": 'hr' }
+          |{ "id": 2, "salary": 150, "dep": 'software' }
+          |{ "id": 3, "salary": 120, "dep": 'hr' }
+          |""".stripMargin)
+
+      val (cond, groupFilterCond) = executeAndKeepConditions {
+        sql(
+          s"""DELETE FROM $tableNameAsString
+             |WHERE id IN (SELECT id FROM $tableNameAsString WHERE salary > 200)
+             |""".stripMargin)
+      }
+
+      cond match {
+        case InSubquery(_, query) => assertNoScanPlanning(query.plan)
+        case _ => fail(s"unexpected condition: $cond")
+      }
+
+      groupFilterCond match {
+        case Some(InSubquery(_, query)) => assertNoScanPlanning(query.plan)
+        case _ => fail(s"unexpected group filter: $groupFilterCond")
+      }
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(2, 150, "software") :: Row(3, 120, "hr") :: Nil)
+
+      checkReplacedPartitions(Seq("hr"))
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+    }
+  }
+
+  test("delete does not double plan table (group filter disabled)") {
+    withSQLConf(SQLConf.RUNTIME_ROW_LEVEL_OPERATION_GROUP_FILTER_ENABLED.key -> "false") {
+      createAndInitTable("id INT, salary INT, dep STRING",
+        """{ "id": 1, "salary": 300, "dep": 'hr' }
+          |{ "id": 2, "salary": 150, "dep": 'software' }
+          |{ "id": 3, "salary": 120, "dep": 'hr' }
+          |""".stripMargin)
+
+      val (cond, groupFilterCond) = executeAndKeepConditions {
+        sql(
+          s"""DELETE FROM $tableNameAsString
+             |WHERE id IN (SELECT id FROM $tableNameAsString WHERE salary > 200)
+             |""".stripMargin)
+      }
+
+      cond match {
+        case InSubquery(_, query) => assertNoScanPlanning(query.plan)
+        case _ => fail(s"unexpected condition: $cond")
+      }
+
+      assert(groupFilterCond.isEmpty, "group filter must be empty")
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(2, 150, "software") :: Row(3, 120, "hr") :: Nil)
+
+      checkReplacedPartitions(Seq("software", "hr"))
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 2)
     }
   }
 }

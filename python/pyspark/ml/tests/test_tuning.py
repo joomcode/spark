@@ -16,17 +16,16 @@
 #
 import os
 import tempfile
-import unittest
 
 import numpy as np
 
+from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml.linalg import Vectors
-from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
 from pyspark.ml.tuning import (
-    ParamGridBuilder,
     CrossValidator,
     CrossValidatorModel,
+    ParamGridBuilder,
     TrainValidationSplit,
     TrainValidationSplitModel,
 )
@@ -155,9 +154,12 @@ class TuningTestsMixin:
 
         checkSubModels(model.subModels)
 
-        for i in range(numFolds):
-            for j in range(len(grid)):
-                self.assertEqual(model.subModels[i][j].uid, model.subModels[i][j].uid)
+        def checkSubModelsEqual(subModels1, subModels2):
+            for i in range(numFolds):
+                for j in range(len(grid)):
+                    m1, m2 = subModels1[i][j], subModels2[i][j]
+                    self.assertEqual(m1.coefficients, m2.coefficients)
+                    self.assertEqual(m1.intercept, m2.intercept)
 
         # save & load
         with tempfile.TemporaryDirectory(prefix="cv") as d:
@@ -170,6 +172,7 @@ class TuningTestsMixin:
             model.write().overwrite().save(d)
             model2 = CrossValidatorModel.load(d)
             checkSubModels(model2.subModels)
+            checkSubModelsEqual(model.subModels, model2.subModels)
             self.assertEqual(str(model), str(model2))
             self.assertEqual(str(model.getEstimator()), str(model2.getEstimator()))
             self.assertEqual(str(model.getEvaluator()), str(model2.getEvaluator()))
@@ -280,12 +283,6 @@ class TuningTests(TuningTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.test_tuning import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

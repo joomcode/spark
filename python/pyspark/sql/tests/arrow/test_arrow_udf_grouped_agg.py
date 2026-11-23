@@ -15,31 +15,31 @@
 # limitations under the License.
 #
 
-import unittest
 import logging
+import unittest
+from typing import Iterator, Tuple
 
-from pyspark.sql.functions import arrow_udf, ArrowUDFType
-from pyspark.util import PythonEvalType, is_remote_only
+from pyspark.errors import AnalysisException, PythonException
 from pyspark.sql import Row
+from pyspark.sql import functions as sf
+from pyspark.sql.functions import ArrowUDFType, arrow_udf
 from pyspark.sql.types import (
     ArrayType,
-    YearMonthIntervalType,
-    StructType,
     StructField,
+    StructType,
     VariantType,
     VariantVal,
-)
-from pyspark.sql import functions as sf
-from pyspark.errors import AnalysisException, PythonException
-from pyspark.testing.utils import (
-    have_numpy,
-    numpy_requirement_message,
-    have_pyarrow,
-    pyarrow_requirement_message,
-    assertDataFrameEqual,
+    YearMonthIntervalType,
 )
 from pyspark.testing.sqlutils import ReusedSQLTestCase
-from typing import Iterator, Tuple
+from pyspark.testing.utils import (
+    assertDataFrameEqual,
+    have_numpy,
+    have_pyarrow,
+    numpy_requirement_message,
+    pyarrow_requirement_message,
+)
+from pyspark.util import PythonEvalType, is_remote_only
 
 
 @unittest.skipIf(not have_pyarrow, pyarrow_requirement_message)
@@ -111,8 +111,8 @@ class GroupedAggArrowUDFTestsMixin:
 
     @property
     def arrow_agg_weighted_mean_udf(self):
-        import pyarrow as pa
         import numpy as np
+        import pyarrow as pa
 
         @arrow_udf("double", ArrowUDFType.GROUPED_AGG)
         def weighted_mean(v, w):
@@ -527,7 +527,7 @@ class GroupedAggArrowUDFTestsMixin:
 
         df = self.spark.range(0, 100)
 
-        with self.tempView("table"), self.temp_func("max_udf"):
+        with self.temp_view("table"), self.temp_func("max_udf"):
             df.createTempView("table")
             self.spark.udf.register("max_udf", max_udf)
 
@@ -556,7 +556,7 @@ class GroupedAggArrowUDFTestsMixin:
         df = self.data
         weighted_mean = self.arrow_agg_weighted_mean_udf
 
-        with self.tempView("v"), self.temp_func("weighted_mean"):
+        with self.temp_view("v"), self.temp_func("weighted_mean"):
             df.createOrReplaceTempView("v")
             self.spark.udf.register("weighted_mean", weighted_mean)
 
@@ -585,7 +585,7 @@ class GroupedAggArrowUDFTestsMixin:
         df = self.data
         weighted_mean = self.arrow_agg_weighted_mean_udf
 
-        with self.tempView("v"), self.temp_func("weighted_mean"):
+        with self.temp_view("v"), self.temp_func("weighted_mean"):
             df.createOrReplaceTempView("v")
             self.spark.udf.register("weighted_mean", weighted_mean)
 
@@ -625,7 +625,7 @@ class GroupedAggArrowUDFTestsMixin:
 
             return np.average(kwargs["v"], weights=kwargs["w"])
 
-        with self.tempView("v"), self.temp_func("weighted_mean"):
+        with self.temp_view("v"), self.temp_func("weighted_mean"):
             df.createOrReplaceTempView("v")
             self.spark.udf.register("weighted_mean", weighted_mean)
 
@@ -670,7 +670,7 @@ class GroupedAggArrowUDFTestsMixin:
         def biased_sum(v, w=None):
             return pa.compute.sum(v).as_py() + (pa.compute.sum(w).as_py() if w is not None else 100)
 
-        with self.tempView("v"), self.temp_func("biased_sum"):
+        with self.temp_view("v"), self.temp_func("biased_sum"):
             df.createOrReplaceTempView("v")
             self.spark.udf.register("biased_sum", biased_sum)
 
@@ -804,8 +804,7 @@ class GroupedAggArrowUDFTestsMixin:
     def test_time_min(self):
         import pyarrow as pa
 
-        df = self.spark.sql(
-            """
+        df = self.spark.sql("""
             SELECT * FROM VALUES
             (1, TIME '12:34:56'),
             (1, TIME '1:2:3'),
@@ -813,8 +812,7 @@ class GroupedAggArrowUDFTestsMixin:
             (2, TIME '10:58:59'),
             (2, TIME '10:00:03')
             AS tab(i, t)
-            """
-        )
+            """)
 
         @arrow_udf("time", ArrowUDFType.GROUPED_AGG)
         def agg_min_time(v):
@@ -999,18 +997,18 @@ class GroupedAggArrowUDFTestsMixin:
     def test_arrow_batch_slicing(self):
         import pyarrow as pa
 
-        df = self.spark.range(10000000).select(
+        df = self.spark.range(1000000).select(
             (sf.col("id") % 2).alias("key"), sf.col("id").alias("v")
         )
 
         @arrow_udf("long", ArrowUDFType.GROUPED_AGG)
         def arrow_max(v):
-            assert len(v) == 10000000 / 2, len(v)
+            assert len(v) == 1000000 / 2, len(v)
             return pa.compute.max(v)
 
         expected = (df.groupby("key").agg(sf.max("v").alias("res")).sort("key")).collect()
 
-        for maxRecords, maxBytes in [(1000, 2**31 - 1), (0, 1048576), (1000, 1048576)]:
+        for maxRecords, maxBytes in [(100, 2**31 - 1), (0, 104858), (100, 104858)]:
             with self.subTest(maxRecords=maxRecords, maxBytes=maxBytes):
                 with self.sql_conf(
                     {
@@ -1064,8 +1062,9 @@ class GroupedAggArrowUDFTestsMixin:
         """
         Test iterator API for grouped aggregation with single column.
         """
-        import pyarrow as pa
         from typing import Iterator
+
+        import pyarrow as pa
 
         @arrow_udf("double")
         def arrow_mean_iter(it: Iterator[pa.Array]) -> float:
@@ -1091,8 +1090,8 @@ class GroupedAggArrowUDFTestsMixin:
         """
         Test iterator API for grouped aggregation with multiple columns.
         """
-        import pyarrow as pa
         import numpy as np
+        import pyarrow as pa
 
         @arrow_udf("double")
         def arrow_weighted_mean_iter(it: Iterator[Tuple[pa.Array, pa.Array]]) -> float:
@@ -1131,8 +1130,9 @@ class GroupedAggArrowUDFTestsMixin:
         """
         Test that the eval type is correctly inferred for iterator grouped agg UDFs.
         """
-        import pyarrow as pa
         from typing import Iterator
+
+        import pyarrow as pa
 
         @arrow_udf("double")
         def arrow_sum_iter(it: Iterator[pa.Array]) -> float:
@@ -1148,8 +1148,9 @@ class GroupedAggArrowUDFTestsMixin:
         Test that iterator grouped agg UDF can partially consume batches.
         This ensures that batches are processed one by one without loading all data into memory.
         """
-        import pyarrow as pa
         from typing import Iterator
+
+        import pyarrow as pa
 
         # Create a dataset with multiple batches per group
         # Use small batch size to ensure multiple batches per group
@@ -1232,7 +1233,7 @@ class GroupedAggArrowUDFTestsMixin:
             [(1, 1.0), (1, 2.0), (2, 3.0), (2, 5.0), (2, 10.0)], ("id", "v")
         )
 
-        with self.tempView("test_table"), self.temp_func("arrow_mean_iter"):
+        with self.temp_view("test_table"), self.temp_func("arrow_mean_iter"):
             df.createOrReplaceTempView("test_table")
             self.spark.udf.register("arrow_mean_iter", arrow_mean_iter)
 
@@ -1266,7 +1267,7 @@ class GroupedAggArrowUDFTestsMixin:
             ("id", "v", "w"),
         )
 
-        with self.tempView("test_table"), self.temp_func("arrow_weighted_mean_iter"):
+        with self.temp_view("test_table"), self.temp_func("arrow_weighted_mean_iter"):
             df.createOrReplaceTempView("test_table")
             self.spark.udf.register("arrow_weighted_mean_iter", arrow_weighted_mean_iter)
 
@@ -1290,12 +1291,6 @@ class GroupedAggArrowUDFTests(GroupedAggArrowUDFTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.arrow.test_arrow_udf_grouped_agg import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

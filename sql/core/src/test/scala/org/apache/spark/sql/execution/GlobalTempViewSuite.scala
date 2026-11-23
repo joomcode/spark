@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.spark.sql.{AnalysisException, QueryTest, Row}
+import org.apache.spark.sql.{AnalysisException, Row}
 import org.apache.spark.sql.catalog.Table
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.plans.logical.{BROADCAST, HintInfo, Join, JoinHint}
@@ -25,7 +25,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.StructType
 
-class GlobalTempViewSuite extends QueryTest with SharedSparkSession {
+class GlobalTempViewSuite extends SharedSparkSession {
   import testImplicits._
 
   override protected def beforeAll(): Unit = {
@@ -93,11 +93,15 @@ class GlobalTempViewSuite extends QueryTest with SharedSparkSession {
   }
 
   test("global temp view database should be preserved") {
-    val e = intercept[AnalysisException](sql(s"CREATE DATABASE $globalTempDB"))
-    assert(e.message.contains("system preserved database"))
+    checkError(
+      exception = intercept[AnalysisException](sql(s"CREATE DATABASE $globalTempDB")),
+      condition = "RESERVED_DATABASE_NAME",
+      parameters = Map("database" -> s"`$globalTempDB`"))
 
-    val e2 = intercept[AnalysisException](sql(s"USE $globalTempDB"))
-    assert(e2.message.contains("system preserved database"))
+    checkError(
+      exception = intercept[AnalysisException](sql(s"USE $globalTempDB")),
+      condition = "CANNOT_USE_RESERVED_DATABASE_AS_CURRENT",
+      parameters = Map("database" -> s"`$globalTempDB`"))
   }
 
   test("CREATE GLOBAL TEMP VIEW USING") {

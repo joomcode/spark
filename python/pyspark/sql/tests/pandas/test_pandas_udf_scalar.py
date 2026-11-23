@@ -14,64 +14,65 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import logging
 import os
 import random
 import shutil
 import tempfile
 import time
 import unittest
-import logging
 from datetime import date, datetime
 from decimal import Decimal
-from typing import cast
 
 from pyspark import TaskContext
-from pyspark.util import PythonEvalType, is_remote_only
+from pyspark.errors import AnalysisException, PythonException
 from pyspark.sql import Column, Row
 from pyspark.sql.functions import (
+    PandasUDFType,
     array,
     col,
     expr,
     lit,
-    sum,
-    struct,
-    udf,
     pandas_udf,
+    struct,
+    sum,
     to_json,
-    PandasUDFType,
+    udf,
 )
 from pyspark.sql.types import (
-    IntegerType,
-    ByteType,
-    StructType,
-    ShortType,
-    BooleanType,
-    LongType,
-    FloatType,
-    DoubleType,
-    DecimalType,
-    StringType,
     ArrayType,
-    StructField,
-    TimestampType,
-    MapType,
-    DateType,
     BinaryType,
-    YearMonthIntervalType,
+    BooleanType,
+    ByteType,
+    DateType,
+    DecimalType,
+    DoubleType,
+    FloatType,
+    IntegerType,
+    LongType,
+    MapType,
+    ShortType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
     VariantType,
     VariantVal,
+    YearMonthIntervalType,
 )
-from pyspark.errors import AnalysisException, PythonException
 from pyspark.testing.sqlutils import (
     ReusedSQLTestCase,
     test_compiled,
     test_not_compiled_message,
+)
+from pyspark.testing.utils import (
+    assertDataFrameEqual,
     have_pandas,
     have_pyarrow,
     pandas_requirement_message,
     pyarrow_requirement_message,
 )
-from pyspark.testing.utils import assertDataFrameEqual
+from pyspark.util import PythonEvalType, is_remote_only
 
 if have_pandas:
     import pandas as pd
@@ -82,7 +83,7 @@ if have_pyarrow:
 
 @unittest.skipIf(
     not have_pandas or not have_pyarrow,
-    cast(str, pandas_requirement_message or pyarrow_requirement_message),
+    pandas_requirement_message or pyarrow_requirement_message,
 )
 class ScalarPandasUDFTestsMixin:
     @property
@@ -233,9 +234,9 @@ class ScalarPandasUDFTestsMixin:
 
         @pandas_udf("Array<struct<col1:string, col2:long, col3:double>>")
         def return_cols(cols):
-            assert type(cols) == pd.Series
-            assert type(cols[0]) == np.ndarray
-            assert type(cols[0][0]) == dict
+            assert isinstance(cols, pd.Series)
+            assert isinstance(cols[0], np.ndarray)
+            assert isinstance(cols[0][0], dict)
             return cols
 
         df = self.spark.createDataFrame(
@@ -677,7 +678,7 @@ class ScalarPandasUDFTestsMixin:
         df = self.spark.range(10)
         raise_exception = pandas_udf(lambda _: pd.Series(1), LongType())
         with self.assertRaisesRegex(
-            Exception, "Result vector from pandas_udf was not the required length"
+            Exception, "The number of output rows.*must match the number of input rows"
         ):
             df.select(raise_exception(col("id"))).collect()
 
@@ -687,7 +688,7 @@ class ScalarPandasUDFTestsMixin:
                 yield pd.Series(1)
 
         with self.assertRaisesRegex(
-            Exception, "The length of output in Scalar iterator.*" "the length of output was 1"
+            Exception, "The number of output rows.*must match the number of input rows"
         ):
             df.select(iter_udf_wong_output_size(col("id"))).collect()
 
@@ -700,8 +701,20 @@ class ScalarPandasUDFTestsMixin:
 
         with self.sql_conf({"spark.sql.execution.arrow.maxRecordsPerBatch": 3}):
             df1 = self.spark.range(10).repartition(1)
-            with self.assertRaisesRegex(Exception, "pandas iterator UDF should exhaust"):
+            with self.assertRaisesRegex(Exception, "The input iterator must be fully consumed"):
                 df1.select(iter_udf_not_reading_all_input(col("id"))).collect()
+
+        @pandas_udf(LongType(), PandasUDFType.SCALAR_ITER)
+        def iter_udf_too_many_output_rows(it):
+            for batch in it:
+                yield pd.Series([1] * (len(batch) + 1))
+
+        with self.sql_conf({"spark.sql.execution.arrow.maxRecordsPerBatch": 3}):
+            df1 = self.spark.range(10).repartition(1)
+            with self.assertRaisesRegex(
+                Exception, "The number of output rows must not exceed the number of input rows"
+            ):
+                df1.select(iter_udf_too_many_output_rows(col("id"))).collect()
 
     def test_vectorized_udf_chained(self):
         df = self.spark.range(10)
@@ -1541,34 +1554,34 @@ class ScalarPandasUDFTestsMixin:
 
         @udf("int")
         def f1(x):
-            assert type(x) == int
+            assert isinstance(x, int)
             return x + 1
 
         @pandas_udf("int")
         def f2_scalar(x):
-            assert type(x) == pd.Series
+            assert isinstance(x, pd.Series)
             return x + 10
 
         @pandas_udf("int", PandasUDFType.SCALAR_ITER)
         def f2_iter(it):
             for x in it:
-                assert type(x) == pd.Series
+                assert isinstance(x, pd.Series)
                 yield x + 10
 
         @udf("int")
         def f3(x):
-            assert type(x) == int
+            assert isinstance(x, int)
             return x + 100
 
         @pandas_udf("int")
         def f4_scalar(x):
-            assert type(x) == pd.Series
+            assert isinstance(x, pd.Series)
             return x + 1000
 
         @pandas_udf("int", PandasUDFType.SCALAR_ITER)
         def f4_iter(it):
             for x in it:
-                assert type(x) == pd.Series
+                assert isinstance(x, pd.Series)
                 yield x + 1000
 
         expected_chained_1 = df.withColumn("f2_f1", df["v"] + 11).collect()
@@ -1666,7 +1679,7 @@ class ScalarPandasUDFTestsMixin:
 
         @udf("int")
         def f1(x):
-            assert type(x) == int
+            assert isinstance(x, int)
             return x + 1
 
         def f2(x):
@@ -1675,13 +1688,13 @@ class ScalarPandasUDFTestsMixin:
 
         @pandas_udf("int")
         def f3s(x):
-            assert type(x) == pd.Series
+            assert isinstance(x, pd.Series)
             return x + 100
 
         @pandas_udf("int", PandasUDFType.SCALAR_ITER)
         def f3i(it):
             for x in it:
-                assert type(x) == pd.Series
+                assert isinstance(x, pd.Series)
                 yield x + 100
 
         expected = (
@@ -1725,7 +1738,7 @@ class ScalarPandasUDFTestsMixin:
             self.assertEqual(expected, df1.collect())
 
     # SPARK-24721
-    @unittest.skipIf(not test_compiled, test_not_compiled_message)  # type: ignore
+    @unittest.skipIf(not test_compiled, test_not_compiled_message)
     def test_datasource_with_udf(self):
         # Same as SQLTests.test_datasource_with_udf, but with Pandas UDF
         # This needs to a separate test because Arrow dependency is optional
@@ -2043,6 +2056,25 @@ class ScalarPandasUDFTestsMixin:
                     result = df.select(plus_two("id").alias("result")).collect()
                     self.assertEqual(expected, result)
 
+    def test_scalar_iter_pandas_udf_with_single_output_batch(self):
+        @pandas_udf("long", PandasUDFType.SCALAR_ITER)
+        def return_one(iterator):
+            rows = 0
+            batches = 0
+            for s in iterator:
+                rows += len(s)
+                batches += 1
+
+            assert rows == 1000, rows
+            assert batches == 200, batches
+            yield pd.Series([1] * rows)
+
+        with self.sql_conf({"spark.sql.execution.arrow.maxRecordsPerBatch": 5}):
+            df = self.spark.range(0, 1000, 1, 1)
+            expected = [Row(one=1) for i in range(1000)]
+            result = df.select(return_one("id").alias("one")).collect()
+            self.assertEqual(expected, result)
+
 
 class ScalarPandasUDFTests(ScalarPandasUDFTestsMixin, ReusedSQLTestCase):
     @classmethod
@@ -2068,12 +2100,6 @@ class ScalarPandasUDFTests(ScalarPandasUDFTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.pandas.test_pandas_udf_scalar import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

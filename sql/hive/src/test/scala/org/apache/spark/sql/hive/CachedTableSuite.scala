@@ -26,14 +26,13 @@ import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
 import org.apache.spark.sql.execution.datasources.{CatalogFileIndex, HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.hive.test.TestHiveSingleton
-import org.apache.spark.sql.test.SQLTestUtils
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.storage.RDDBlockId
 import org.apache.spark.storage.StorageLevel.{DISK_ONLY, MEMORY_ONLY}
 import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
-class CachedTableSuite extends QueryTest with SQLTestUtils with TestHiveSingleton {
+class CachedTableSuite extends QueryTest with TestHiveSingleton {
   import hiveContext._
 
   def rddIdOf(tableName: String): Int = {
@@ -299,11 +298,17 @@ class CachedTableSuite extends QueryTest with SQLTestUtils with TestHiveSingleto
   test("Cache Table As Select - having database name") {
     withTempDatabase { db =>
       withTempView("cachedTable") {
-        val e = intercept[ParseException] {
-          sql(s"CACHE TABLE $db.cachedTable AS SELECT 1")
-        }.getMessage
-        assert(e.contains("It is not allowed to add catalog/namespace prefix ") &&
-          e.contains("to the table name in CACHE TABLE AS SELECT"))
+        val sqlText = s"CACHE TABLE $db.cachedTable AS SELECT 1"
+        checkError(
+          exception = intercept[ParseException] {
+            sql(sqlText)
+          },
+          condition = "INVALID_SQL_SYNTAX.MULTI_PART_NAME",
+          sqlState = "42000",
+          parameters = Map(
+            "statement" -> "CACHE TABLE ... AS SELECT",
+            "name" -> s"`$db`.`cachedTable`"),
+          context = ExpectedContext(fragment = sqlText, start = 0, stop = sqlText.length - 1))
       }
     }
   }

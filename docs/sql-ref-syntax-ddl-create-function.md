@@ -50,8 +50,9 @@ CREATE [ OR REPLACE ] [ TEMPORARY ] FUNCTION [ IF NOT EXISTS ]
 * **TEMPORARY**
 
     Indicates the scope of function being created. When `TEMPORARY` is specified, the
-    created function is valid and visible in the current session. No persistent
-    entry is made in the catalog for these kind of functions.
+    created function is valid and visible in the current session. Temporary functions live in the
+    per-session `system.session` namespace. No persistent entry is made in the catalog for these
+    kind of functions.
 
 * **IF NOT EXISTS**
 
@@ -62,19 +63,38 @@ CREATE [ OR REPLACE ] [ TEMPORARY ] FUNCTION [ IF NOT EXISTS ]
 
 * **function_name**
 
-    Specifies a name of function to be created. The function name may be optionally qualified with a database name.
+    Specifies a name of function to be created.
 
-    **Syntax:** `[ database_name. ] function_name`
+    * For a **permanent** function the name may be optionally qualified with a database name
+      (or a catalog and database). If the name is not qualified the function is created in the
+      current schema.
+
+      **Syntax:** `[ catalog_name. ] [ database_name. ] function_name`
+
+    * For a **temporary** function the name may be optionally qualified with the session schema
+      (`session` or `system.session`). Any other qualifier is rejected with
+      `INVALID_TEMP_OBJ_QUALIFIER`.
+
+      **Syntax:** `[ { session | system.session } . ] function_name`
 
 * **class_name**
 
     Specifies the name of the class that provides the implementation for function to be created.
-    The implementing class should extend one of the base classes as follows:
+    The implementing class should have a public no-arg constructor, and extend one of the base
+    classes as follows:
 
+    * Should implement `UnboundFunction` in `org.apache.spark.sql.connector.catalog.functions`
+      package.
     * Should extend `UDF` or `UDAF` in `org.apache.hadoop.hive.ql.exec` package.
     * Should extend `AbstractGenericUDAFResolver`, `GenericUDF`, or
       `GenericUDTF` in `org.apache.hadoop.hive.ql.udf.generic` package.
     * Should extend `UserDefinedAggregateFunction` in `org.apache.spark.sql.expressions` package.
+
+    **Note:** If an `UnboundFunction` binds to a `ScalarFunction` that implements the magic method
+    `invoke`, and its jar is added at runtime (`ADD JAR`, or `USING JAR`), codegen may fail to find
+    the class, e.g., in spark-shell. Whole-stage codegen falls back to slower interpreted
+    execution, other codegen fails the query. To avoid it, add the jar at startup via `--jars`, or
+    implement `produceResult` instead.
 
 * **resource_locations**
 

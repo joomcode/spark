@@ -49,7 +49,7 @@ import org.apache.spark.sql.catalyst.plans.logical.{CompoundBody, LocalRelation,
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.catalyst.util.CharVarcharUtils
 import org.apache.spark.sql.classic.SparkSession.applyAndLoadExtensions
-import org.apache.spark.sql.errors.{QueryCompilationErrors, SqlScriptingErrors}
+import org.apache.spark.sql.errors.SqlScriptingErrors
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.command.ExternalCommandExecutor
 import org.apache.spark.sql.execution.datasources.LogicalRelation
@@ -126,7 +126,7 @@ class SparkSession private(
 
   // If there is no active SparkSession, uses the default SQL conf. Otherwise, use the session's.
   SQLConf.setSQLConfGetter(() => {
-    SparkSession.getActiveSession.filterNot(_.sparkContext.isStopped).map(_.sessionState.conf)
+    SparkSession.getActiveSession.filterNot(_.sparkContext.isStopped).map(_.sqlConf)
       .getOrElse(SQLConf.getFallbackConf)
   })
 
@@ -176,6 +176,29 @@ class SparkSession private(
     existingSharedState.getOrElse(new SharedState(sparkContext, initialSessionOptions))
   }
 
+  /**
+   * SQL-specific key-value configurations.
+   *
+   * This is initialized before sessionState to avoid recursive access during sessionState
+   * initialization when SQLConf.get is called.
+   */
+  @transient
+  private[sql] lazy val sqlConf: SQLConf = {
+    parentSessionState.map { s =>
+      val cloned = s.conf.clone()
+      if (sparkContext.conf.get(StaticSQLConf.SQL_LEGACY_SESSION_INIT_WITH_DEFAULTS)) {
+        SQLConf.mergeSparkConf(cloned, sparkContext.conf)
+      }
+      cloned
+    }.getOrElse {
+      val conf = new SQLConf
+      SQLConf.mergeSparkConf(conf, sharedState.conf)
+      SQLConf.mergeNonStaticSQLConfigs(conf, sparkContext.conf.getAll.toMap)
+      SQLConf.mergeNonStaticSQLConfigs(conf, initialSessionOptions)
+      conf
+    }
+  }
+
   /** @inheritdoc */
   @Unstable
   @transient
@@ -195,7 +218,7 @@ class SparkSession private(
   val sqlContext: SQLContext = new SQLContext(this)
 
   /** @inheritdoc */
-  @transient lazy val conf: RuntimeConfig = new RuntimeConfig(sessionState.conf)
+  @transient lazy val conf: RuntimeConfig = new RuntimeConfig(sqlConf)
 
   /** @inheritdoc */
   def listenerManager: ExecutionListenerManager = sessionState.listenerManager
@@ -223,7 +246,9 @@ class SparkSession private(
   @Unstable
   def streams: StreamingQueryManager = sessionState.streamingQueryManager
 
-  private[spark] def streamingCheckpointManager = sessionState.streamingCheckpointManager
+  @Unstable
+  private[spark] def streamingCheckpointManager: StreamingCheckpointManager =
+    sessionState.streamingCheckpointManager
 
   /**
    * Returns an `ArtifactManager` that supports adding, managing and using session-scoped artifacts
@@ -506,16 +531,19 @@ class SparkSession private(
         val parsedPlan = {
           // Always parse with parameter context to detect unbound parameter markers.
           // Even if args is empty, we need to detect and reject parameter markers in the SQL.
-          val (paramMap, resolvedParams) = if (args.nonEmpty) {
+          val resolvedParams = if (args.nonEmpty) {
             val pMap = args.zipWithIndex.map { case (arg, idx) =>
               s"_pos_$idx" -> lit(arg).expr
             }.toMap
-            (pMap, resolveAndValidateParameters(pMap))
+            resolveAndValidateParameters(pMap)
           } else {
-            (Map.empty[String, Expression], Map.empty[String, Expression])
+            Map.empty[String, Expression]
           }
 
-          val paramContext = PositionalParameterContext(resolvedParams.values.toSeq)
+          // Look up by the positional key instead of relying on `resolvedParams.values`:
+          // the map does not preserve insertion order for 5+ entries.
+          val paramContext =
+            PositionalParameterContext(args.indices.map(idx => resolvedParams(s"_pos_$idx")))
           val parsed = sessionState.sqlParser.parsePlanWithParameters(sqlText, paramContext)
 
           // Check for SQL scripting with positional parameters
@@ -616,67 +644,73 @@ class SparkSession private(
       tracker: QueryPlanningTracker): DataFrame =
     withActive {
       val plan = tracker.measurePhase(QueryPlanningTracker.PARSING) {
-        // Always parse with parameter context to detect unbound parameter markers.
-        // Even if args is empty, we need to detect and reject parameter markers in the SQL.
-        val parsedPlan = if (args.nonEmpty) {
-          // Resolve and validate parameter arguments
-          val paramMap = args.zipWithIndex.map { case (arg, idx) =>
-            val name = if (idx < paramNames.length && paramNames(idx).nonEmpty) {
-              paramNames(idx)
-            } else {
-              s"_pos_$idx"
-            }
-            val expr = arg match {
-              case literal: Literal =>
-                // Already a Literal expression from ResolveExecuteImmediate - use it directly
-                literal
-              case _ =>
-                // Raw value or Column - convert to expression using lit()
-                lit(arg).expr
-            }
-            name -> expr
-          }.toMap
-
-          val resolvedParams = resolveAndValidateParameters(paramMap)
-          val paramExpressions = args.indices.map { idx =>
-            val name = if (idx < paramNames.length && paramNames(idx).nonEmpty) {
-              paramNames(idx)
-            } else {
-              s"_pos_$idx"
-            }
-            resolvedParams(name)
-          }.toSeq
-
-          val paramContext = HybridParameterContext(paramExpressions, paramNames.toSeq)
-
-          val parsed = sessionState.sqlParser.parsePlanWithParameters(sqlText, paramContext)
-
-          // In legacy mode, wrap with GeneralParameterizedQuery for analyzer binding
-          if (sessionState.conf.legacyParameterSubstitutionConstantsOnly) {
-            GeneralParameterizedQuery(
-              parsed,
-              args.map(lit(_).expr).toImmutableArraySeq,
-              paramNames.toImmutableArraySeq
-            )
-          } else {
-            parsed
-          }
-        } else {
-          // No arguments provided, but still need to detect parameter markers
-          val paramContext = HybridParameterContext(Seq.empty, Seq.empty)
-          sessionState.sqlParser.parsePlanWithParameters(sqlText, paramContext)
-        }
-
-        // Check for SQL scripts in EXECUTE IMMEDIATE (applies to both empty and non-empty args)
-        if (parsedPlan.isInstanceOf[CompoundBody]) {
-          throw QueryCompilationErrors.sqlScriptInExecuteImmediate(sqlText)
-        }
-
-        parsedPlan
+        parseParameterizedPlan(sqlText, args, paramNames)
       }
-
       Dataset.ofRows(self, plan, tracker)
     }
+
+  /**
+   * Parses `sqlText` with the given parameters into an unresolved plan. `paramNames(i)` names
+   * `args(i)`, or is empty for a positional argument. In legacy mode the plan is wrapped in
+   * [[GeneralParameterizedQuery]] for analyzer binding. Self-activates the session, so callers
+   * need not wrap it in [[withActive]].
+   */
+  private[sql] def parseParameterizedPlan(
+      sqlText: String,
+      args: Array[_],
+      paramNames: Array[String]): LogicalPlan = withActive {
+    // Always parse with parameter context to detect unbound parameter markers.
+    // Even if args is empty, we need to detect and reject parameter markers in the SQL.
+    val parsedPlan = if (args.nonEmpty) {
+      // Resolve and validate parameter arguments
+      val paramMap = args.zipWithIndex.map { case (arg, idx) =>
+        val name = if (idx < paramNames.length && paramNames(idx).nonEmpty) {
+          paramNames(idx)
+        } else {
+          s"_pos_$idx"
+        }
+        val expr = arg match {
+          case literal: Literal =>
+            // Already a Literal expression from ResolveExecuteImmediate - use it directly
+            literal
+          case _ =>
+            // Raw value or Column - convert to expression using lit()
+            lit(arg).expr
+        }
+        name -> expr
+      }.toMap
+
+      val resolvedParams = resolveAndValidateParameters(paramMap)
+      val paramExpressions = args.indices.map { idx =>
+        val name = if (idx < paramNames.length && paramNames(idx).nonEmpty) {
+          paramNames(idx)
+        } else {
+          s"_pos_$idx"
+        }
+        resolvedParams(name)
+      }.toSeq
+
+      val paramContext = HybridParameterContext(paramExpressions, paramNames.toSeq)
+      val parsed = sessionState.sqlParser.parsePlanWithParameters(sqlText, paramContext)
+
+      // In legacy mode, wrap with GeneralParameterizedQuery for analyzer binding
+      if (sessionState.conf.legacyParameterSubstitutionConstantsOnly) {
+        GeneralParameterizedQuery(
+          parsed,
+          args.map(lit(_).expr).toImmutableArraySeq,
+          paramNames.toImmutableArraySeq
+        )
+      } else {
+        parsed
+      }
+    } else {
+      // No arguments provided, but still need to detect parameter markers
+      val paramContext = HybridParameterContext(Seq.empty, Seq.empty)
+      sessionState.sqlParser.parsePlanWithParameters(sqlText, paramContext)
+    }
+
+    parsedPlan
+  }
 
   /** @inheritdoc */
   override def sql(sqlText: String): DataFrame = sql(sqlText, Map.empty[String, Any])
@@ -696,7 +730,7 @@ class SparkSession private(
   /** @inheritdoc */
   @Experimental
   override def addArtifact(uri: URI): Unit = {
-    artifactManager.addLocalArtifacts(Artifact.parseArtifacts(uri))
+    artifactManager.addLocalArtifacts(artifactManager.resolveArtifacts(uri))
   }
 
   /** @inheritdoc */
@@ -725,7 +759,7 @@ class SparkSession private(
   @Experimental
   @scala.annotation.varargs
   override def addArtifacts(uri: URI*): Unit = {
-    artifactManager.addLocalArtifacts(uri.flatMap(Artifact.parseArtifacts))
+    artifactManager.addLocalArtifacts(uri.flatMap(artifactManager.resolveArtifacts(_)))
   }
 
   /** @inheritdoc */
@@ -735,7 +769,10 @@ class SparkSession private(
   }
 
   /** @inheritdoc */
-  override def removeTag(tag: String): Unit = managedJobTags.get().remove(tag)
+  override def removeTag(tag: String): Unit = {
+    SparkContext.throwIfInvalidTag(tag)
+    managedJobTags.get().remove(tag)
+  }
 
   /** @inheritdoc */
   override def getTags(): Set[String] = managedJobTags.get().keySet.toSet
@@ -884,7 +921,10 @@ class SparkSession private(
       override protected def conf: SQLConf = sessionState.conf
     }
 
-  private[sql] lazy val observationManager = new ObservationManager(this)
+  // Avoid using lazy val here because it locks the SparkSession instance
+  // when initializing observationManager and may cause deadlocks.
+  @transient
+  private[sql] val observationManager = new ObservationManager(this)
 
   override private[sql] def isUsable: Boolean = !sparkContext.isStopped
 
@@ -1255,12 +1295,18 @@ object SparkSession extends SparkSessionCompanion with Logging {
       Utils.getContextOrSparkClassLoader)
     val loadedExts = loader.iterator()
 
-    while (loadedExts.hasNext) {
+    var keepLoading = true
+    while (keepLoading) {
       try {
-        val ext = loadedExts.next()
-        ext(extensions)
+        if (loadedExts.hasNext) {
+          val ext = loadedExts.next()
+          ext(extensions)
+        } else {
+          keepLoading = false
+        }
       } catch {
-        case e: Throwable => logWarning("Failed to load session extension", e)
+        case e: Throwable =>
+          logWarning("Failed to load session extension", e)
       }
     }
   }

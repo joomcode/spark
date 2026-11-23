@@ -30,7 +30,6 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.*;
 
-import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.core.JsonToken;
@@ -43,7 +42,12 @@ import static org.apache.spark.types.variant.VariantUtil.*;
  */
 public class VariantBuilder {
   public VariantBuilder(boolean allowDuplicateKeys) {
+    this(allowDuplicateKeys, true);
+  }
+
+  public VariantBuilder(boolean allowDuplicateKeys, boolean validateUnicodeInJsonParsing) {
     this.allowDuplicateKeys = allowDuplicateKeys;
+    this.validateUnicodeInJsonParsing = validateUnicodeInJsonParsing;
   }
 
   /**
@@ -53,20 +57,463 @@ public class VariantBuilder {
    * @throws IOException if any JSON parsing error happens.
    */
   public static Variant parseJson(String json, boolean allowDuplicateKeys) throws IOException {
-    try (JsonParser parser = new JsonFactory().createParser(json)) {
+    return parseJson(json, allowDuplicateKeys, true);
+  }
+
+  /**
+   * Similar to {@link #parseJson(String, boolean)}, but additionally controls whether JSON
+   * string contents are validated to be well-formed Unicode (no unpaired UTF-16 surrogate code
+   * units). Strict validation is the default and matches RFC 8259 section 7. The flag exists
+   * to allow callers to opt out for backward compatibility with input that previously parsed
+   * (with the unpaired surrogate silently replaced by the Unicode replacement character).
+   */
+  public static Variant parseJson(String json, boolean allowDuplicateKeys,
+      boolean validateUnicodeInJsonParsing) throws IOException {
+    try (JsonParser parser = JSON_FACTORY.createParser(json)) {
       parser.nextToken();
-      return parseJson(parser, allowDuplicateKeys);
+      return parseJson(parser, allowDuplicateKeys, validateUnicodeInJsonParsing);
     }
   }
 
   /**
-   * Similar {@link #parseJson(String, boolean)}, but takes a JSON parser instead of string input.
+   * Similar to {@link #parseJson(String, boolean)}, but takes a JSON parser instead of string
+   * input.
    */
   public static Variant parseJson(JsonParser parser, boolean allowDuplicateKeys)
       throws IOException {
-    VariantBuilder builder = new VariantBuilder(allowDuplicateKeys);
+    return parseJson(parser, allowDuplicateKeys, true);
+  }
+
+  /**
+   * Similar to {@link #parseJson(JsonParser, boolean)}, but additionally controls whether JSON
+   * string contents are validated to be well-formed Unicode. See
+   * {@link #parseJson(String, boolean, boolean)}.
+   */
+  public static Variant parseJson(JsonParser parser, boolean allowDuplicateKeys,
+      boolean validateUnicodeInJsonParsing) throws IOException {
+    VariantBuilder builder = new VariantBuilder(allowDuplicateKeys, validateUnicodeInJsonParsing);
     builder.buildJson(parser);
     return builder.result();
+  }
+
+  // A segment in a JSONPath used by variant manipulation functions.
+  public abstract static class PathSegment {}
+
+  // Object field access (e.g. `.a` or `['a']`).
+  public static final class ObjectKeySegment extends PathSegment {
+    public final String key;
+
+    public ObjectKeySegment(String key) {
+      this.key = key;
+    }
+  }
+
+  // Array index access (e.g. `[0]`).
+  public static final class ArrayIndexSegment extends PathSegment {
+    public final int index;
+
+    public ArrayIndexSegment(int index) {
+      this.index = index;
+    }
+  }
+
+  // Return a new variant with the field or array element at `segments` removed. If the path does
+  // not match (missing key, out-of-range index, or incompatible container type), a semantically
+  // equivalent variant is returned. The result is always rebuilt with fresh metadata, so the
+  // binary representation may differ even when nothing is deleted. `segments` must be non-empty.
+  public static Variant deleteAtPath(Variant v, PathSegment[] segments) {
+    if (segments.length == 0) {
+      throw new IllegalArgumentException("Segments must be non-empty");
+    }
+    VariantBuilder builder = new VariantBuilder(false);
+    builder.appendWithDeletionImpl(v.value, v.metadata, v.pos, segments, 0);
+    return builder.result();
+  }
+
+  // Return a new variant equal to `v` with `val` inserted at `segments` (which must be non-empty).
+  // An object leaf adds a field (or throws VARIANT_DUPLICATE_KEY if the key exists); an array leaf
+  // inserts at the index, shifting elements right and padding with nulls past the end. Missing
+  // intermediate keys/indices are created. A segment applied to an incompatible value throws
+  // VariantPathTypeMismatchException, which the caller maps to VARIANT_PATH_TYPE_MISMATCH.
+  public static Variant insertAtPath(Variant v, PathSegment[] segments, Variant val) {
+    if (segments.length == 0) {
+      throw new IllegalArgumentException("Segments must be non-empty");
+    }
+    VariantBuilder builder = new VariantBuilder(false);
+    builder.appendWithInsertionImpl(v.value, v.metadata, v.pos, segments, 0, val);
+    return builder.result();
+  }
+
+  // Return a new variant with the field or array element at `segments` set to the given value
+  // (`segments` must be non-empty). An object leaf replaces the field if present, otherwise adds
+  // it; an array leaf replaces the element at the index. When `createIfMissing` is true, missing
+  // leaves and intermediate keys/indices are created; when false, a missing key/index leaves the
+  // variant unchanged. A segment that targets an incompatible value throws
+  // VariantPathTypeMismatchException, which the caller maps to VARIANT_PATH_TYPE_MISMATCH.
+  public static Variant setAtPath(
+      Variant v, PathSegment[] segments, Variant val, boolean createIfMissing) {
+    if (segments.length == 0) {
+      throw new IllegalArgumentException("Segments must be non-empty");
+    }
+    VariantBuilder builder = new VariantBuilder(false);
+    builder.appendWithSetImpl(v.value, v.metadata, v.pos, segments, 0, val, createIfMissing);
+    return builder.result();
+  }
+
+  // Return a new variant with `val` appended to the array at `segments`, where an empty `segments`
+  // refers to the whole variant. If the path does not match (missing key or out-of-range index), a
+  // semantically equivalent variant is returned. A target that is not an array, or a segment
+  // applied to an incompatible container type, throws VariantPathTypeMismatchException, which the
+  // caller maps to VARIANT_PATH_TYPE_MISMATCH.
+  public static Variant arrayAppendAtPath(Variant v, PathSegment[] segments, Variant val) {
+    VariantBuilder builder = new VariantBuilder(false);
+    builder.appendWithArrayAppendImpl(v.value, v.metadata, v.pos, segments, 0, val);
+    return builder.result();
+  }
+
+  // Return a new variant with null-valued object fields removed, recursing into nested objects
+  // and arrays. When `includeArrays` is true, null array elements are removed too; when false,
+  // arrays keep their nulls but objects inside them are still cleaned. A container emptied by
+  // stripping is preserved as {} / [] rather than collapsed to a variant null, and a top-level
+  // variant null is returned unchanged. The result is always rebuilt with fresh metadata.
+  public static Variant stripNulls(Variant v, boolean includeArrays) {
+    VariantBuilder builder = new VariantBuilder(false);
+    builder.appendWithNullStrippingImpl(v.value, v.metadata, v.pos, includeArrays);
+    return builder.result();
+  }
+
+  // Return a new variant keeping only the substructures at `paths`. A kept object field stays
+  // nested under its parent objects; kept array elements are compacted into a new array in their
+  // original order. Missing keys, out-of-range indices, and type mismatches are skipped, dropping
+  // any parent left with nothing. The top-level object/array shape is preserved (possibly empty);
+  // a scalar, variant null, or root `$` returns v unchanged.
+  public static Variant pickAtPaths(Variant v, List<PathSegment[]> paths) {
+    return pickAtPaths(v, buildPickTree(paths));
+  }
+
+  public static PickNode buildPickTree(List<PathSegment[]> paths) {
+    PickNode root = new PickNode();
+    for (PathSegment[] path : paths) {
+      root.add(path, 0);
+    }
+    return root;
+  }
+
+  public static Variant pickAtPaths(Variant v, PickNode tree) {
+    VariantBuilder builder = new VariantBuilder(false);
+    builder.pickImplTopLevel(v.value, v.metadata, v.pos, tree);
+    return builder.result();
+  }
+
+  /**
+   * Return {@code v} in canonical form, or {@code v} itself if it is already canonical.
+   * <p>
+   * The variant binary encoding allows the same logical value to be encoded in several ways
+   * (dictionary order, unused keys, integer and offset widths, decimal scale, ...). Canonical form
+   * picks one encoding per value, so that values which are equal under the variant equality rules
+   * have identical {@code value} and {@code metadata} bytes and can be compared, hashed and
+   * grouped bytewise. It is a Spark-internal normalization, not part of the variant spec, and
+   * nothing outside Spark is expected to produce or require it. Only valid variants are supported.
+   * Malformed bytes fail with {@code MALFORMED_VARIANT} where they are detected; repeated field
+   * names within an object fail with {@code VARIANT_DUPLICATE_KEY}.
+   * <p>
+   * A variant is canonical when its {@code metadata} and {@code value} satisfy all of the following
+   * rules. The scalar and container encoding rules apply recursively to every nested value.
+   * <ul>
+   *   <li>Metadata header: version {@link VariantUtil#VERSION}, {@code sorted_strings} and the
+   *       reserved bit 5 clear, and the smallest offset size (1 to 4 bytes) that holds both the
+   *       key count and the total key length, as the key count is stored with the same size.
+   *       {@code sorted_strings} stays clear although the keys are sorted: this builder never sets
+   *       it, and keeping it clear avoids rebuilding otherwise canonical builder output only to
+   *       set it.</li>
+   *   <li>Metadata dictionary: the first offset is 0 and the offsets are non-decreasing, the key
+   *       bytes end exactly at the last offset, the keys are strictly increasing under unsigned
+   *       byte comparison (so each key appears once), and every key is used by some object
+   *       field.</li>
+   *   <li>Value: {@code value} holds exactly one encoded value, with no bytes after it.</li>
+   *   <li>Object: the field ids are strictly increasing, which stores the fields in key order and
+   *       rules out a repeated key; the field values are canonical and stored contiguously in
+   *       field order, so each offset is the sum of the preceding value sizes and the last offset
+   *       is the total size; the header uses the smallest id size for the largest id (one byte for
+   *       an empty object), the smallest offset size for the total size, {@code is_large} only for
+   *       more than 255 fields, and has the reserved bit 7 clear.</li>
+   *   <li>Array: the elements are canonical and stored contiguously in element order, so each
+   *       offset is the sum of the preceding element sizes and the last offset is the total size;
+   *       the header uses the smallest offset size for the total size, {@code is_large} only for
+   *       more than 255 elements, and has the reserved bits 5 to 7 clear.</li>
+   *   <li>Integer: the smallest of INT1, INT2, INT4 and INT8 that holds the value.</li>
+   *   <li>Decimal: trailing zeros stripped, and a scale that stripping made negative (1E+20 for
+   *       10^20) set back to 0. An integral value that fits in a signed 64-bit integer is stored
+   *       as an integer instead. Otherwise the smallest of DECIMAL4 (precision and scale at most
+   *       9), DECIMAL8 (at most 18) and DECIMAL16 that holds the value.</li>
+   *   <li>Float and double: -0.0 is stored as 0.0 and NaN as the canonical NaN bit pattern of
+   *       {@link Float#floatToIntBits} and {@link Double#doubleToLongBits}. The type is kept, so
+   *       a float and a double are never identical.</li>
+   *   <li>String: strings of at most {@link VariantUtil#MAX_SHORT_STR_SIZE} bytes use the
+   *       short-string encoding, longer strings the long-string encoding.</li>
+   *   <li>Null, boolean, date, microsecond timestamp and timestamp_ntz, binary and uuid have a
+   *       single encoding in the spec and are kept as they are.</li>
+   * </ul>
+   * These are all the supported types; a value of any other type fails with
+   * {@code UNKNOWN_PRIMITIVE_TYPE_IN_VARIANT}.
+   * <p>
+   * A view into a larger variant ({@code v.pos != 0}) is never canonical; its canonical form is a
+   * new root value with its own metadata. {@code isCanonical} checks exactly these rules and
+   * {@code doCanonicalize} produces them; the two must be changed together when a rule changes or
+   * a type is added to the spec.
+   *
+   * @throws VariantSizeLimitException if the rebuilt value or metadata would exceed
+   * {@link VariantUtil#SIZE_LIMIT}.
+   */
+  public static Variant canonicalize(Variant v) {
+    if (isCanonical(v)) {
+      return v;
+    }
+    return doCanonicalize(v);
+  }
+
+  // Check whether `v` already satisfies every rule listed in `canonicalize`. Return false at the
+  // first non-canonical encoding. Malformed bytes that the check can reject from what it has
+  // already read return false, and the rebuild then decides whether they fail. This includes a
+  // container whose declared data runs past the value and a child whose encoding runs past its
+  // container's declared data: the rebuild accepts both when every child it reaches is in bounds,
+  // and re-encodes each child from its own header. Malformed bytes that the check has to decode
+  // throw instead, for example `MALFORMED_VARIANT` for an unreadable metadata table, a truncated
+  // container size field or offset list, or a decimal whose precision or scale is out of range,
+  // and `UNKNOWN_PRIMITIVE_TYPE_IN_VARIANT` for an unknown type ID. When the check throws,
+  // `canonicalize` fails with that error. Returning false does not establish validity.
+  static boolean isCanonical(Variant v) {
+    if (v.pos != 0) {
+      return false;
+    }
+    byte[] value = v.value;
+    byte[] metadata = v.metadata;
+    int offsetSize = getMetadataOffsetSize(metadata);
+    int numKeys = getMetadataNumKeys(metadata, offsetSize);
+    int stringStart = getMetadataStringStart(metadata, numKeys, offsetSize);
+    int lastOffset = readUnsigned(metadata, stringStart - offsetSize, offsetSize);
+    // The key bytes must end exactly at lastOffset; trailing bytes are not canonical.
+    if (metadata.length != stringStart + lastOffset) {
+      return false;
+    }
+    int canonicalOffsetSize = getIntegerSize(Math.max(lastOffset, numKeys));
+    if (metadata[0] != metadataHeader(canonicalOffsetSize)) {
+      return false;
+    }
+    int firstOffset = readUnsigned(metadata, 1 + offsetSize, offsetSize);
+    if (firstOffset != 0) {
+      return false;
+    }
+    int previousOffset = 0;
+    int currentOffset = 0;
+    for (int keyId = 0; keyId < numKeys; ++keyId) {
+      int nextOffset = readUnsigned(metadata, 1 + (keyId + 2) * offsetSize, offsetSize);
+      if (currentOffset > nextOffset || nextOffset > lastOffset) {
+        return false;
+      }
+      if (keyId > 0 && Arrays.compareUnsigned(
+          metadata, stringStart + previousOffset, stringStart + currentOffset,
+          metadata, stringStart + currentOffset, stringStart + nextOffset) >= 0) {
+        return false;
+      }
+      previousOffset = currentOffset;
+      currentOffset = nextOffset;
+    }
+    boolean[] referenced = new boolean[numKeys];
+    if (valueSize(value, 0) != value.length || !isValueCanonical(value, 0, referenced)) {
+      return false;
+    }
+    for (boolean keyReferenced : referenced) {
+      if (!keyReferenced) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Check canonical value encoding and mark key IDs in referenced as they are visited.
+  // On false, referenced may be incomplete. Keep these checks in sync with
+  // appendCanonicalizedScalar, canonical object/array rebuilding in appendVariantImpl,
+  // finishWritingObject, and finishWritingArray.
+  private static boolean isValueCanonical(byte[] value, int pos, boolean[] referenced) {
+    int encodedSize = valueSize(value, pos);
+    if (encodedSize <= 0 || (long) pos + encodedSize > value.length) {
+      return false;
+    }
+    switch (getType(value, pos)) {
+      case OBJECT:
+        return handleObject(value, pos,
+            (size, idSize, offsetSize, idStart, offsetStart, dataStart) -> {
+          int previousId = -1;
+          int dataSize = 0;
+          for (int fieldIndex = 0; fieldIndex < size; ++fieldIndex) {
+            int keyId = readUnsigned(value, idStart + idSize * fieldIndex, idSize);
+            if (keyId <= previousId || keyId >= referenced.length) {
+              return false;
+            }
+            previousId = keyId;
+            referenced[keyId] = true;
+            int offset = readUnsigned(value, offsetStart + offsetSize * fieldIndex, offsetSize);
+            if (offset != dataSize) {
+              return false;
+            }
+            int elementPos = dataStart + offset;
+            if (!isValueCanonical(value, elementPos, referenced)) {
+              return false;
+            }
+            dataSize += valueSize(value, elementPos);
+          }
+          int lastOffset = readUnsigned(value, offsetStart + offsetSize * size, offsetSize);
+          if (lastOffset != dataSize) {
+            return false;
+          }
+          int maxId = size == 0 ? 0 : previousId;
+          return value[pos] ==
+              objectHeader(size > U8_MAX, getIntegerSize(maxId), getIntegerSize(dataSize));
+        });
+      case ARRAY:
+        return handleArray(value, pos, (size, offsetSize, offsetStart, dataStart) -> {
+          int dataSize = 0;
+          for (int elementIndex = 0; elementIndex < size; ++elementIndex) {
+            int offset = readUnsigned(value, offsetStart + offsetSize * elementIndex, offsetSize);
+            if (offset != dataSize) {
+              return false;
+            }
+            int elementPos = dataStart + offset;
+            if (!isValueCanonical(value, elementPos, referenced)) {
+              return false;
+            }
+            dataSize += valueSize(value, elementPos);
+          }
+          int lastOffset = readUnsigned(value, offsetStart + offsetSize * size, offsetSize);
+          return lastOffset == dataSize &&
+              value[pos] == arrayHeader(size > U8_MAX, getIntegerSize(dataSize));
+        });
+      case LONG:
+        return getTypeInfo(value, pos) == minimalLongTypeInfo(getLong(value, pos));
+      case DECIMAL: {
+        BigDecimal original = getDecimalWithOriginalScale(value, pos);
+        BigDecimal stripped = original.stripTrailingZeros();
+        if (decimalPromotesToLong(stripped)) {
+          return false;
+        }
+        BigDecimal canonical = canonicalDecimalForm(stripped);
+        return original.scale() == canonical.scale() &&
+            getTypeInfo(value, pos) == minimalDecimalTypeInfo(canonical);
+      }
+      case FLOAT: {
+        int rawBits = (int) readLong(value, pos + 1, 4);
+        float number = Float.intBitsToFloat(rawBits);
+        return rawBits == Float.floatToIntBits(normalizeNegativeZero(number));
+      }
+      case DOUBLE: {
+        long rawBits = readLong(value, pos + 1, 8);
+        double number = Double.longBitsToDouble(rawBits);
+        return rawBits == Double.doubleToLongBits(normalizeNegativeZero(number));
+      }
+      case STRING: {
+        // Strings of at most MAX_SHORT_STR_SIZE bytes must use the short-string encoding.
+        boolean shortString = (value[pos] & BASIC_TYPE_MASK) == SHORT_STR;
+        int length = encodedSize - (shortString ? 1 : 1 + U32_SIZE);
+        return shortString || length > MAX_SHORT_STR_SIZE;
+      }
+      case NULL:
+      case BOOLEAN:
+      case DATE:
+      case TIMESTAMP:
+      case TIMESTAMP_NTZ:
+      case BINARY:
+      case UUID:
+        // Single encoding in the spec; copied unchanged by the rebuild.
+        return true;
+      default:
+        // A type added to the spec must be classified here and in `appendCanonicalizedScalar`
+        // before it can be canonicalized.
+        throw unknownPrimitiveTypeInVariant(getTypeInfo(value, pos));
+    }
+  }
+
+  // Rebuild `v` so that it satisfies every rule listed in `canonicalize`, without checking
+  // whether it already does. The result is a new root value, also when `v` is a nested value of a
+  // larger variant.
+  static Variant doCanonicalize(Variant v) {
+    VariantBuilder builder = new VariantBuilder(false);
+    builder.buildCanonicalized(v.value, v.metadata, v.pos);
+    return builder.result();
+  }
+
+  // Rebuild the value at `pos` into this builder: collect the keys it uses in sorted order, then
+  // append it with the remapped field IDs and canonical scalar encodings.
+  private void buildCanonicalized(byte[] value, byte[] metadata, int pos) {
+    int offsetSize = getMetadataOffsetSize(metadata);
+    int numKeys = getMetadataNumKeys(metadata, offsetSize);
+    // Validate metadata table bounds before allocating the key-ID mapping.
+    getMetadataStringStart(metadata, numKeys, offsetSize);
+    int[] canonicalIds = new int[numKeys];
+    Arrays.fill(canonicalIds, -1);
+    TreeMap<byte[], Integer> keys = new TreeMap<>(VariantUtil::compareKeys);
+    collectAllObjectKeys(value, metadata, pos, canonicalIds, keys, new int[1]);
+    // Remap the IDs assigned during collection to unsigned byte order without decoding keys.
+    int[] sortedIds = new int[keys.size()];
+    for (java.util.Map.Entry<byte[], Integer> key : keys.entrySet()) {
+      sortedIds[key.getValue()] = dictionaryKeys.size();
+      dictionaryKeys.add(key.getKey());
+    }
+    for (int i = 0; i < canonicalIds.length; ++i) {
+      if (canonicalIds[i] >= 0) {
+        canonicalIds[i] = sortedIds[canonicalIds[i]];
+      }
+    }
+    appendVariantImpl(value, metadata, pos, canonicalIds);
+  }
+
+  // Container offsets may point several entries at the same child, so a small value can reach far
+  // more values than its size. The rebuild writes at least one byte per reached value, so fail with
+  // `VariantSizeLimitException` once more than `SIZE_LIMIT` values are reached.
+  private static void collectAllObjectKeys(
+      byte[] value, byte[] metadata, int pos, int[] canonicalIds, TreeMap<byte[], Integer> keys,
+      int[] visitedValues) {
+    if (++visitedValues[0] > SIZE_LIMIT) {
+      throw new VariantSizeLimitException();
+    }
+    checkIndex(pos, value.length);
+    switch (value[pos] & BASIC_TYPE_MASK) {
+      case OBJECT:
+        handleObject(value, pos, (size, idSize, offsetSize, idStart, offsetStart, dataStart) -> {
+          for (int fieldIndex = 0; fieldIndex < size; ++fieldIndex) {
+            int keyId = readUnsigned(value, idStart + idSize * fieldIndex, idSize);
+            int offset = readUnsigned(value, offsetStart + offsetSize * fieldIndex, offsetSize);
+            if (keyId >= canonicalIds.length) {
+              throw malformedVariant();
+            }
+            if (canonicalIds[keyId] < 0) {
+              byte[] key = getMetadataKeyBytes(metadata, keyId);
+              Integer id = keys.get(key);
+              if (id == null) {
+                id = keys.size();
+                keys.put(key, id);
+              }
+              canonicalIds[keyId] = id;
+            }
+            collectAllObjectKeys(
+                value, metadata, dataStart + offset, canonicalIds, keys, visitedValues);
+          }
+          return null;
+        });
+        break;
+      case ARRAY:
+        handleArray(value, pos, (size, offsetSize, offsetStart, dataStart) -> {
+          for (int elementIndex = 0; elementIndex < size; ++elementIndex) {
+            int offset = readUnsigned(value, offsetStart + offsetSize * elementIndex, offsetSize);
+            collectAllObjectKeys(
+                value, metadata, dataStart + offset, canonicalIds, keys, visitedValues);
+          }
+          return null;
+        });
+        break;
+      default:
+        break;
+    }
   }
 
   // Build the variant metadata from `dictionaryKeys` and return the variant result.
@@ -119,17 +566,21 @@ public class VariantBuilder {
 
   public void appendString(String str) {
     byte[] text = str.getBytes(StandardCharsets.UTF_8);
-    boolean longStr = text.length > MAX_SHORT_STR_SIZE;
-    checkCapacity((longStr ? 1 + U32_SIZE : 1) + text.length);
+    appendString(text, 0, text.length);
+  }
+
+  private void appendString(byte[] text, int offset, int length) {
+    boolean longStr = length > MAX_SHORT_STR_SIZE;
+    checkCapacity((longStr ? 1 + U32_SIZE : 1) + length);
     if (longStr) {
       writeBuffer[writePos++] = primitiveHeader(LONG_STR);
-      writeLong(writeBuffer, writePos, text.length, U32_SIZE);
+      writeLong(writeBuffer, writePos, length, U32_SIZE);
       writePos += U32_SIZE;
     } else {
-      writeBuffer[writePos++] = shortStrHeader(text.length);
+      writeBuffer[writePos++] = shortStrHeader(length);
     }
-    System.arraycopy(text, 0, writeBuffer, writePos, text.length);
-    writePos += text.length;
+    System.arraycopy(text, offset, writeBuffer, writePos, length);
+    writePos += length;
   }
 
   public void appendNull() {
@@ -263,7 +714,7 @@ public class VariantBuilder {
     } else {
       id = dictionaryKeys.size();
       dictionary.put(key, id);
-      dictionaryKeys.add(key.getBytes(StandardCharsets.UTF_8));
+      dictionaryKeys.add(encodeKey(key));
     }
     return id;
   }
@@ -329,8 +780,13 @@ public class VariantBuilder {
     } else {
       for (int i = 1; i < size; ++i) {
         maxId = Math.max(maxId, fields.get(i).id);
-        String key = fields.get(i).key;
-        if (key.equals(fields.get(i - 1).key)) {
+        FieldEntry field = fields.get(i);
+        FieldEntry previous = fields.get(i - 1);
+        boolean duplicate = field.key == null ? field.id == previous.id :
+            field.key.equals(previous.key);
+        if (duplicate) {
+          String key = field.key != null ? field.key :
+              new String(field.keyBytes, StandardCharsets.UTF_8);
           @SuppressWarnings("unchecked")
           Map<String, String> parameters = Map$.MODULE$.<String, String>empty().updated("key", key);
           throw new SparkRuntimeException("VARIANT_DUPLICATE_KEY", parameters,
@@ -391,6 +847,11 @@ public class VariantBuilder {
   }
 
   private void appendVariantImpl(byte[] value, byte[] metadata, int pos) {
+    appendVariantImpl(value, metadata, pos, null);
+  }
+
+  private void appendVariantImpl(
+      byte[] value, byte[] metadata, int pos, int[] canonicalIds) {
     checkIndex(pos, value.length);
     int basicType = value[pos] & BASIC_TYPE_MASK;
     switch (basicType) {
@@ -398,14 +859,45 @@ public class VariantBuilder {
         handleObject(value, pos, (size, idSize, offsetSize, idStart, offsetStart, dataStart) -> {
           ArrayList<FieldEntry> fields = new ArrayList<>(size);
           int start = writePos;
-          for (int i = 0; i < size; ++i) {
-            int id = readUnsigned(value, idStart + idSize * i, idSize);
-            int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+          Integer[] fieldOrder = null;
+          if (canonicalIds != null && size > 1) {
+            // Canonical IDs follow key order. Only sort if the remapped IDs are out of order.
+            boolean needsSort = false;
+            int previousId = -1;
+            for (int fieldIndex = 0; fieldIndex < size; ++fieldIndex) {
+              int keyId = readUnsigned(value, idStart + idSize * fieldIndex, idSize);
+              int newId = canonicalIds[keyId];
+              if (newId < previousId) {
+                needsSort = true;
+                break;
+              }
+              previousId = newId;
+            }
+            if (needsSort) {
+              fieldOrder = new Integer[size];
+              int[] newIds = new int[size];
+              for (int fieldIndex = 0; fieldIndex < size; ++fieldIndex) {
+                fieldOrder[fieldIndex] = fieldIndex;
+                int keyId = readUnsigned(value, idStart + idSize * fieldIndex, idSize);
+                newIds[fieldIndex] = canonicalIds[keyId];
+              }
+              Arrays.sort(fieldOrder,
+                  (left, right) -> Integer.compare(newIds[left], newIds[right]));
+            }
+          }
+          for (int fieldIndex = 0; fieldIndex < size; ++fieldIndex) {
+            int sourceIndex = fieldOrder == null ? fieldIndex : fieldOrder[fieldIndex];
+            int id = readUnsigned(value, idStart + idSize * sourceIndex, idSize);
+            int offset = readUnsigned(value, offsetStart + offsetSize * sourceIndex, offsetSize);
             int elementPos = dataStart + offset;
-            String key = getMetadataKey(metadata, id);
-            int newId = addKey(key);
-            fields.add(new FieldEntry(key, newId, writePos - start));
-            appendVariantImpl(value, metadata, elementPos);
+            if (canonicalIds != null) {
+              int newId = canonicalIds[id];
+              fields.add(new FieldEntry(dictionaryKeys.get(newId), newId, writePos - start));
+            } else {
+              String key = getMetadataKey(metadata, id);
+              fields.add(new FieldEntry(key, addKey(key), writePos - start));
+            }
+            appendVariantImpl(value, metadata, elementPos, canonicalIds);
           }
           finishWritingObject(start, fields);
           return null;
@@ -419,15 +911,646 @@ public class VariantBuilder {
             int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
             int elementPos = dataStart + offset;
             offsets.add(writePos - start);
-            appendVariantImpl(value, metadata, elementPos);
+            appendVariantImpl(value, metadata, elementPos, canonicalIds);
           }
           finishWritingArray(start, offsets);
           return null;
         });
         break;
       default:
+        if (canonicalIds != null) {
+          appendCanonicalizedScalar(value, pos);
+        } else {
+          shallowAppendVariantImpl(value, pos);
+        }
+        break;
+    }
+  }
+
+  // Append the scalar at `value[pos...]` in canonical form. Keep in sync with the scalar cases
+  // of `isValueCanonical`.
+  private void appendCanonicalizedScalar(byte[] value, int pos) {
+    switch (getType(value, pos)) {
+      case LONG:
+        appendLong(getLong(value, pos));
+        break;
+      case DECIMAL: {
+        BigDecimal stripped = getDecimal(value, pos);
+        if (decimalPromotesToLong(stripped)) {
+          appendLong(stripped.longValue());
+        } else {
+          appendDecimal(canonicalDecimalForm(stripped));
+        }
+        break;
+      }
+      case FLOAT:
+        appendFloat(normalizeNegativeZero(getFloat(value, pos)));
+        break;
+      case DOUBLE:
+        appendDouble(normalizeNegativeZero(getDouble(value, pos)));
+        break;
+      case STRING: {
+        int size = valueSize(value, pos);
+        if (size <= 0 || (long) pos + size > value.length) {
+          throw malformedVariant();
+        }
+        int headerSize = (value[pos] & BASIC_TYPE_MASK) == SHORT_STR ? 1 : 1 + U32_SIZE;
+        appendString(value, pos + headerSize, size - headerSize);
+        break;
+      }
+      case NULL:
+      case BOOLEAN:
+      case DATE:
+      case TIMESTAMP:
+      case TIMESTAMP_NTZ:
+      case BINARY:
+      case UUID:
+        // Single encoding in the spec; copy the bytes unchanged.
         shallowAppendVariantImpl(value, pos);
         break;
+      default:
+        // A type added to the spec must be classified here and in `isValueCanonical` before it
+        // can be canonicalized.
+        throw unknownPrimitiveTypeInVariant(getTypeInfo(value, pos));
+    }
+  }
+
+  private static int minimalLongTypeInfo(long value) {
+    if (value == (byte) value) return INT1;
+    if (value == (short) value) return INT2;
+    if (value == (int) value) return INT4;
+    return INT8;
+  }
+
+  private static int minimalDecimalTypeInfo(BigDecimal value) {
+    if (value.scale() <= MAX_DECIMAL4_PRECISION && value.precision() <= MAX_DECIMAL4_PRECISION) {
+      return DECIMAL4;
+    } else if (value.scale() <= MAX_DECIMAL8_PRECISION &&
+        value.precision() <= MAX_DECIMAL8_PRECISION) {
+      return DECIMAL8;
+    } else {
+      return DECIMAL16;
+    }
+  }
+
+  // Map -0.0 to 0.0. NaN needs no handling here: appendFloat/appendDouble write
+  // Float.floatToIntBits/Double.doubleToLongBits, which already collapse every NaN to one pattern,
+  // and isValueCanonical compares against those same bits.
+  private static float normalizeNegativeZero(float value) {
+    return value == 0.0f ? 0.0f : value;
+  }
+
+  private static double normalizeNegativeZero(double value) {
+    return value == 0.0d ? 0.0d : value;
+  }
+
+  private static final BigDecimal LONG_MIN_AS_DECIMAL = BigDecimal.valueOf(Long.MIN_VALUE);
+  private static final BigDecimal LONG_MAX_AS_DECIMAL = BigDecimal.valueOf(Long.MAX_VALUE);
+
+  private static boolean decimalPromotesToLong(BigDecimal stripped) {
+    return stripped.scale() <= 0 && stripped.compareTo(LONG_MIN_AS_DECIMAL) >= 0 &&
+        stripped.compareTo(LONG_MAX_AS_DECIMAL) <= 0;
+  }
+
+  private static BigDecimal canonicalDecimalForm(BigDecimal stripped) {
+    return stripped.scale() < 0 ? stripped.setScale(0) : stripped;
+  }
+
+  private void appendWithDeletionImpl(
+      byte[] value, byte[] metadata, int pos, PathSegment[] segments, int depth) {
+    checkIndex(pos, value.length);
+    PathSegment seg = segments[depth];
+    boolean isLast = depth == segments.length - 1;
+    int basicType = value[pos] & BASIC_TYPE_MASK;
+    if (seg instanceof ObjectKeySegment && basicType == OBJECT) {
+      String key = ((ObjectKeySegment) seg).key;
+      handleObject(value, pos, (size, idSize, offsetSize, idStart, offsetStart, dataStart) -> {
+        ArrayList<FieldEntry> fields = new ArrayList<>(size);
+        int start = writePos;
+        for (int i = 0; i < size; ++i) {
+          int id = readUnsigned(value, idStart + idSize * i, idSize);
+          int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+          int elementPos = dataStart + offset;
+          String fieldKey = getMetadataKey(metadata, id);
+          boolean isTarget = fieldKey.equals(key);
+          if (!(isTarget && isLast)) {
+            int newId = addKey(fieldKey);
+            fields.add(new FieldEntry(fieldKey, newId, writePos - start));
+            if (isTarget) {
+              appendWithDeletionImpl(value, metadata, elementPos, segments, depth + 1);
+            } else {
+              appendVariantImpl(value, metadata, elementPos);
+            }
+          }
+        }
+        finishWritingObject(start, fields);
+        return null;
+      });
+    } else if (seg instanceof ArrayIndexSegment && basicType == ARRAY) {
+      int index = ((ArrayIndexSegment) seg).index;
+      handleArray(value, pos, (size, offsetSize, offsetStart, dataStart) -> {
+        ArrayList<Integer> offsets = new ArrayList<>(size);
+        int start = writePos;
+        for (int i = 0; i < size; ++i) {
+          boolean isTarget = i == index;
+          if (!(isTarget && isLast)) {
+            int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+            int elementPos = dataStart + offset;
+            offsets.add(writePos - start);
+            if (isTarget) {
+              appendWithDeletionImpl(value, metadata, elementPos, segments, depth + 1);
+            } else {
+              appendVariantImpl(value, metadata, elementPos);
+            }
+          }
+        }
+        finishWritingArray(start, offsets);
+        return null;
+      });
+    } else {
+      // Container type does not match the segment kind; append unchanged.
+      appendVariantImpl(value, metadata, pos);
+    }
+  }
+
+  private void appendWithInsertionImpl(
+      byte[] value, byte[] metadata, int pos, PathSegment[] segments, int depth, Variant val) {
+    checkIndex(pos, value.length);
+    PathSegment seg = segments[depth];
+    boolean isLast = depth == segments.length - 1;
+    int basicType = value[pos] & BASIC_TYPE_MASK;
+    if (seg instanceof ObjectKeySegment && basicType == OBJECT) {
+      String key = ((ObjectKeySegment) seg).key;
+      handleObject(value, pos, (size, idSize, offsetSize, idStart, offsetStart, dataStart) -> {
+        ArrayList<FieldEntry> fields = new ArrayList<>(size + 1);
+        int start = writePos;
+        boolean found = false;
+        for (int i = 0; i < size; ++i) {
+          int id = readUnsigned(value, idStart + idSize * i, idSize);
+          int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+          int elementPos = dataStart + offset;
+          String fieldKey = getMetadataKey(metadata, id);
+          boolean isTarget = fieldKey.equals(key);
+          found |= isTarget;
+          int newId = addKey(fieldKey);
+          fields.add(new FieldEntry(fieldKey, newId, writePos - start));
+          if (isTarget && !isLast) {
+            appendWithInsertionImpl(value, metadata, elementPos, segments, depth + 1, val);
+          } else {
+            appendVariantImpl(value, metadata, elementPos);
+          }
+        }
+        if (isLast) {
+          // Append the new field unconditionally; if `key` already exists, the duplicate is
+          // detected by `finishWritingObject`, which raises VARIANT_DUPLICATE_KEY.
+          int newId = addKey(key);
+          fields.add(new FieldEntry(key, newId, writePos - start));
+          appendVariant(val);
+        } else if (!found) {
+          // Intermediate object key is missing; create the rest of the path under it.
+          int newId = addKey(key);
+          fields.add(new FieldEntry(key, newId, writePos - start));
+          appendNewPath(segments, depth + 1, val);
+        }
+        finishWritingObject(start, fields);
+        return null;
+      });
+    } else if (seg instanceof ArrayIndexSegment && basicType == ARRAY) {
+      int index = ((ArrayIndexSegment) seg).index;
+      handleArray(value, pos, (size, offsetSize, offsetStart, dataStart) -> {
+        ArrayList<Integer> offsets = new ArrayList<>(size + 1);
+        int start = writePos;
+        if (isLast) {
+          // Insert `val` at `index`, shifting existing elements right.
+          for (int i = 0; i < size; ++i) {
+            if (i == index) {
+              offsets.add(writePos - start);
+              appendVariant(val);
+            }
+            int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+            offsets.add(writePos - start);
+            appendVariantImpl(value, metadata, dataStart + offset);
+          }
+          if (index >= size) {
+            // Pad with variant nulls up to `index`, then append `val`.
+            for (int i = size; i < index; ++i) {
+              offsets.add(writePos - start);
+              appendNull();
+            }
+            offsets.add(writePos - start);
+            appendVariant(val);
+          }
+        } else if (index < size) {
+          // Descend into the existing element at `index`.
+          for (int i = 0; i < size; ++i) {
+            int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+            int elementPos = dataStart + offset;
+            offsets.add(writePos - start);
+            if (i == index) {
+              appendWithInsertionImpl(value, metadata, elementPos, segments, depth + 1, val);
+            } else {
+              appendVariantImpl(value, metadata, elementPos);
+            }
+          }
+        } else {
+          // Intermediate index is past the end; copy existing elements, pad with variant nulls up
+          // to `index`, then create the rest of the path at `index`.
+          for (int i = 0; i < size; ++i) {
+            int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+            offsets.add(writePos - start);
+            appendVariantImpl(value, metadata, dataStart + offset);
+          }
+          for (int i = size; i < index; ++i) {
+            offsets.add(writePos - start);
+            appendNull();
+          }
+          offsets.add(writePos - start);
+          appendNewPath(segments, depth + 1, val);
+        }
+        finishWritingArray(start, offsets);
+        return null;
+      });
+    } else {
+      // The segment kind does not match the container at this path prefix.
+      throw new VariantPathTypeMismatchException(depth);
+    }
+  }
+
+  private void appendWithSetImpl(
+      byte[] value, byte[] metadata, int pos, PathSegment[] segments, int depth, Variant val,
+      boolean createIfMissing) {
+    checkIndex(pos, value.length);
+    PathSegment seg = segments[depth];
+    boolean isLast = depth == segments.length - 1;
+    int basicType = value[pos] & BASIC_TYPE_MASK;
+    if (seg instanceof ObjectKeySegment && basicType == OBJECT) {
+      String key = ((ObjectKeySegment) seg).key;
+      handleObject(value, pos, (size, idSize, offsetSize, idStart, offsetStart, dataStart) -> {
+        ArrayList<FieldEntry> fields = new ArrayList<>(size + 1);
+        int start = writePos;
+        boolean found = false;
+        for (int i = 0; i < size; ++i) {
+          int id = readUnsigned(value, idStart + idSize * i, idSize);
+          int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+          int elementPos = dataStart + offset;
+          String fieldKey = getMetadataKey(metadata, id);
+          boolean isTarget = fieldKey.equals(key);
+          found |= isTarget;
+          int newId = addKey(fieldKey);
+          fields.add(new FieldEntry(fieldKey, newId, writePos - start));
+          if (isTarget && isLast) {
+            // Replace the existing field's value in place.
+            appendVariant(val);
+          } else if (isTarget) {
+            appendWithSetImpl(
+                value, metadata, elementPos, segments, depth + 1, val, createIfMissing);
+          } else {
+            appendVariantImpl(value, metadata, elementPos);
+          }
+        }
+        if (!found && createIfMissing) {
+          // Target key is missing; create it (and any remaining path). When `createIfMissing` is
+          // false this is a no-op: the fields copied above already reproduce the input object.
+          int newId = addKey(key);
+          fields.add(new FieldEntry(key, newId, writePos - start));
+          if (isLast) {
+            appendVariant(val);
+          } else {
+            appendNewPath(segments, depth + 1, val);
+          }
+        }
+        finishWritingObject(start, fields);
+        return null;
+      });
+    } else if (seg instanceof ArrayIndexSegment && basicType == ARRAY) {
+      int index = ((ArrayIndexSegment) seg).index;
+      handleArray(value, pos, (size, offsetSize, offsetStart, dataStart) -> {
+        ArrayList<Integer> offsets = new ArrayList<>(size + 1);
+        int start = writePos;
+        if (index < size) {
+          // Replace the element at `index`, or descend into it for an intermediate segment.
+          for (int i = 0; i < size; ++i) {
+            int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+            int elementPos = dataStart + offset;
+            offsets.add(writePos - start);
+            if (i != index) {
+              appendVariantImpl(value, metadata, elementPos);
+            } else if (isLast) {
+              appendVariant(val);
+            } else {
+              appendWithSetImpl(
+                  value, metadata, elementPos, segments, depth + 1, val, createIfMissing);
+            }
+          }
+        } else {
+          // Index is past the end. Copy existing elements; when `createIfMissing` is true, pad with
+          // variant nulls up to `index` and create the leaf value or the rest of the path. When
+          // false this is a no-op: the copied elements already reproduce the input array.
+          for (int i = 0; i < size; ++i) {
+            int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+            offsets.add(writePos - start);
+            appendVariantImpl(value, metadata, dataStart + offset);
+          }
+          if (createIfMissing) {
+            for (int i = size; i < index; ++i) {
+              offsets.add(writePos - start);
+              appendNull();
+            }
+            offsets.add(writePos - start);
+            if (isLast) {
+              appendVariant(val);
+            } else {
+              appendNewPath(segments, depth + 1, val);
+            }
+          }
+        }
+        finishWritingArray(start, offsets);
+        return null;
+      });
+    } else {
+      // The segment kind does not match the container at this path prefix.
+      throw new VariantPathTypeMismatchException(depth);
+    }
+  }
+
+  private void appendWithArrayAppendImpl(
+      byte[] value, byte[] metadata, int pos, PathSegment[] segments, int depth, Variant val) {
+    checkIndex(pos, value.length);
+    int basicType = value[pos] & BASIC_TYPE_MASK;
+    if (depth == segments.length) {
+      // Reached the target: it must be an array, to which `val` is appended.
+      if (basicType != ARRAY) {
+        throw new VariantPathTypeMismatchException(depth);
+      }
+      handleArray(value, pos, (size, offsetSize, offsetStart, dataStart) -> {
+        ArrayList<Integer> offsets = new ArrayList<>(size + 1);
+        int start = writePos;
+        for (int i = 0; i < size; ++i) {
+          int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+          offsets.add(writePos - start);
+          appendVariantImpl(value, metadata, dataStart + offset);
+        }
+        offsets.add(writePos - start);
+        appendVariant(val);
+        finishWritingArray(start, offsets);
+        return null;
+      });
+      return;
+    }
+    PathSegment seg = segments[depth];
+    if (seg instanceof ObjectKeySegment && basicType == OBJECT) {
+      String key = ((ObjectKeySegment) seg).key;
+      handleObject(value, pos, (size, idSize, offsetSize, idStart, offsetStart, dataStart) -> {
+        ArrayList<FieldEntry> fields = new ArrayList<>(size);
+        int start = writePos;
+        for (int i = 0; i < size; ++i) {
+          int id = readUnsigned(value, idStart + idSize * i, idSize);
+          int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+          int elementPos = dataStart + offset;
+          String fieldKey = getMetadataKey(metadata, id);
+          int newId = addKey(fieldKey);
+          fields.add(new FieldEntry(fieldKey, newId, writePos - start));
+          if (fieldKey.equals(key)) {
+            appendWithArrayAppendImpl(value, metadata, elementPos, segments, depth + 1, val);
+          } else {
+            appendVariantImpl(value, metadata, elementPos);
+          }
+        }
+        // A missing key is a no-op: the fields copied above already reproduce the input object.
+        finishWritingObject(start, fields);
+        return null;
+      });
+    } else if (seg instanceof ArrayIndexSegment && basicType == ARRAY) {
+      int index = ((ArrayIndexSegment) seg).index;
+      handleArray(value, pos, (size, offsetSize, offsetStart, dataStart) -> {
+        ArrayList<Integer> offsets = new ArrayList<>(size);
+        int start = writePos;
+        for (int i = 0; i < size; ++i) {
+          int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+          int elementPos = dataStart + offset;
+          offsets.add(writePos - start);
+          if (i == index) {
+            appendWithArrayAppendImpl(value, metadata, elementPos, segments, depth + 1, val);
+          } else {
+            appendVariantImpl(value, metadata, elementPos);
+          }
+        }
+        // An out-of-range index is a no-op: the elements copied above reproduce the input array.
+        finishWritingArray(start, offsets);
+        return null;
+      });
+    } else {
+      // The segment kind does not match the container at this path prefix.
+      throw new VariantPathTypeMismatchException(depth);
+    }
+  }
+
+  // Build a fresh chain of containers for `segments[depth..]`, terminating in `val`. Used to
+  // materialize missing intermediate path segments during insertion. The kind of each segment
+  // decides the container created: an object-key segment creates a single-field object, while an
+  // array-index segment creates an array padded with variant nulls up to the index.
+  private void appendNewPath(PathSegment[] segments, int depth, Variant val) {
+    PathSegment seg = segments[depth];
+    boolean isLast = depth == segments.length - 1;
+    if (seg instanceof ObjectKeySegment) {
+      String key = ((ObjectKeySegment) seg).key;
+      ArrayList<FieldEntry> fields = new ArrayList<>(1);
+      int start = writePos;
+      int id = addKey(key);
+      fields.add(new FieldEntry(key, id, writePos - start));
+      if (isLast) {
+        appendVariant(val);
+      } else {
+        appendNewPath(segments, depth + 1, val);
+      }
+      finishWritingObject(start, fields);
+    } else {
+      int index = ((ArrayIndexSegment) seg).index;
+      ArrayList<Integer> offsets = new ArrayList<>();
+      int start = writePos;
+      for (int i = 0; i < index; ++i) {
+        offsets.add(writePos - start);
+        appendNull();
+      }
+      offsets.add(writePos - start);
+      if (isLast) {
+        appendVariant(val);
+      } else {
+        appendNewPath(segments, depth + 1, val);
+      }
+      finishWritingArray(start, offsets);
+    }
+  }
+
+  private void appendWithNullStrippingImpl(
+      byte[] value, byte[] metadata, int pos, boolean includeArrays) {
+    checkIndex(pos, value.length);
+    int basicType = value[pos] & BASIC_TYPE_MASK;
+    if (basicType == OBJECT) {
+      handleObject(value, pos, (size, idSize, offsetSize, idStart, offsetStart, dataStart) -> {
+        ArrayList<FieldEntry> fields = new ArrayList<>(size);
+        int start = writePos;
+        for (int i = 0; i < size; ++i) {
+          int id = readUnsigned(value, idStart + idSize * i, idSize);
+          int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+          int elementPos = dataStart + offset;
+          // Drop the whole field when its value is a variant null.
+          if (getType(value, elementPos) == Type.NULL) {
+            continue;
+          }
+          String key = getMetadataKey(metadata, id);
+          int newId = addKey(key);
+          fields.add(new FieldEntry(key, newId, writePos - start));
+          appendWithNullStrippingImpl(value, metadata, elementPos, includeArrays);
+        }
+        finishWritingObject(start, fields);
+        return null;
+      });
+    } else if (basicType == ARRAY) {
+      handleArray(value, pos, (size, offsetSize, offsetStart, dataStart) -> {
+        ArrayList<Integer> offsets = new ArrayList<>(size);
+        int start = writePos;
+        for (int i = 0; i < size; ++i) {
+          int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+          int elementPos = dataStart + offset;
+          // Drop variant-null elements only when stripping arrays; otherwise keep them but still
+          // recurse into nested containers.
+          if (includeArrays && getType(value, elementPos) == Type.NULL) {
+            continue;
+          }
+          offsets.add(writePos - start);
+          appendWithNullStrippingImpl(value, metadata, elementPos, includeArrays);
+        }
+        finishWritingArray(start, offsets);
+        return null;
+      });
+    } else {
+      // Scalars and standalone variant nulls are appended unchanged.
+      appendVariantImpl(value, metadata, pos);
+    }
+  }
+
+  // A node in the keep-tree built from `variant_pick`'s JSONPaths. It records whether a path
+  // terminates here (keep everything below), else which object keys / array indices to descend
+  // into. Holds only strings and ints, so it is `Serializable` for whole-stage codegen.
+  public static final class PickNode implements java.io.Serializable {
+    // A path terminates here: keep the whole value, subsuming any deeper paths under this node.
+    private boolean keepAll = false;
+    // Lazily created; a node may hold both maps when paths disagree on the container type, and
+    // only the map matching the actual value is used.
+    private HashMap<String, PickNode> objectChildren = null;
+    private HashMap<Integer, PickNode> arrayChildren = null;
+
+    // Insert the path suffix `path[depth..]` under this node.
+    private void add(PathSegment[] path, int depth) {
+      // A broader path already keeps everything here, so any deeper path is subsumed.
+      if (keepAll) {
+        return;
+      }
+      if (depth == path.length) {
+        keepAll = true;
+        // Drop children from narrower paths added earlier; keepAll subsumes them.
+        objectChildren = null;
+        arrayChildren = null;
+        return;
+      }
+      PathSegment seg = path[depth];
+      PickNode child;
+      if (seg instanceof ObjectKeySegment) {
+        if (objectChildren == null) {
+          objectChildren = new HashMap<>();
+        }
+        child = objectChildren.computeIfAbsent(((ObjectKeySegment) seg).key, k -> new PickNode());
+      } else {
+        if (arrayChildren == null) {
+          arrayChildren = new HashMap<>();
+        }
+        child = arrayChildren.computeIfAbsent(((ArrayIndexSegment) seg).index, k -> new PickNode());
+      }
+      child.add(path, depth + 1);
+    }
+  }
+
+  // Top-level entry for `pickAtPaths`: an object or array input yields a (possibly empty) object
+  // or array; a scalar, variant null, or root `$` (`keepAll`) keeps the value unchanged.
+  private void pickImplTopLevel(byte[] value, byte[] metadata, int pos, PickNode root) {
+    checkIndex(pos, value.length);
+    int basicType = value[pos] & BASIC_TYPE_MASK;
+    if (root.keepAll || (basicType != OBJECT && basicType != ARRAY)) {
+      appendVariantImpl(value, metadata, pos);
+    } else if (!pickImpl(value, metadata, pos, root)) {
+      // `pickImpl` writes nothing when it keeps nothing, so the top-level empty object/array (the
+      // preserved shape) is emitted here rather than in the recursion.
+      if (basicType == OBJECT) {
+        finishWritingObject(writePos, new ArrayList<>());
+      } else {
+        finishWritingArray(writePos, new ArrayList<>());
+      }
+    }
+  }
+
+  // Append the substructures at `pos` selected by `node`, returning whether anything was appended.
+  // It writes bytes if it returns true, so misses and empty sub-containers leave no trace and the
+  // top-level empty object/array comes from `pickImplTopLevel`. A key is registered only if kept.
+  private boolean pickImpl(byte[] value, byte[] metadata, int pos, PickNode node) {
+    checkIndex(pos, value.length);
+    if (node.keepAll) {
+      appendVariantImpl(value, metadata, pos);
+      return true;
+    }
+    int basicType = value[pos] & BASIC_TYPE_MASK;
+    if (basicType == OBJECT) {
+      return handleObject(
+          value, pos, (size, idSize, offsetSize, idStart, offsetStart, dataStart) -> {
+        ArrayList<FieldEntry> fields = new ArrayList<>();
+        int start = writePos;
+        // No object-key children here: skip the whole scan and its per-field key lookups.
+        if (node.objectChildren != null) {
+          for (int i = 0; i < size; ++i) {
+            int id = readUnsigned(value, idStart + idSize * i, idSize);
+            String fieldKey = getMetadataKey(metadata, id);
+            PickNode child = node.objectChildren.get(fieldKey);
+            if (child != null) {
+              int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+              int fieldOffset = writePos - start;
+              if (pickImpl(value, metadata, dataStart + offset, child)) {
+                fields.add(new FieldEntry(fieldKey, addKey(fieldKey), fieldOffset));
+              }
+            }
+          }
+        }
+        if (fields.isEmpty()) {
+          return false;
+        }
+        finishWritingObject(start, fields);
+        return true;
+      });
+    } else if (basicType == ARRAY) {
+      return handleArray(value, pos, (size, offsetSize, offsetStart, dataStart) -> {
+        ArrayList<Integer> offsets = new ArrayList<>();
+        int start = writePos;
+        // No array-index children here: skip the whole element scan.
+        if (node.arrayChildren != null) {
+          for (int i = 0; i < size; ++i) {
+            PickNode child = node.arrayChildren.get(i);
+            if (child != null) {
+              int offset = readUnsigned(value, offsetStart + offsetSize * i, offsetSize);
+              int elementOffset = writePos - start;
+              if (pickImpl(value, metadata, dataStart + offset, child)) {
+                offsets.add(elementOffset);
+              }
+            }
+          }
+        }
+        if (offsets.isEmpty()) {
+          return false;
+        }
+        finishWritingArray(start, offsets);
+        return true;
+      });
+    } else {
+      // The value is a scalar but the node still has segments to follow: nothing matches.
+      return false;
     }
   }
 
@@ -467,6 +1590,7 @@ public class VariantBuilder {
     final String key;
     final int id;
     final int offset;
+    private byte[] keyBytes;
 
     public FieldEntry(String key, int id, int offset) {
       this.key = key;
@@ -474,13 +1598,29 @@ public class VariantBuilder {
       this.offset = offset;
     }
 
+    // Canonicalization preserves raw keys; decode them only when reporting a duplicate key.
+    private FieldEntry(byte[] keyBytes, int id, int offset) {
+      this.key = null;
+      this.id = id;
+      this.offset = offset;
+      this.keyBytes = keyBytes;
+    }
+
     FieldEntry withNewOffset(int newOffset) {
-      return new FieldEntry(key, id, newOffset);
+      return key == null ? new FieldEntry(keyBytes, id, newOffset) :
+          new FieldEntry(key, id, newOffset);
+    }
+
+    private byte[] keyBytes() {
+      if (keyBytes == null) {
+        keyBytes = encodeKey(key);
+      }
+      return keyBytes;
     }
 
     @Override
     public int compareTo(FieldEntry other) {
-      return key.compareTo(other.key);
+      return compareKeys(keyBytes(), other.keyBytes());
     }
   }
 
@@ -495,6 +1635,9 @@ public class VariantBuilder {
         int start = writePos;
         while (parser.nextToken() != JsonToken.END_OBJECT) {
           String key = parser.currentName();
+          if (validateUnicodeInJsonParsing) {
+            checkValidUnicodeString(key, parser);
+          }
           parser.nextToken();
           int id = addKey(key);
           fields.add(new FieldEntry(key, id, writePos - start));
@@ -513,9 +1656,14 @@ public class VariantBuilder {
         finishWritingArray(start, offsets);
         break;
       }
-      case VALUE_STRING:
-        appendString(parser.getText());
+      case VALUE_STRING: {
+        String text = parser.getText();
+        if (validateUnicodeInJsonParsing) {
+          checkValidUnicodeString(text, parser);
+        }
+        appendString(text);
         break;
+      }
       case VALUE_NUMBER_INT:
         try {
           appendLong(parser.getLongValue());
@@ -543,7 +1691,7 @@ public class VariantBuilder {
 
   // Choose the smallest unsigned integer type that can store `value`. It must be within
   // `[0, SIZE_LIMIT]`.
-  private int getIntegerSize(int value) {
+  private static int getIntegerSize(int value) {
     assert value >= 0 && value <= SIZE_LIMIT;
     if (value <= U8_MAX) return 1;
     if (value <= U16_MAX) return 2;
@@ -554,6 +1702,30 @@ public class VariantBuilder {
   private void parseFloatingPoint(JsonParser parser) throws IOException {
     if (!tryParseDecimal(parser.getText())) {
       appendDouble(parser.getDoubleValue());
+    }
+  }
+
+  // Reject JSON strings that contain unpaired UTF-16 surrogate code units. Java strings can
+  // hold lone surrogates, but RFC 8259 section 7 requires JSON string contents to be well-formed
+  // Unicode. Stricter parsers such as simdjson reject these inputs, while Jackson's
+  // `ReaderBasedJsonParser` accepts them and silently replaces the invalid character with U+FFFD
+  // when the result is encoded as UTF-8. That silent replacement causes data corruption, so
+  // we surface a JSON parse error instead.
+  private static void checkValidUnicodeString(String str, JsonParser parser)
+      throws JsonParseException {
+    int len = str.length();
+    for (int i = 0; i < len; ++i) {
+      char c = str.charAt(i);
+      if (Character.isHighSurrogate(c)) {
+        if (i + 1 >= len || !Character.isLowSurrogate(str.charAt(i + 1))) {
+          throw new JsonParseException(parser, String.format(
+              "Invalid Unicode in JSON string: lone high surrogate U+%04X", (int) c));
+        }
+        ++i;
+      } else if (Character.isLowSurrogate(c)) {
+        throw new JsonParseException(parser, String.format(
+            "Invalid Unicode in JSON string: lone low surrogate U+%04X", (int) c));
+      }
     }
   }
 
@@ -580,7 +1752,12 @@ public class VariantBuilder {
   private int writePos = 0;
   // Map keys to a monotonically increasing id.
   private final HashMap<String, Integer> dictionary = new HashMap<>();
-  // Store all keys in `dictionary` in the order of id.
+  // Store key bytes in ID order. Canonicalization populates this directly,
+  // without populating `dictionary`, to preserve the original key bytes.
   private final ArrayList<byte[]> dictionaryKeys = new ArrayList<>();
   private final boolean allowDuplicateKeys;
+  // When true, JSON string contents are validated to be well-formed Unicode (RFC 8259 sec 7).
+  // Unpaired UTF-16 surrogate code units cause a `JsonParseException` to be thrown during
+  // `buildJson`, which surfaces as a `MALFORMED_RECORD_IN_PARSING` error to SQL callers.
+  private final boolean validateUnicodeInJsonParsing;
 }

@@ -21,8 +21,10 @@ import java.io._
 import java.nio.charset.StandardCharsets.UTF_8
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.analysis.TempResolvedColumn
+import org.apache.spark.sql.catalyst.analysis.{FunctionRegistry, TempResolvedColumn}
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.expressions.objects.InvokeLike
+import org.apache.spark.sql.catalyst.util.FieldMetadataUtils.FIELD_ID_METADATA_KEY
 import org.apache.spark.sql.connector.catalog.MetadataColumn
 import org.apache.spark.sql.types.{MetadataBuilder, NumericType, StringType, StructType}
 import org.apache.spark.unsafe.types.UTF8String
@@ -89,16 +91,33 @@ package object util extends Logging {
   private def usePrettyExpression(
       e: Expression,
       shouldTrimTempResolvedColumn: Boolean = false): Expression = e transform {
+    case u: UpdateFields if u.fieldOps.exists(_.isInstanceOf[UpdateNestedField]) =>
+      val sql = u.sqlString(toPrettySQL(_, shouldTrimTempResolvedColumn), identity)
+      if (u.checkInputDataTypes().isSuccess) {
+        PrettyAttribute(sql, u.dataType)
+      } else {
+        PrettyAttribute(sql)
+      }
     case a: Attribute => new PrettyAttribute(a)
     case Literal(s: UTF8String, StringType) => PrettyAttribute(s.toString, StringType)
     case Literal(v, t: NumericType) if v != null => PrettyAttribute(v.toString, t)
     case Literal(null, dataType) => PrettyAttribute("NULL", dataType)
     case e: GetStructField =>
-      val name = e.name.getOrElse(e.childSchema(e.ordinal).name)
-      PrettyAttribute(
-        usePrettyExpression(e.child, shouldTrimTempResolvedColumn).sql + "." + name,
-        e.dataType
-      )
+      e.child.dataType match {
+        case st: StructType =>
+          val name = e.name.getOrElse(st(e.ordinal).name)
+          PrettyAttribute(
+            usePrettyExpression(e.child, shouldTrimTempResolvedColumn).sql + "." + name,
+            st(e.ordinal).dataType
+          )
+        case _ =>
+          // Child type was changed by a plan transformation.
+          val name = e.name.getOrElse(s"_${e.ordinal}")
+          PrettyAttribute(
+            usePrettyExpression(e.child, shouldTrimTempResolvedColumn).sql + "." + name,
+            e.child.dataType
+          )
+      }
     case e: GetArrayStructFields =>
       PrettyAttribute(
         s"${usePrettyExpression(e.child, shouldTrimTempResolvedColumn)}.${e.field.name}",
@@ -116,9 +135,28 @@ package object util extends Logging {
         ),
         dataType = r.dataType
       )
-    case c: Cast if c.getTagValue(Cast.USER_SPECIFIED_CAST).isEmpty =>
+    case c: Cast if !c.containsTag(Cast.USER_SPECIFIED_CAST) =>
       PrettyAttribute(usePrettyExpression(c.child, shouldTrimTempResolvedColumn).sql, c.dataType)
+    // A V2 function's magic method registered under a function name, e.g. by `CREATE FUNCTION`.
+    case i: InvokeLike if i.getTagValue(FunctionRegistry.FUNC_ALIAS).isDefined =>
+      val args = i.arguments.map(toPrettySQL(_, shouldTrimTempResolvedColumn))
+      PrettyAttribute(s"${i.prettyName}(${args.mkString(", ")})", i.dataType)
+    case j: RoutedSqlJsonExpression =>
+      // Column names are for display and never reparsed, so render the clean clause-free form, not
+      // the canonical `sql` that appends a round-trip-only default clause. Render children in place
+      // rather than substituting the node's children, so the raw-vs-quoted splice decisions (which
+      // key off each child's identity) are unchanged and no synthetic `FORMAT JSON` leaks in.
+      PrettyAttribute(
+        j.sqlString(
+          forceBuiltinOwnership = false,
+          usePrettyExpression(_, shouldTrimTempResolvedColumn).sql),
+        j.dataType)
     case p: PythonFuncExpression => PrettyPythonUDF(p.name, p.dataType, p.children)
+    // Present a transpiled UDF exactly like the UDF it wraps, so auto-generated
+    // column names stay `f(a)` whether or not transpilation engages (the node
+    // carries the rewrite options as extra children, which must not leak into
+    // user-visible names).
+    case t: TranspiledPythonUDF => PrettyPythonUDF(t.name, t.dataType, t.pythonUDFExpr.children)
   }
 
   def quoteIdentifier(name: String): String = {
@@ -177,10 +215,10 @@ package object util extends Logging {
   val QUALIFIED_ACCESS_ONLY = "__qualified_access_only"
 
   /**
-   * If set, this metadata column can only be accessed under [[AggregateExpression]]. This is
-   * important when resolving columns in ORDER BY and HAVING clauses on top of [[Aggregate]].
-   * In this case we can only reference attributes from grouping expressions, or attributes marked
-   * as "__aggregated_access_only" under [[AggregateExpression]].
+   * If set, this column can only be accessed under [[AggregateExpression]]. This is important when
+   * resolving columns in ORDER BY and HAVING clauses on top of [[Aggregate]]. In this case we can
+   * only reference attributes from grouping expressions, or attributes marked as
+   * "__aggregated_access_only" under [[AggregateExpression]].
    */
   val AGGREGATED_ACCESS_ONLY = "__aggregated_access_only"
 
@@ -192,8 +230,7 @@ package object util extends Logging {
       attr.metadata.contains(QUALIFIED_ACCESS_ONLY) &&
       attr.metadata.getBoolean(QUALIFIED_ACCESS_ONLY)
 
-    def aggregatedAccessOnly: Boolean = attr.isMetadataCol &&
-      attr.metadata.contains(AGGREGATED_ACCESS_ONLY) &&
+    def aggregatedAccessOnly: Boolean = attr.metadata.contains(AGGREGATED_ACCESS_ONLY) &&
       attr.metadata.getBoolean(AGGREGATED_ACCESS_ONLY)
 
     def markAsQualifiedAccessOnly(): Attribute = attr.withMetadata(
@@ -207,7 +244,6 @@ package object util extends Logging {
     def markAsAggregatedAccessOnly(): Attribute = attr.withMetadata(
       new MetadataBuilder()
         .withMetadata(attr.metadata)
-        .putString(METADATA_COL_ATTR_KEY, attr.name)
         .putBoolean(AGGREGATED_ACCESS_ONLY, true)
         .build()
     )
@@ -233,19 +269,26 @@ package object util extends Logging {
     AUTO_GENERATED_ALIAS,
     METADATA_COL_ATTR_KEY,
     QUALIFIED_ACCESS_ONLY,
+    FIELD_ID_METADATA_KEY,
     FileSourceMetadataAttribute.FILE_SOURCE_METADATA_COL_ATTR_KEY,
     FileSourceConstantMetadataStructField.FILE_SOURCE_CONSTANT_METADATA_COL_ATTR_KEY,
     FileSourceGeneratedMetadataStructField.FILE_SOURCE_GENERATED_METADATA_COL_ATTR_KEY,
     MetadataColumn.PRESERVE_ON_DELETE,
     MetadataColumn.PRESERVE_ON_UPDATE,
-    MetadataColumn.PRESERVE_ON_REINSERT
+    MetadataColumn.PRESERVE_ON_REINSERT,
+    GeneratedColumn.GENERATION_EXPRESSION_METADATA_KEY,
+    GeneratedColumn.AUTO_FILLED_GENERATED_COLUMN_METADATA_KEY
   )
 
-  def removeInternalMetadata(schema: StructType): StructType = {
+  def removeInternalMetadata(schema: StructType, keepFieldIds: Boolean = false): StructType = {
     StructType(schema.map { field =>
       var builder = new MetadataBuilder().withMetadata(field.metadata)
       INTERNAL_METADATA_KEYS.foreach { key =>
-        builder = builder.remove(key)
+        // Column IDs are listed as internal so most paths drop them, but some paths (e.g. the v2
+        // relation output) deliberately surface them, so allow callers to keep them.
+        if (!(keepFieldIds && key == FIELD_ID_METADATA_KEY)) {
+          builder = builder.remove(key)
+        }
       }
       field.copy(metadata = builder.build())
     })

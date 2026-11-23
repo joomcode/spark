@@ -24,14 +24,56 @@ import org.apache.spark.internal.LogKeys._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.connector.catalog.Column
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.ArrayImplicits._
 
 object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
 
   // visible for testing
   private[sql] val CHAR_VARCHAR_TYPE_STRING_METADATA_KEY = "__CHAR_VARCHAR_TYPE_STRING"
+
+  /** JVM method name used by [[addPaddingForScan]] when read-side CHAR padding is on. */
+  private[sql] val READ_SIDE_PADDING = "readSidePadding"
+
+  /** JVM method name used by [[addPaddingForScan]] under standard CHAR/VARCHAR semantics. */
+  private[sql] val CHAR_TYPE_READ_SIDE_CHECK = "charTypeReadSideCheck"
+
+  private[sql] val VARCHAR_TYPE_READ_SIDE_CHECK = "varcharTypeReadSideCheck"
+
+  /**
+   * V2 function name for CHAR read-side padding. Distinct from SQL `RPAD` so connectors that
+   * already allowlist `RPAD` for explicit `rpad()` do not inherit CHAR-scan rewrite. Emitted
+   * only for equality, null-safe equality, inequality, or IN against a string of the CHAR
+   * length. JDBC may compile it as the column only when the remote compares CHAR
+   * blank-padded (see `JdbcDialect.isSupportedFunction`) and stored values never exceed
+   * that length.
+   */
+  private[sql] val V2_CHAR_READ_SIDE_PADDING = "CHAR_READ_SIDE_PADDING"
+
+  /**
+   * Like [[hasCharVarchar]], but also inspects [[UserDefinedType]] storage types.
+   * Python/Arrow host checks must match PySpark `_has_type`, which unwraps UDTs.
+   */
+  def hasCharVarcharIncludingUDT(dt: DataType): Boolean = {
+    dt.existsRecursively {
+      case _: CharType | _: VarcharType => true
+      case u: UserDefinedType[_] => hasCharVarcharIncludingUDT(u.sqlType)
+      case _ => false
+    }
+  }
+
+  /**
+   * Creates a StringRPad expression with the pad literal inheriting the collation from the
+   * str expression's data type. This is necessary because StringRPad may be created after
+   * CollationTypeCasts has run, so the default pad with StringType companion object would
+   * not get its collation coerced to match the str expression.
+   */
+  private[sql] def createStringRPad(str: Expression, len: Expression): StringRPad = {
+    StringRPad(str, len, Literal.create(" ", str.dataType))
+  }
 
   /**
    * Replaces CharType/VarcharType with StringType recursively in the given struct type. If a
@@ -40,11 +82,27 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
    * re-construct the original data type with CharType/VarcharType later when needed.
    */
   def replaceCharVarcharWithStringInSchema(st: StructType): StructType = {
+    replaceCharVarcharWithStringInSchema(st, replaceCharVarcharWithString)
+  }
+
+  /**
+   * Like [[replaceCharVarcharWithStringInSchema]], but always rewrites the physical type to
+   * unbounded STRING even when first-class CHAR/VARCHAR is enabled. Hive TRANSFORM script I/O
+   * is STRING-on-the-wire; callers apply [[stringLengthCheck]] in a Project when first-class
+   * CHAR/VARCHAR types are enabled.
+   */
+  def replaceCharVarcharWithStringInSchemaAlways(st: StructType): StructType = {
+    replaceCharVarcharWithStringInSchema(st, replaceCharVarcharWithStringAlways)
+  }
+
+  private def replaceCharVarcharWithStringInSchema(
+      st: StructType,
+      replace: DataType => DataType): StructType = {
     StructType(st.map { field =>
       if (hasCharVarchar(field.dataType)) {
         val metadata = new MetadataBuilder().withMetadata(field.metadata)
           .putString(CHAR_VARCHAR_TYPE_STRING_METADATA_KEY, field.dataType.catalogString).build()
-        field.copy(dataType = replaceCharVarcharWithString(field.dataType), metadata = metadata)
+        field.copy(dataType = replace(field.dataType), metadata = metadata)
       } else {
         field
       }
@@ -63,7 +121,7 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
       StructType(fields.map { field =>
         field.copy(dataType = replaceCharWithVarchar(field.dataType))
       })
-    case CharType(length) => VarcharType(length)
+    case c: CharType => VarcharType(c.length, c.collation)
     case _ => dt
   }
 
@@ -72,9 +130,10 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
    * warning message if it has char or varchar types
    */
   def replaceCharVarcharWithStringForCast(dt: DataType): DataType = {
-    if (SQLConf.get.charVarcharAsString) {
+    // standardSemantics takes precedence over legacy charVarcharAsString.
+    if (SQLConf.get.charVarcharAsString && !SQLConf.get.charVarcharStandardSemantics) {
       replaceCharVarcharWithString(dt)
-    } else if (hasCharVarchar(dt) && !SQLConf.get.preserveCharVarcharTypeInfo) {
+    } else if (hasCharVarchar(dt) && !SQLConf.get.charVarcharFirstClassTypes) {
       logWarning(log"The Spark cast operator does not support char/varchar type and simply treats" +
         log" them as string type. Please use string type directly to avoid confusion. Otherwise," +
         log" you can set ${MDC(CONFIG, SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key)} " +
@@ -102,6 +161,33 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
       .withMetadata(metadata)
       .remove(CHAR_VARCHAR_TYPE_STRING_METADATA_KEY)
       .build()
+  }
+
+  /**
+   * Adds the CHAR/VARCHAR types of the V2 `columns` to the attributes of `output` with the same
+   * names. `TableOutputResolver.applyColumnMetadata` removes them from the query of a write. An
+   * expression stored with the table, such as a CHECK condition or a generation expression,
+   * resolved against the result pads a string literal compared with a CHAR column, as the write
+   * pads the stored values. A write that treats CHAR as STRING does not pad the values, so the
+   * types are removed instead, also those of a query that reads a CHAR column and already matches
+   * the table: `ApplyCharTypePadding` skips such a write, but not an expression analyzed under the
+   * fixed settings of `StoredExpressionText`.
+   */
+  def withCharVarcharTypes(output: Seq[Attribute], columns: Array[Column]): Seq[Attribute] = {
+    val conf = SQLConf.get
+    // standardSemantics takes precedence over legacy charVarcharAsString.
+    if (conf.charVarcharAsString && !conf.charVarcharStandardSemantics) {
+      output.map(a => a.withMetadata(cleanMetadata(a.metadata)))
+    } else {
+      val charVarcharColumns = columns.filter(c => hasCharVarchar(c.dataType()))
+      output.map { a =>
+        charVarcharColumns.find(c => conf.resolver(c.name(), a.name)).fold(a) { c =>
+          a.withMetadata(new MetadataBuilder().withMetadata(a.metadata)
+            .putString(CHAR_VARCHAR_TYPE_STRING_METADATA_KEY, c.dataType().catalogString)
+            .build())
+        }
+      }
+    }
   }
 
   def getRawTypeString(metadata: Metadata): Option[String] = {
@@ -146,6 +232,53 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
   }
 
   /**
+   * Applies assignment semantics when parsing text into a typed schema. CHAR values are padded,
+   * and excess trailing spaces are trimmed when the remaining value fits. Non-space overflow
+   * raises EXCEED_LIMIT_LENGTH. Null stays null, and unbounded STRING is unchanged.
+   *
+   * With first-class CHAR/VARCHAR semantics enabled, for example,
+   * `from_json('{"c":"ab"}', 'c CHAR(4)')` produces `"ab  "`, while parsing `{"v":"abcd"}`
+   * as `v VARCHAR(3)` in FAILFAST mode raises EXCEED_LIMIT_LENGTH.
+   */
+  def applyTextParseSemantics(value: UTF8String, dt: DataType): UTF8String = {
+    if (value == null) {
+      null
+    } else {
+      dt match {
+        case c: CharType =>
+          CharVarcharCodegenUtils.charTypeWriteSideCheck(value, c.length)
+        case v: VarcharType =>
+          CharVarcharCodegenUtils.varcharTypeWriteSideCheck(value, v.length)
+        case _ => value
+      }
+    }
+  }
+
+  /**
+   * True if a CHAR/VARCHAR map key is not a valid identity key: CHAR(n) must be exactly n
+   * characters (shorter keys fail too); VARCHAR(n) must be at most n. STRING and other
+   * key types never violate. Avro map-key checks use this; JSON/XML keep local checks.
+   */
+  def charVarcharMapKeyViolatesLength(key: UTF8String, keyType: DataType): Boolean = {
+    keyType match {
+      case c: CharType => key.numChars() != c.length
+      case v: VarcharType => key.numChars() > v.length
+      case _ => false
+    }
+  }
+
+  /**
+   * Caps a map key echoed in an error so a long user-supplied name cannot blow the message.
+   */
+  def truncateMapKeyForError(key: UTF8String, maxChars: Int = 128): UTF8String = {
+    if (key != null && key.numChars() > maxChars) {
+      UTF8String.concat(key.substring(0, maxChars), UTF8String.fromString("..."))
+    } else {
+      key
+    }
+  }
+
+  /**
    * Returns an expression to apply write-side string length check for the given expression. A
    * string value can not exceed N characters if it's written into a CHAR(N)/VARCHAR(N)
    * column/field.
@@ -154,6 +287,15 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
     getRawType(targetAttr.metadata).map { rawType =>
       stringLengthCheck(expr, rawType)
     }.getOrElse(expr)
+  }
+
+  /**
+   * Write-side CHAR/VARCHAR length checks apply unless the session is on the legacy
+   * `charVarcharAsString` path with no first-class types. `standardSemantics` and
+   * `preserveCharVarcharTypeInfo` keep first-class types even if the legacy flag is also on.
+   */
+  def shouldApplyWriteSideLengthCheck(conf: SQLConf): Boolean = {
+    !conf.charVarcharAsString || conf.charVarcharFirstClassTypes
   }
 
   def stringLengthCheck(expr: Expression, dt: DataType): Expression = {
@@ -170,28 +312,28 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
       charFuncName: Option[String],
       varcharFuncName: Option[String]): Expression = {
     dt match {
-      case CharType(length) if charFuncName.isDefined =>
+      case c: CharType if charFuncName.isDefined =>
         StaticInvoke(
           classOf[CharVarcharCodegenUtils],
-          if (SQLConf.get.preserveCharVarcharTypeInfo) {
-            CharType(length)
+          if (SQLConf.get.charVarcharFirstClassTypes) {
+            c
           } else {
-            StringType
+            c.toStringType
           },
           charFuncName.get,
-          expr :: Literal(length) :: Nil,
+          expr :: Literal(c.length) :: Nil,
           returnNullable = false)
 
-      case VarcharType(length) if varcharFuncName.isDefined =>
+      case v: VarcharType if varcharFuncName.isDefined =>
         StaticInvoke(
           classOf[CharVarcharCodegenUtils],
-          if (SQLConf.get.preserveCharVarcharTypeInfo) {
-            VarcharType(length)
+          if (SQLConf.get.charVarcharFirstClassTypes) {
+            v
           } else {
-            StringType
+            v.toStringType
           },
           varcharFuncName.get,
-          expr :: Literal(length) :: Nil,
+          expr :: Literal(v.length) :: Nil,
           returnNullable = false)
 
       case StructType(fields) =>
@@ -202,10 +344,8 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
         if (struct.valExprs.forall(_.isInstanceOf[GetStructField])) {
           // No field needs char/varchar processing, just return the original expression.
           expr
-        } else if (expr.nullable) {
-          If(IsNull(expr), Literal(null, struct.dataType), struct)
         } else {
-          struct
+          nullSafeRebuiltStruct(expr, struct)
         }
 
       case ArrayType(et, containsNull) =>
@@ -229,6 +369,19 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
     }
   }
 
+  /**
+   * Guard a rebuilt named_struct so a NULL input stays NULL. Use CaseWhen rather than If:
+   * CollationTypeCoercion rewrites If (no same-type skip) and can widen VARCHAR collations
+   * inside the struct to unbounded STRING. CaseWhen skips that when the branches already match.
+   */
+  private def nullSafeRebuiltStruct(expr: Expression, struct: CreateNamedStruct): Expression = {
+    if (expr.nullable) {
+      CaseWhen(Seq((IsNull(expr), Literal(null, struct.dataType))), Some(struct))
+    } else {
+      struct
+    }
+  }
+
   private def processStringForCharVarcharInArray(
       arr: Expression,
       et: DataType,
@@ -246,10 +399,68 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
   }
 
   def addPaddingForScan(attr: Attribute): Expression = {
-    getRawType(attr.metadata).map { rawType =>
-      processStringForCharVarchar(
-        attr, rawType, charFuncName = Some("readSidePadding"), varcharFuncName = None)
+    // Driven by metadata rather than attr.dataType even when Char/Varchar are first-class types.
+    // The metadata is the "not yet padded" marker: ApplyCharTypePadding rebuilds the relation via
+    // cleanAttrMetadata, so a second application of the rule finds no raw type and leaves the plan
+    // alone. Keying off attr.dataType instead would re-pad an already-padded scan on every pass and
+    // break the Once strategy's idempotence check.
+    getRawType(attr.metadata).map { dt =>
+      if (SQLConf.get.charVarcharStandardSemantics) {
+        // Pad CHAR and enforce length limits for CHAR/VARCHAR (trim trailing blanks first).
+        processStringForCharVarchar(
+          attr,
+          dt,
+          charFuncName = Some(CHAR_TYPE_READ_SIDE_CHECK),
+          varcharFuncName = Some(VARCHAR_TYPE_READ_SIDE_CHECK))
+      } else {
+        processStringForCharVarchar(
+          attr, dt, charFuncName = Some(READ_SIDE_PADDING), varcharFuncName = None)
+      }
     }.getOrElse(attr)
+  }
+
+  /**
+   * Matches the read-side CHAR padding that [[addPaddingForScan]] wraps a column in (when
+   * standard semantics are off) and extracts the padded expression and the CHAR length.
+   */
+  private[sql] object ReadSidePadding {
+    def unapply(e: Expression): Option[(Expression, Int)] = e match {
+      case s @ StaticInvoke(_, _, READ_SIDE_PADDING, Seq(child, Literal(n: Int, _)), _, _, _, _,
+          None) if s.staticObject == classOf[CharVarcharCodegenUtils] =>
+        Some((child, n))
+      case _ => None
+    }
+  }
+
+  /**
+   * Matches what [[addPaddingForScan]] wraps a column in: the read-side CHAR padding, or under
+   * standard CHAR/VARCHAR semantics one of the read-side checks. Extracts the wrapped expression,
+   * the length, and whether shorter values are padded to that length, as the padding and the CHAR
+   * check do. Unlike [[ReadSidePadding]] it also matches the checks, which trim trailing spaces and
+   * fail on values still longer than the length, so it must not be used to compile padding.
+   */
+  private[sql] object ReadSidePaddingOrCheck {
+    def unapply(e: Expression): Option[(Expression, Int, Boolean)] = e match {
+      case s @ StaticInvoke(_, _, name, Seq(child, Literal(n: Int, _)), _, _, _, _, None)
+          if s.staticObject == classOf[CharVarcharCodegenUtils] =>
+        name match {
+          case READ_SIDE_PADDING | CHAR_TYPE_READ_SIDE_CHECK => Some((child, n, true))
+          case VARCHAR_TYPE_READ_SIDE_CHECK => Some((child, n, false))
+          case _ => None
+        }
+      case _ => None
+    }
+  }
+
+  /**
+   * Strips a cast of a CHAR, VARCHAR or STRING value to a STRING of the same collation, such as
+   * the one a comparison with a STRING adds when CHAR and VARCHAR are first-class types. Such a
+   * cast returns the value unchanged, so the result is unique, or estimated, as the child is.
+   */
+  def stripCastToPlainString(e: Expression): Expression = e match {
+    case Cast(child, to: StringType, _, _) if StringHelper.plainStringType(child.dataType) == to =>
+      child
+    case _ => e
   }
 
   /**
@@ -261,6 +472,11 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
     val rawTypes = attrs.map(attr => getRawType(attr.metadata))
     if (rawTypes.exists(_.isEmpty)) {
       attrs
+    } else if (attrs.exists(attr => !RowOrdering.isOrderable(attr.dataType))) {
+      // Comparing a non-orderable type, such as a struct holding a MAP, is rejected later by
+      // CheckAnalysis. Leave it alone so the error names the attribute the user wrote rather
+      // than the rewritten struct.
+      attrs
     } else {
       val typeWithTargetCharLength = rawTypes.map(_.get).reduce(typeWithWiderCharLength)
       attrs.zip(rawTypes.map(_.get)).map { case (attr, rawType) =>
@@ -271,8 +487,8 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
 
   private def typeWithWiderCharLength(type1: DataType, type2: DataType): DataType = {
     (type1, type2) match {
-      case (CharType(len1), CharType(len2)) =>
-        CharType(math.max(len1, len2))
+      case (c1: CharType, c2: CharType) =>
+        CharType(math.max(c1.length, c2.length), c1.collation)
       case (StructType(fields1), StructType(fields2)) =>
         assert(fields1.length == fields2.length)
         StructType(fields1.zip(fields2).map { case (left, right) =>
@@ -290,8 +506,8 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
       typeWithTargetCharLength: DataType,
       alwaysPad: Boolean): Option[Expression] = {
     (rawType, typeWithTargetCharLength) match {
-      case (CharType(len), CharType(target)) if alwaysPad || target > len =>
-        Some(StringRPad(expr, Literal(target)))
+      case (c: CharType, t: CharType) if alwaysPad || t.length > c.length =>
+        Some(createStringRPad(expr, Literal(t.length)))
 
       case (StructType(fields), StructType(targets)) =>
         assert(fields.length == targets.length)
@@ -303,12 +519,23 @@ object CharVarcharUtils extends Logging with SparkCharVarcharUtils {
           val fieldExpr = GetStructField(expr, i, Some(field.name))
           val padded = padCharToTargetLength(
             fieldExpr, field.dataType, targets(i).dataType, alwaysPad)
-          needPadding = padded.isDefined
+          // Accumulate: any single field needing padding means the struct must be rebuilt,
+          // otherwise the padding computed for earlier fields would be discarded.
+          needPadding |= padded.isDefined
           createStructExprs += Literal(field.name)
           createStructExprs += padded.getOrElse(fieldExpr)
           i += 1
         }
-        if (needPadding) Some(CreateNamedStruct(createStructExprs.toSeq)) else None
+        if (needPadding) {
+          val struct = CreateNamedStruct(createStructExprs.toSeq)
+          // Rebuilding the struct field by field loses the nullability of the struct itself:
+          // GetStructField on a NULL struct yields NULL fields, which CreateNamedStruct would
+          // turn into a non-NULL struct of NULLs. Guard it the same way the scan-side rewrite
+          // in processStringForCharVarchar does.
+          Some(nullSafeRebuiltStruct(expr, struct))
+        } else {
+          None
+        }
 
       case (ArrayType(et, containsNull), ArrayType(target, _)) =>
         val param = NamedLambdaVariable("x", replaceCharVarcharWithString(et), containsNull)

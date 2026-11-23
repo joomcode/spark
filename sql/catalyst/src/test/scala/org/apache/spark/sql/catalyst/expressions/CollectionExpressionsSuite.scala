@@ -24,20 +24,20 @@ import java.util.TimeZone
 import scala.language.implicitConversions
 import scala.util.Random
 
-import org.apache.spark.{SparkFunSuite, SparkRuntimeException}
+import org.apache.spark.{SparkArrayIndexOutOfBoundsException, SparkFunSuite, SparkIllegalArgumentException, SparkRuntimeException}
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
-import org.apache.spark.sql.catalyst.util.{DateTimeTestUtils, DateTimeUtils}
-import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.{outstandingZoneIds, LA, UTC}
+import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, DateTimeTestUtils, DateTimeUtils, GenericArrayData, TimestampNanosTestUtils}
+import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.{outstandingZoneIds, LA, UTC, UTC_OPT}
 import org.apache.spark.sql.catalyst.util.IntervalUtils._
 import org.apache.spark.sql.catalyst.util.TypeUtils.ordinalNumber
 import org.apache.spark.sql.errors.DataTypeErrorsBase
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.array.ByteArrayMethods
-import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.unsafe.types.{TimestampNanosVal, UTF8String}
 
 class CollectionExpressionsSuite
   extends SparkFunSuite with ExpressionEvalHelper with DataTypeErrorsBase {
@@ -923,8 +923,66 @@ class CollectionExpressionsSuite
     checkEvaluation(Slice(a1, Literal(1), Literal(2)), Seq("a", "b"))
     checkEvaluation(Slice(a2, Literal(1), Literal(2)), Seq("", null))
     checkEvaluation(Slice(a0, Literal(10), Literal(1)), Seq.empty[Int])
+    // SPARK-57665: a large length must not overflow startIndex + length; both the interpreted and
+    // codegen paths must return the tail of the array, not an empty array.
+    checkEvaluation(Slice(a0, Literal(2), Literal(Int.MaxValue)), Seq(2, 3, 4, 5, 6))
+    checkEvaluation(Slice(a0, Literal(1), Literal(Int.MaxValue)), Seq(1, 2, 3, 4, 5, 6))
+    // Negative start with a large length exercises the start < 0 branch together with clamping.
+    checkEvaluation(Slice(a0, Literal(-2), Literal(Int.MaxValue)), Seq(5, 6))
+    // Both extremes: an Int.MinValue start resolves far below 0, so the guard returns empty and
+    // the (harmlessly overflowing) resolved length is never used.
+    checkEvaluation(Slice(a0, Literal(Int.MinValue), Literal(Int.MaxValue)), Seq.empty[Int])
+    // A negative length is still rejected when the start is out of range, because the length is
+    // resolved before the start guard.
+    checkErrorInExpression[SparkRuntimeException](
+      expression = Slice(a0, Literal(-20), Literal(-1)),
+      condition = "INVALID_PARAMETER_VALUE.LENGTH",
+      parameters = Map(
+        "parameter" -> toSQLId("length"),
+        "length" -> (-1).toString,
+        "functionName" -> toSQLId("slice")
+      ))
     checkEvaluation(Slice(a1, Literal(10), Literal(1)), Seq.empty[String])
     checkEvaluation(Slice(a3, Literal(2), Literal(3)), Seq(2, null, 4))
+  }
+
+  test("TrimArray") {
+    val a0 = Literal.create(Seq(1, 2, 3, 4, 5), ArrayType(IntegerType))
+    val a1 = Literal.create(Seq[String]("a", "b", "c"), ArrayType(StringType))
+    val a2 = Literal.create(Seq[String]("a", null, "b"), ArrayType(StringType, containsNull = true))
+    val a3 = Literal.create(Seq.empty[Int], ArrayType(IntegerType))
+
+    // n between 0 and cardinality removes the last n elements.
+    checkEvaluation(TrimArray(a0, Literal(0)), Seq(1, 2, 3, 4, 5))
+    checkEvaluation(TrimArray(a0, Literal(2)), Seq(1, 2, 3))
+    checkEvaluation(TrimArray(a0, Literal(5)), Seq.empty[Int])
+    checkEvaluation(TrimArray(a1, Literal(1)), Seq("a", "b"))
+    checkEvaluation(TrimArray(a2, Literal(1)), Seq("a", null))
+    checkEvaluation(TrimArray(a3, Literal(0)), Seq.empty[Int])
+
+    // NULL array or NULL n yields NULL.
+    checkEvaluation(TrimArray(Literal.create(null, ArrayType(IntegerType)), Literal(1)), null)
+    checkEvaluation(TrimArray(a0, Literal.create(null, IntegerType)), null)
+
+    // n < 0 and n > cardinality are rejected.
+    checkErrorInExpression[SparkRuntimeException](
+      expression = TrimArray(a0, Literal(-1)),
+      condition = "INVALID_PARAMETER_VALUE.TRIM_ARRAY_LENGTH",
+      parameters = Map(
+        "parameter" -> toSQLId("n"),
+        "functionName" -> toSQLId("trim_array"),
+        "numElements" -> "5",
+        "length" -> (-1).toString
+      ))
+    checkErrorInExpression[SparkRuntimeException](
+      expression = TrimArray(a0, Literal(6)),
+      condition = "INVALID_PARAMETER_VALUE.TRIM_ARRAY_LENGTH",
+      parameters = Map(
+        "parameter" -> toSQLId("n"),
+        "functionName" -> toSQLId("trim_array"),
+        "numElements" -> "5",
+        "length" -> 6.toString
+      ))
   }
 
   test("ArrayJoin") {
@@ -960,6 +1018,71 @@ class CollectionExpressionsSuite
       Literal.create(Seq[String](null), ArrayType(StringType)),
       Literal(","),
       Some(Literal.create(null, StringType))), null)
+  }
+
+  test("ArrayJoin codegen with non-nullable array/delimiter and nullable " +
+    "nullReplacement") {
+    // When an upstream IsNotNull filter tightens the array and delimiter to
+    // non-nullable but the nullReplacement is a nullable column, ArrayJoin.nullable is true so
+    // doGenCode initializes ev.isNull = true. The non-nullable branch of
+    // genCodeForArrayAndDelimiter must still reset ev.isNull = false, otherwise codegen builds the
+    // joined string but discards it as NULL while interpreted eval() returns the correct result.
+    val arr = BoundReference(0, ArrayType(StringType, containsNull = true), nullable = false)
+    val delimiter = BoundReference(1, StringType, nullable = false)
+    val nullReplacement = BoundReference(2, StringType, nullable = true)
+    val arrayJoin = ArrayJoin(arr, delimiter, Some(nullReplacement))
+    // ArrayJoin is nullable only because nullReplacement is nullable.
+    assert(arrayJoin.nullable)
+
+    // Non-null replacement: NULL array elements are replaced and a joined string is produced.
+    checkEvaluation(
+      arrayJoin,
+      "a,NR,b",
+      create_row(Seq[String]("a", null, "b"), ",", "NR"))
+
+    // Null replacement value: the whole result is NULL, matching eval().
+    checkEvaluation(
+      arrayJoin,
+      null,
+      create_row(Seq[String]("a", null, "b"), ",", null))
+  }
+
+  Seq(
+    ("literal", Literal("temp"), "temp"),
+    ("collated literal", Literal.create("temp", StringType("UTF8_LCASE")), "temp"),
+    ("dynamic", BoundReference(0, StringType, nullable = false), "0"),
+    ("foldable", Concat(Seq(Literal("te"), Literal("mp"))), "0"),
+    ("null", Literal.create(null, StringType), "0")
+  ).foreach { case (description, key, fieldName) =>
+    test(s"ArraysZip field names for $description string map keys") {
+      val map = Literal.create(
+        Map("temp" -> Seq(1, 2), "hum" -> Seq(3, 4)),
+        MapType(key.dataType, ArrayType(IntegerType)))
+      val hum = GetMapValue(map, Literal.create("hum", key.dataType))
+      val zipped = ArraysZip(Seq(GetMapValue(map, key), hum))
+      assert(zipped.dataType == ArrayType(new StructType()
+        .add(fieldName, IntegerType)
+        .add("hum", IntegerType), containsNull = false))
+      val expected = if (description == "null") null else Seq(Row(1, 3), Row(2, 4))
+      checkEvaluation(zipped, expected, InternalRow(UTF8String.fromString("temp")))
+    }
+  }
+
+  Seq(
+    Literal(1),
+    Literal(Date.valueOf("2026-01-01")),
+    Literal(Timestamp.valueOf("2026-01-01 12:00:00")),
+    Literal(Array[Byte](1, 2))
+  ).foreach { key =>
+    test(s"ArraysZip field names for ${key.dataType.sql} map keys") {
+      val array = Literal.create(Seq(1, 2), ArrayType(IntegerType))
+      val map = CreateMap(Seq(key, array))
+      val zipped = ArraysZip(Seq(array, GetMapValue(map, key)))
+      assert(zipped.dataType == ArrayType(new StructType()
+        .add("0", IntegerType)
+        .add("1", IntegerType), containsNull = false))
+      checkEvaluation(zipped, Seq(Row(1, 1), Row(2, 2)))
+    }
   }
 
   test("ArraysZip") {
@@ -1137,6 +1260,20 @@ class CollectionExpressionsSuite
         "maxRoundedArrayLength" -> ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH.toString(),
         "parameter" -> toSQLId("count")))
 
+    // SPARK-58821: an overflow in the `Long` length computation does not by itself mean the
+    // sequence is too long, because the length also depends on the step. For a large step the
+    // result has only a few elements, so the exact length recomputed in `BigInt` has to be
+    // returned rather than treated as an unreachable case.
+    checkEvaluation(
+      new Sequence(Literal(Long.MinValue), Literal(Long.MaxValue), Literal(Long.MaxValue)),
+      Seq(Long.MinValue, -1L, Long.MaxValue - 1))
+    checkEvaluation(
+      new Sequence(Literal(Long.MinValue), Literal(0L), Literal(4611686018427387904L)),
+      Seq(Long.MinValue, -4611686018427387904L, 0L))
+    checkEvaluation(
+      new Sequence(Literal(Long.MaxValue), Literal(Long.MinValue), Literal(-Long.MaxValue)),
+      Seq(Long.MaxValue, 0L, -Long.MaxValue))
+
     // test sequence with one element (zero step or equal start and stop)
 
     checkEvaluation(new Sequence(Literal(1), Literal(1), Literal(-1)), Seq(1))
@@ -1155,6 +1292,39 @@ class CollectionExpressionsSuite
     checkEvaluation(
       new Sequence(Literal(-1.toByte), Literal(-3.toByte), Literal(-1.toByte)),
       Seq(-1.toByte, -2.toByte, -3.toByte))
+  }
+
+  test("SPARK-58440: illegal sequence boundaries carry String message parameters") {
+    // Codegen-only: the interpreted path reports this through `require`, which throws a plain
+    // IllegalArgumentException with no error class or parameters, so the two-mode
+    // `checkErrorInExpression` cannot be used here.
+    // The parameter map is built in generated Java source. Janino erases the
+    // `Map<String, String>` type arguments, so non-String values used to slip in and reach
+    // `SparkThrowable.getMessageParameters`, whose declared value type is String.
+    withSQLConf(
+        SQLConf.CODEGEN_FACTORY_MODE.key -> CodegenObjectFactoryMode.CODEGEN_ONLY.toString) {
+      // Numeric start/stop/step (IntegralSequenceImpl).
+      checkError(
+        exception = intercept[SparkIllegalArgumentException] {
+          evaluateWithMutableProjection(new Sequence(Literal(1), Literal(2), Literal(0)))
+        },
+        condition = "_LEGACY_ERROR_TEMP_3243",
+        parameters = Map("start" -> "1", "stop" -> "2", "step" -> "0"))
+
+      // Interval step (InternalSequenceBase): `step` is a CalendarInterval, not a number. A
+      // month-granularity step is required to reach this path; a day-granularity one is
+      // delegated to the integral implementation with a plain `int` step.
+      checkError(
+        exception = intercept[SparkIllegalArgumentException] {
+          evaluateWithMutableProjection(Sequence(
+            Literal(Date.valueOf("1970-01-01")),
+            Literal(Date.valueOf("1970-02-01")),
+            Some(Literal(negateExact(stringToInterval("interval 1 month")))),
+            UTC_OPT))
+        },
+        condition = "_LEGACY_ERROR_TEMP_3243",
+        parameters = Map("start" -> "0", "stop" -> "2678400000000", "step" -> "-1 months"))
+    }
   }
 
   test("Sequence of timestamps") {
@@ -1267,6 +1437,148 @@ class CollectionExpressionsSuite
         Timestamp.valueOf("2020-11-01 00:00:00.000"),
         Timestamp.valueOf("2019-06-01 00:00:00.000"),
         Timestamp.valueOf("2018-01-01 00:00:00.000")))
+  }
+
+  test("SPARK-57834: sequence of nanosecond-precision timestamps") {
+    // The sequence advances on the microsecond grid and every element carries the start value's
+    // sub-microsecond fraction; the endpoints' own fractions decide the bound in full precision.
+    val sec = 1000000L // microseconds per second
+    val hour = 3600 * sec
+    val day = 86400000000L // microseconds per day
+    val month = 2678400000000L // microseconds in January 1970 (31 days), for the month-step case
+    def ntz(micros: Long, frac: Int, p: Int = 9): Literal =
+      Literal(TimestampNanosVal.fromParts(micros, frac.toShort), TimestampNTZNanosType(p))
+    def ltz(micros: Long, frac: Int, p: Int = 9): Literal =
+      Literal(TimestampNanosVal.fromParts(micros, frac.toShort), TimestampLTZNanosType(p))
+    def tnv(micros: Long, frac: Int): TimestampNanosVal =
+      TimestampNanosVal.fromParts(micros, frac.toShort)
+
+    // NTZ(9), calendar-interval step; the 123ns fraction is kept on every element.
+    checkEvaluation(new Sequence(
+      ntz(0, 123), ntz(2 * sec, 123),
+      Literal(stringToInterval("interval 1 second"))),
+      Seq(tnv(0, 123), tnv(sec, 123), tnv(2 * sec, 123)))
+
+    // Day-time interval (Duration) step and year-month interval (Period) step, exercising the
+    // Duration/Period sequence implementations for nanos rather than only the calendar path.
+    checkEvaluation(new Sequence(
+      ntz(0, 123), ntz(2 * hour, 123), Literal(Duration.ofHours(1))),
+      Seq(tnv(0, 123), tnv(hour, 123), tnv(2 * hour, 123)))
+    checkEvaluation(new Sequence(
+      ntz(0, 123), ntz(month, 123), Literal(Period.ofMonths(1))),
+      Seq(tnv(0, 123), tnv(month, 123)))
+
+    // LTZ(9), hour step (zone-independent since it adds pure microseconds).
+    checkEvaluation(new Sequence(
+      ltz(0, 500), ltz(2 * hour, 500),
+      Literal(stringToInterval("interval 1 hour"))),
+      Seq(tnv(0, 500), tnv(hour, 500), tnv(2 * hour, 500)))
+
+    // Precision 8 (fraction is a multiple of 10) and precision 7 (multiple of 100).
+    checkEvaluation(new Sequence(
+      ntz(0, 120, 8), ntz(sec, 120, 8),
+      Literal(stringToInterval("interval 1 second"))),
+      Seq(tnv(0, 120), tnv(sec, 120)))
+    checkEvaluation(new Sequence(
+      ntz(0, 100, 7), ntz(sec, 100, 7),
+      Literal(stringToInterval("interval 1 second"))),
+      Seq(tnv(0, 100), tnv(sec, 100)))
+
+    // Differing fractions: start.frac > stop.frac drops the element that lands on stop's
+    // microsecond (it would exceed stop), so the result never overshoots stop.
+    checkEvaluation(new Sequence(
+      ntz(0, 900), ntz(2 * sec, 100),
+      Literal(stringToInterval("interval 1 second"))),
+      Seq(tnv(0, 900), tnv(sec, 900)))
+    // start.frac <= stop.frac keeps the boundary element.
+    checkEvaluation(new Sequence(
+      ntz(0, 100), ntz(2 * sec, 900),
+      Literal(stringToInterval("interval 1 second"))),
+      Seq(tnv(0, 100), tnv(sec, 100), tnv(2 * sec, 100)))
+    // stop on a whole second, start with a larger fraction: the element landing on stop's
+    // microsecond is dropped rather than overshooting stop (only start is in [start, stop]).
+    checkEvaluation(new Sequence(
+      ntz(0, 500), ntz(sec, 0),
+      Literal(stringToInterval("interval 1 second"))),
+      Seq(tnv(0, 500)))
+
+    // Negative step, equal fractions.
+    checkEvaluation(new Sequence(
+      ntz(2 * sec, 999), ntz(0, 999),
+      Literal(negateExact(stringToInterval("interval 1 second")))),
+      Seq(tnv(2 * sec, 999), tnv(sec, 999), tnv(0, 999)))
+    // Negative step, differing fractions: an element on stop's microsecond is kept only when it
+    // stays >= stop. startFrac < stopFrac drops it; startFrac >= stopFrac keeps it.
+    checkEvaluation(new Sequence(
+      ntz(2 * sec, 100), ntz(0, 900),
+      Literal(negateExact(stringToInterval("interval 1 second")))),
+      Seq(tnv(2 * sec, 100), tnv(sec, 100)))
+    checkEvaluation(new Sequence(
+      ntz(2 * sec, 900), ntz(0, 100),
+      Literal(negateExact(stringToInterval("interval 1 second")))),
+      Seq(tnv(2 * sec, 900), tnv(sec, 900), tnv(0, 900)))
+
+    // Negative calendar/day/month and default steps route through the while-loop sequence
+    // machinery (not the count-based micros path), where the micro-nudged bound cannot exclude an
+    // endpoint that lands on stop's microsecond. A descending whole-day step with
+    // startFrac < stopFrac must still drop that endpoint (tnv(0, 100) is < stop tnv(0, 900)).
+    checkEvaluation(new Sequence(
+      ntz(2 * day, 100), ntz(0, 900),
+      Literal(negateExact(stringToInterval("interval 1 day")))),
+      Seq(tnv(2 * day, 100), tnv(day, 100)))
+    // Same descending day step but startFrac >= stopFrac keeps the endpoint (it stays >= stop).
+    checkEvaluation(new Sequence(
+      ntz(2 * day, 900), ntz(0, 100),
+      Literal(negateExact(stringToInterval("interval 1 day")))),
+      Seq(tnv(2 * day, 900), tnv(day, 900), tnv(0, 900)))
+    // Descending month step (Period, while-loop path) with startFrac < stopFrac: the endpoint that
+    // lands on stop's microsecond is dropped.
+    checkEvaluation(new Sequence(
+      ntz(month, 100), ntz(0, 900), Literal(Period.ofMonths(-1))),
+      Seq(tnv(month, 100)))
+    // Default (implicit) step: start > stop picks a descending 1-day step (while-loop path); the
+    // endpoint that lands on stop's microsecond is dropped when startFrac < stopFrac.
+    checkEvaluation(new Sequence(ntz(2 * day, 100), ntz(0, 900)),
+      Seq(tnv(2 * day, 100), tnv(day, 100)))
+
+    // start == stop yields a single element that still carries the fraction.
+    checkEvaluation(new Sequence(
+      ntz(5 * sec, 42), ntz(5 * sec, 42),
+      Literal(stringToInterval("interval 1 second"))),
+      Seq(tnv(5 * sec, 42)))
+
+    // Endpoints share a microsecond but start > stop in full precision: with a positive step this
+    // is an illegal boundary, matching sequence(2, 1, 1). Codegen-only, like SPARK-58440 (the
+    // interpreted path reports this through `require`, a plain IllegalArgumentException). The
+    // reported bound is nudged one microsecond off stop to trigger the machinery's boundary check.
+    withSQLConf(
+        SQLConf.CODEGEN_FACTORY_MODE.key -> CodegenObjectFactoryMode.CODEGEN_ONLY.toString) {
+      checkError(
+        exception = intercept[SparkIllegalArgumentException] {
+          evaluateWithMutableProjection(Sequence(
+            ntz(sec, 500), ntz(sec, 100),
+            Some(Literal(stringToInterval("interval 1 second"))), UTC_OPT))
+        },
+        condition = "_LEGACY_ERROR_TEMP_3243",
+        parameters = Map("start" -> "1000000", "stop" -> "999999", "step" -> "1000000"))
+    }
+
+    // No explicit step: the default step (+1 day) is chosen from the full-precision comparison.
+    checkEvaluation(new Sequence(ntz(0, 7), ntz(day, 7)),
+      Seq(tnv(0, 7), tnv(day, 7)))
+    // Equal microseconds, differing fractions, no explicit step: the default step direction comes
+    // from the full-precision comparison, so the single in-range element is start itself (never an
+    // out-of-order pair). Ascending when start < stop, descending when start > stop.
+    checkEvaluation(new Sequence(ntz(5 * sec, 100), ntz(5 * sec, 500)), Seq(tnv(5 * sec, 100)))
+    checkEvaluation(new Sequence(ntz(5 * sec, 500), ntz(5 * sec, 100)), Seq(tnv(5 * sec, 500)))
+
+    // Null propagation.
+    checkEvaluation(new Sequence(
+      Literal.create(null, TimestampNTZNanosType(9)), ntz(sec, 1),
+      Literal(stringToInterval("interval 1 second"))), null)
+    checkEvaluation(new Sequence(
+      ntz(0, 1), Literal.create(null, TimestampNTZNanosType(9)),
+      Literal(stringToInterval("interval 1 second"))), null)
   }
 
   test("Sequence on DST boundaries") {
@@ -1855,6 +2167,19 @@ class CollectionExpressionsSuite
     checkEvaluation(Reverse(as6), Seq.empty)
     checkEvaluation(Reverse(as7), null)
     checkEvaluation(Reverse(aa), Seq(Seq("e"), Seq("c", "d"), Seq("a", "b")))
+
+    // BinaryType
+    val bb0 = Literal.create(Array[Byte](0xe6.toByte, 0x87.toByte), BinaryType)
+    val bb1 = Literal.create(Array[Byte](), BinaryType)
+    val bb2 = Literal.create(Array[Byte](0xff.toByte), BinaryType)
+    val bb3 = Literal.create(Array[Byte](0x00.toByte, 0x87.toByte), BinaryType)
+    val bb4 = Literal.create(null, BinaryType)
+
+    checkEvaluation(Reverse(bb0), Array[Byte](0x87.toByte, 0xe6.toByte))
+    checkEvaluation(Reverse(bb1), Array[Byte]())
+    checkEvaluation(Reverse(bb2), Array[Byte](0xff.toByte))
+    checkEvaluation(Reverse(bb3), Array[Byte](0x87.toByte, 0x00.toByte))
+    checkEvaluation(Reverse(bb4), null)
   }
 
   test("Array Position") {
@@ -1887,79 +2212,275 @@ class CollectionExpressionsSuite
     checkEvaluation(ArrayPosition(aa1, aae), 0L)
   }
 
-  test("elementAt") {
-    val a0 = Literal.create(Seq(1, 2, 3), ArrayType(IntegerType))
-    val a1 = Literal.create(Seq[String](null, ""), ArrayType(StringType))
-    val a2 = Literal.create(Seq(null), ArrayType(LongType))
-    val a3 = Literal.create(null, ArrayType(StringType))
+  Seq((Int.MaxValue, "Linear Lookup"), (0, "Hash Lookup")).foreach { case (threshold, name) =>
+    test(s"elementAt - $name") {
+      withSQLConf(SQLConf.MAP_LOOKUP_HASH_THRESHOLD.key -> threshold.toString) {
+        val a0 = Literal.create(Seq(1, 2, 3), ArrayType(IntegerType))
+        val a1 = Literal.create(Seq[String](null, ""), ArrayType(StringType))
+        val a2 = Literal.create(Seq(null), ArrayType(LongType))
+        val a3 = Literal.create(null, ArrayType(StringType))
 
-    intercept[Exception] {
-      checkEvaluation(ElementAt(a0, Literal(0)), null)
-    }.getMessage.contains("SQL array indices start at 1")
-    intercept[Exception] { checkEvaluation(ElementAt(a0, Literal(1.1)), null) }
-    withSQLConf(SQLConf.ANSI_ENABLED.key -> false.toString) {
-      checkEvaluation(ElementAt(a0, Literal(4)), null)
-      checkEvaluation(ElementAt(a0, Literal(-4)), null)
-    }
+        intercept[Exception] {
+          checkEvaluation(ElementAt(a0, Literal(0)), null)
+        }.getMessage.contains("SQL array indices start at 1")
+        intercept[Exception] { checkEvaluation(ElementAt(a0, Literal(1.1)), null) }
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> false.toString) {
+          checkEvaluation(ElementAt(a0, Literal(4)), null)
+          checkEvaluation(ElementAt(a0, Literal(-4)), null)
+        }
 
-    checkEvaluation(ElementAt(a0, Literal(1)), 1)
-    checkEvaluation(ElementAt(a0, Literal(2)), 2)
-    checkEvaluation(ElementAt(a0, Literal(3)), 3)
-    checkEvaluation(ElementAt(a0, Literal(-3)), 1)
-    checkEvaluation(ElementAt(a0, Literal(-2)), 2)
-    checkEvaluation(ElementAt(a0, Literal(-1)), 3)
+        checkEvaluation(ElementAt(a0, Literal(1)), 1)
+        checkEvaluation(ElementAt(a0, Literal(2)), 2)
+        checkEvaluation(ElementAt(a0, Literal(3)), 3)
+        checkEvaluation(ElementAt(a0, Literal(-3)), 1)
+        checkEvaluation(ElementAt(a0, Literal(-2)), 2)
+        checkEvaluation(ElementAt(a0, Literal(-1)), 3)
 
-    checkEvaluation(ElementAt(a1, Literal(1)), null)
-    checkEvaluation(ElementAt(a1, Literal(2)), "")
-    checkEvaluation(ElementAt(a1, Literal(-2)), null)
-    checkEvaluation(ElementAt(a1, Literal(-1)), "")
+        checkEvaluation(ElementAt(a1, Literal(1)), null)
+        checkEvaluation(ElementAt(a1, Literal(2)), "")
+        checkEvaluation(ElementAt(a1, Literal(-2)), null)
+        checkEvaluation(ElementAt(a1, Literal(-1)), "")
 
-    checkEvaluation(ElementAt(a2, Literal(1)), null)
+        checkEvaluation(ElementAt(a2, Literal(1)), null)
 
-    checkEvaluation(ElementAt(a3, Literal(1)), null)
+        checkEvaluation(ElementAt(a3, Literal(1)), null)
 
 
-    val m0 =
-      Literal.create(Map("a" -> "1", "b" -> "2", "c" -> null), MapType(StringType, StringType))
-    val m1 = Literal.create(Map[String, String](), MapType(StringType, StringType))
-    val m2 = Literal.create(null, MapType(StringType, StringType))
+        val m0 =
+          Literal.create(Map("a" -> "1", "b" -> "2", "c" -> null),
+            MapType(StringType, StringType))
+        val m1 = Literal.create(Map[String, String](), MapType(StringType, StringType))
+        val m2 = Literal.create(null, MapType(StringType, StringType))
 
-    assert(ElementAt(m0, Literal(1.0)).checkInputDataTypes() ==
-      DataTypeMismatch(
-        errorSubClass = "MAP_FUNCTION_DIFF_TYPES",
-        messageParameters = Map(
-          "functionName" -> "`element_at`",
-          "dataType" -> "\"MAP\"",
-          "leftType" -> "\"MAP<STRING, STRING>\"",
-          "rightType" -> "\"DOUBLE\""
+        assert(ElementAt(m0, Literal(1.0)).checkInputDataTypes() ==
+          DataTypeMismatch(
+            errorSubClass = "MAP_FUNCTION_DIFF_TYPES",
+            messageParameters = Map(
+              "functionName" -> "`element_at`",
+              "dataType" -> "\"MAP\"",
+              "leftType" -> "\"MAP<STRING, STRING>\"",
+              "rightType" -> "\"DOUBLE\""
+            )
+          )
         )
-      )
-    )
 
-    withSQLConf(SQLConf.ANSI_ENABLED.key -> false.toString) {
-      checkEvaluation(ElementAt(m0, Literal("d")), null)
-      checkEvaluation(ElementAt(m1, Literal("a")), null)
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> false.toString) {
+          checkEvaluation(ElementAt(m0, Literal("d")), null)
+          checkEvaluation(ElementAt(m1, Literal("a")), null)
+        }
+
+        checkEvaluation(ElementAt(m0, Literal("a")), "1")
+        checkEvaluation(ElementAt(m0, Literal("b")), "2")
+        checkEvaluation(ElementAt(m0, Literal("c")), null)
+
+        checkEvaluation(ElementAt(m2, Literal("a")), null)
+
+        // test binary type as keys
+        val mb0 = Literal.create(
+          Map(Array[Byte](1, 2) -> "1", Array[Byte](3, 4) -> null, Array[Byte](2, 1) -> "2"),
+          MapType(BinaryType, StringType))
+        val mb1 = Literal.create(Map[Array[Byte], String](), MapType(BinaryType, StringType))
+
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> false.toString) {
+          checkEvaluation(ElementAt(mb0, Literal(Array[Byte](1, 2, 3))), null)
+          checkEvaluation(ElementAt(mb1, Literal(Array[Byte](1, 2))), null)
+        }
+        checkEvaluation(ElementAt(mb0, Literal(Array[Byte](2, 1), BinaryType)), "2")
+        checkEvaluation(ElementAt(mb0, Literal(Array[Byte](3, 4))), null)
+
+        // Int keys
+        val intMap = Literal.create(Map(1 -> 10, 2 -> 20, 3 -> 30),
+          MapType(IntegerType, IntegerType))
+        checkEvaluation(ElementAt(intMap, Literal(1)), 10)
+        checkEvaluation(ElementAt(intMap, Literal(2)), 20)
+        checkEvaluation(ElementAt(intMap, Literal(4)), null)
+
+        // Duplicate keys
+        val keys = new GenericArrayData(Array(1, 2, 1))
+        val values = new GenericArrayData(Array(10, 20, 30))
+        val dupMapData = new ArrayBasedMapData(keys, values)
+        val dupMap = Literal.create(dupMapData, MapType(IntegerType, IntegerType))
+        checkEvaluation(ElementAt(dupMap, Literal(1)), 10)
+        checkEvaluation(ElementAt(dupMap, Literal(2)), 20)
+
+        // Null values
+        val nullValueMap = Literal.create(Map(1 -> null), MapType(IntegerType, StringType))
+        checkEvaluation(ElementAt(nullValueMap, Literal(1)), null)
+
+        // NaN keys
+        val nan = Double.NaN
+        val doubleMap = Literal.create(Map(1.0 -> 10, nan -> 20),
+          MapType(DoubleType, IntegerType))
+        checkEvaluation(ElementAt(doubleMap, Literal(1.0)), 10)
+        checkEvaluation(ElementAt(doubleMap, Literal(nan)), 20)
+
+        // Nested Map Value
+        val mapNested = Literal.create(
+          Map(1 -> Map(10 -> 100), 2 -> Map(20 -> 200)),
+          MapType(IntegerType, MapType(IntegerType, IntegerType)))
+        checkEvaluation(ElementAt(mapNested, Literal(1)), Map(10 -> 100))
+        checkEvaluation(ElementAt(mapNested, Literal(2)), Map(20 -> 200))
+        checkEvaluation(ElementAt(mapNested, Literal(3)), null)
+
+        // Decimal keys
+        val decType = DecimalType(10, 2)
+        val d1 = Decimal("1.00")
+        val d2 = Decimal("2.50")
+        val d3 = Decimal("3.75")
+        val decimalMap = Literal.create(
+          Map(d1 -> 10, d2 -> 20, d3 -> 30),
+          MapType(decType, IntegerType))
+        checkEvaluation(ElementAt(decimalMap, Literal(d1, decType)), 10)
+        checkEvaluation(ElementAt(decimalMap, Literal(d2, decType)), 20)
+        checkEvaluation(ElementAt(decimalMap, Literal(d3, decType)), 30)
+        checkEvaluation(ElementAt(decimalMap, Literal(Decimal("9.99"), decType)), null)
+
+        // Decimal with high precision
+        val decType2 = DecimalType(38, 18)
+        val d4 = Decimal("12345678901234567890.123456789012345678")
+        val d5 = Decimal("99999999999999999999.999999999999999999")
+        val bigDecimalMap = Literal.create(
+          Map(d4 -> 100, d5 -> 200),
+          MapType(decType2, IntegerType))
+        checkEvaluation(ElementAt(bigDecimalMap, Literal(d4, decType2)), 100)
+        checkEvaluation(ElementAt(bigDecimalMap, Literal(d5, decType2)), 200)
+        checkEvaluation(ElementAt(bigDecimalMap,
+          Literal(Decimal("0.000000000000000001"), decType2)), null)
+
+        // Decimal zero key
+        val zeroDecMap = Literal.create(
+          Map(Decimal("0.00") -> 99, d1 -> 10),
+          MapType(decType, IntegerType))
+        checkEvaluation(ElementAt(zeroDecMap, Literal(Decimal("0.00"), decType)), 99)
+        checkEvaluation(ElementAt(zeroDecMap, Literal(d1, decType)), 10)
+
+        // Decimal negative keys
+        val negDecMap = Literal.create(
+          Map(Decimal("-1.50") -> 10, Decimal("-99.99") -> 20, d1 -> 30),
+          MapType(decType, IntegerType))
+        checkEvaluation(ElementAt(negDecMap, Literal(Decimal("-1.50"), decType)), 10)
+        checkEvaluation(ElementAt(negDecMap, Literal(Decimal("-99.99"), decType)), 20)
+        checkEvaluation(ElementAt(negDecMap, Literal(d1, decType)), 30)
+        checkEvaluation(ElementAt(negDecMap, Literal(Decimal("1.50"), decType)), null)
+
+        // Decimal key with null value
+        val decNullValMap = Literal.create(
+          Map(d1 -> null, d2 -> 20),
+          MapType(decType, IntegerType))
+        checkEvaluation(ElementAt(decNullValMap, Literal(d1, decType)), null)
+        checkEvaluation(ElementAt(decNullValMap, Literal(d2, decType)), 20)
+
+        // Decimal at compact/BigDecimal boundary (precision=18)
+        val decType18 = DecimalType(18, 0)
+        val boundary1 = Decimal(999999999999999999L)
+        val boundary2 = Decimal(-999999999999999999L)
+        val boundaryMap = Literal.create(
+          Map(boundary1 -> 100, boundary2 -> 200),
+          MapType(decType18, IntegerType))
+        checkEvaluation(ElementAt(boundaryMap, Literal(boundary1, decType18)), 100)
+        checkEvaluation(ElementAt(boundaryMap, Literal(boundary2, decType18)), 200)
+        checkEvaluation(ElementAt(boundaryMap, Literal(Decimal(0L), decType18)), null)
+
+        // Decimal duplicate keys
+        val decKeys = new GenericArrayData(Array(d1, d2, d1))
+        val decValues = new GenericArrayData(Array(10, 20, 30))
+        val dupDecMapData = new ArrayBasedMapData(decKeys, decValues)
+        val dupDecMap = Literal.create(dupDecMapData, MapType(decType, IntegerType))
+        checkEvaluation(ElementAt(dupDecMap, Literal(d1, decType)), 10)
+        checkEvaluation(ElementAt(dupDecMap, Literal(d2, decType)), 20)
+
+        // Time keys
+        val timeType = TimeType()
+        val t1 = DateTimeTestUtils.localTime(10, 30, 0)
+        val t2 = DateTimeTestUtils.localTime(14, 0, 30)
+        val t3 = DateTimeTestUtils.localTime(23, 59, 59, 999999)
+        val timeMap = Literal.create(Map(t1 -> 10, t2 -> 20, t3 -> 30),
+          MapType(timeType, IntegerType))
+        checkEvaluation(ElementAt(timeMap, Literal(t1, timeType)), 10)
+        checkEvaluation(ElementAt(timeMap, Literal(t2, timeType)), 20)
+        checkEvaluation(ElementAt(timeMap, Literal(t3, timeType)), 30)
+        checkEvaluation(ElementAt(timeMap,
+          Literal(DateTimeTestUtils.localTime(0, 0, 0), timeType)), null)
+
+        // Time zero (midnight)
+        val t0 = DateTimeTestUtils.localTime()
+        val timeZeroMap = Literal.create(Map(t0 -> 99, t1 -> 10),
+          MapType(timeType, IntegerType))
+        checkEvaluation(ElementAt(timeZeroMap, Literal(t0, timeType)), 99)
+
+        // Time duplicate keys
+        val timeKeys = new GenericArrayData(Array(t1, t2, t1))
+        val timeValues = new GenericArrayData(Array(10, 20, 30))
+        val dupTimeMapData = new ArrayBasedMapData(timeKeys, timeValues)
+        val dupTimeMap = Literal.create(dupTimeMapData, MapType(timeType, IntegerType))
+        checkEvaluation(ElementAt(dupTimeMap, Literal(t1, timeType)), 10)
+        checkEvaluation(ElementAt(dupTimeMap, Literal(t2, timeType)), 20)
+
+        // Nanosecond timestamp keys (SPARK-57841). element_at routes through the same
+        // GetMapValueUtil map-lookup path as GetMapValue, so it must also distinguish keys that
+        // share epochMicros and differ only in nanosWithinMicro, on both the hash (threshold 0) and
+        // linear (threshold Int.MaxValue) paths. Physical TimestampNanosVal objects use the
+        // hashCode()/equals() fall-through arm (not the primitive-long arm). Built from internal
+        // values via ArrayBasedMapData (Literal.create of a Scala nanos-keyed Map would route
+        // through the schema-aware converter, which only accepts LocalDateTime / Instant keys).
+        val ntz9 = TimestampNTZNanosType(9)
+        val micros = 1577836800000000L // 2020-01-01T00:00:00Z
+        val n1 = TimestampNanosTestUtils.nanosVal(micros, 1)
+        val n2 = TimestampNanosTestUtils.nanosVal(micros, 999) // same micro as n1, must not alias
+        val n3 = TimestampNanosTestUtils.nanosVal(micros + 1, 0)
+        val ntzNanosMap = Literal.create(
+          new ArrayBasedMapData(
+            new GenericArrayData(Array[Any](n1, n2, n3)),
+            new GenericArrayData(Array[Any](10, 20, 30))),
+          MapType(ntz9, IntegerType))
+        checkEvaluation(ElementAt(ntzNanosMap, Literal(n1, ntz9)), 10)
+        checkEvaluation(ElementAt(ntzNanosMap, Literal(n2, ntz9)), 20)
+        checkEvaluation(ElementAt(ntzNanosMap, Literal(n3, ntz9)), 30)
+        checkEvaluation(ElementAt(ntzNanosMap,
+          Literal(TimestampNanosTestUtils.nanosVal(micros, 500), ntz9)), null)
+
+        // LTZ family + null value + duplicate-key first-wins.
+        val ltz9 = TimestampLTZNanosType(9)
+        val l1 = TimestampNanosTestUtils.nanosVal(micros, 100)
+        val l2 = TimestampNanosTestUtils.nanosVal(micros, 900)
+        val ltzNanosMap = Literal.create(
+          new ArrayBasedMapData(
+            new GenericArrayData(Array[Any](l1, l2)),
+            new GenericArrayData(Array[Any](10, null))),
+          MapType(ltz9, IntegerType))
+        checkEvaluation(ElementAt(ltzNanosMap, Literal(l1, ltz9)), 10)
+        checkEvaluation(ElementAt(ltzNanosMap, Literal(l2, ltz9)), null) // present, null value
+        val dupNanosMap = Literal.create(
+          new ArrayBasedMapData(
+            new GenericArrayData(Array[Any](n1, n2, n1)),
+            new GenericArrayData(Array[Any](10, 20, 30))),
+          MapType(ntz9, IntegerType))
+        checkEvaluation(ElementAt(dupNanosMap, Literal(n1, ntz9)), 10)
+
+        // Array Keys
+        val arrayType = ArrayType(IntegerType)
+        val arrayMap = Literal.create(
+          Map(Array(1, 2) -> 10, Array(3, 4) -> 20),
+          MapType(arrayType, IntegerType))
+        checkEvaluation(ElementAt(arrayMap, Literal.create(Array(1, 2), arrayType)), 10)
+        checkEvaluation(ElementAt(arrayMap, Literal.create(Array(3, 4), arrayType)), 20)
+        checkEvaluation(ElementAt(arrayMap, Literal.create(Array(5, 6), arrayType)), null)
+
+        // Struct Keys
+        val structType = new StructType().add("a", "int").add("b", "int")
+        val structMap = Literal.create(
+          Map(create_row(1, 1) -> 10, create_row(2, 2) -> 20),
+          MapType(structType, IntegerType))
+        checkEvaluation(ElementAt(structMap, Literal.create(create_row(1, 1), structType)), 10)
+        checkEvaluation(ElementAt(structMap, Literal.create(create_row(2, 2), structType)), 20)
+        checkEvaluation(ElementAt(structMap, Literal.create(create_row(3, 3), structType)), null)
+      }
     }
+  }
 
-    checkEvaluation(ElementAt(m0, Literal("a")), "1")
-    checkEvaluation(ElementAt(m0, Literal("b")), "2")
-    checkEvaluation(ElementAt(m0, Literal("c")), null)
 
-    checkEvaluation(ElementAt(m2, Literal("a")), null)
 
-    // test binary type as keys
-    val mb0 = Literal.create(
-      Map(Array[Byte](1, 2) -> "1", Array[Byte](3, 4) -> null, Array[Byte](2, 1) -> "2"),
-      MapType(BinaryType, StringType))
-    val mb1 = Literal.create(Map[Array[Byte], String](), MapType(BinaryType, StringType))
-
-    withSQLConf(SQLConf.ANSI_ENABLED.key -> false.toString) {
-      checkEvaluation(ElementAt(mb0, Literal(Array[Byte](1, 2, 3))), null)
-      checkEvaluation(ElementAt(mb1, Literal(Array[Byte](1, 2))), null)
-    }
-    checkEvaluation(ElementAt(mb0, Literal(Array[Byte](2, 1), BinaryType)), "2")
-    checkEvaluation(ElementAt(mb0, Literal(Array[Byte](3, 4))), null)
-
+  test("defaultValueOutOfBound") {
     // test defaultValueOutOfBound
     withSQLConf(SQLConf.ANSI_ENABLED.key -> false.toString) {
       val delimiter = Literal.create(".", StringType)
@@ -1994,6 +2515,11 @@ class CollectionExpressionsSuite
         assert(ElementAt(array, Literal(-1)).nullable)
         assert(!ElementAt(array, Subtract(Literal(2), Literal(1))).nullable)
         assert(ElementAt(array, AttributeReference("ordinal", IntegerType)()).nullable)
+        // A null ordinal returns null even when neither the array nor its elements can be null.
+        val nonNullArray = CreateArray(a :: Nil)
+        assert(ElementAt(nonNullArray, AttributeReference("ordinal", IntegerType)()).nullable)
+        assert(ElementAt(nonNullArray,
+          AttributeReference("ordinal", IntegerType, nullable = false)()).nullable == !ansiEnabled)
 
         // CreateArray case invalid indices
         assert(!ElementAt(array, Literal(0)).nullable)
@@ -2036,6 +2562,36 @@ class CollectionExpressionsSuite
         assert(ElementAt(stArray4, Literal(0)).nullable)
         assert(ElementAt(stArray4, Literal(4)).nullable)
         assert(ElementAt(stArray4, Literal(-4)).nullable)
+      }
+    }
+  }
+
+  test("SPARK-60755: ElementAt on CreateArray generates code when the result is not nullable") {
+    val a = BoundReference(0, StringType, nullable = false)
+    val b = BoundReference(1, StringType, nullable = true)
+    val input = create_row("x", null)
+    val field = StructField("f", StringType, nullable = false)
+    val c = BoundReference(0, StructType(Seq(field)), nullable = false)
+    val d = BoundReference(1, StructType(Seq(field)), nullable = true)
+    val inputWithStruct = create_row(create_row("x"), null)
+    Seq(true, false).foreach { ansiEnabled =>
+      withSQLConf(SQLConf.ANSI_ENABLED.key -> ansiEnabled.toString) {
+        // The array can contain NULL, but the selected element cannot.
+        checkEvaluation(ElementAt(CreateArray(Seq(a, b)), Literal(1)), "x", input)
+        checkEvaluation(ElementAt(CreateArray(Seq(a, b)), Literal(-2)), "x", input)
+        val fields = GetArrayStructFields(CreateArray(Seq(c, d)), field, 0, 1, containsNull = true)
+        checkEvaluation(ElementAt(fields, Literal(1)), "x", inputWithStruct)
+        // No element can be NULL.
+        checkEvaluation(ElementAt(CreateArray(Seq(a)), Literal(1)), "x", input)
+        // The index is invalid in every row.
+        checkExceptionInExpression[Exception](
+          ElementAt(CreateArray(Seq(b)), Literal(0)), input, "The index 0 is invalid")
+        if (ansiEnabled) {
+          checkExceptionInExpression[Exception](
+            ElementAt(CreateArray(Seq(b)), Literal(5)), input, "out of bounds")
+        } else {
+          checkEvaluation(ElementAt(CreateArray(Seq(b)), Literal(5)), null, input)
+        }
       }
     }
   }
@@ -2208,6 +2764,17 @@ class CollectionExpressionsSuite
     checkEvaluation(ArrayRepeat(intArray, Literal(2)), Seq(Seq(1, 2), Seq(1, 2)))
     checkEvaluation(ArrayRepeat(strArray, Literal(2)), Seq(Seq("hi", "hola"), Seq("hi", "hola")))
     checkEvaluation(ArrayRepeat(Literal("hi"), Literal(null, IntegerType)), null)
+
+    // A count above the max array length must raise the same error in the interpreted and the
+    // codegen path. The codegen path used to let the array allocation fail with an internal error.
+    checkErrorInExpression[SparkRuntimeException](
+      ArrayRepeat(Literal("hi"), Literal(Int.MaxValue)),
+      condition = "COLLECTION_SIZE_LIMIT_EXCEEDED.PARAMETER",
+      parameters = Map(
+        "numberOfElements" -> Int.MaxValue.toString,
+        "functionName" -> toSQLId("array_repeat"),
+        "maxRoundedArrayLength" -> ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH.toString,
+        "parameter" -> toSQLId("count")))
   }
 
   test("Array remove") {
@@ -3038,6 +3605,48 @@ class CollectionExpressionsSuite
       Literal.create(Seq(Float.NaN, null, 1f), ArrayType(FloatType))), true)
   }
 
+  test("SPARK-59602: array set operations normalize special floating-point values") {
+    val nonCanonicalNaN = java.lang.Double.longBitsToDouble(0x7ff8000000000001L)
+    val doubles = Literal.create(
+      Seq(-0.0d, 0.0d, nonCanonicalNaN, Double.NaN), ArrayType(DoubleType, false))
+    val doubleSet = Literal.create(Seq(0.0d, Double.NaN), ArrayType(DoubleType, false))
+    checkEvaluation(ArrayDistinct(doubles), Seq(0.0d, Double.NaN))
+    checkEvaluation(ArrayUnion(doubles, doubleSet), Seq(0.0d, Double.NaN))
+    checkEvaluation(ArrayIntersect(doubles, doubleSet), Seq(0.0d, Double.NaN))
+    checkEvaluation(ArrayExcept(doubles, doubleSet), Seq.empty[Double])
+    checkEvaluation(ArrayExcept(doubleSet, doubles), Seq.empty[Double])
+    checkEvaluation(ArraysOverlap(doubles, doubleSet), true)
+
+    val nonCanonicalFloatNaN = java.lang.Float.intBitsToFloat(0x7f800001)
+    val floats = Literal.create(
+      Seq(-0.0f, 0.0f, nonCanonicalFloatNaN, Float.NaN), ArrayType(FloatType, false))
+    val floatSet = Literal.create(Seq(0.0f, Float.NaN), ArrayType(FloatType, false))
+    checkEvaluation(ArrayDistinct(floats), Seq(0.0f, Float.NaN))
+    checkEvaluation(ArrayUnion(floats, floatSet), Seq(0.0f, Float.NaN))
+    checkEvaluation(ArrayIntersect(floats, floatSet), Seq(0.0f, Float.NaN))
+    checkEvaluation(ArrayExcept(floats, floatSet), Seq.empty[Float])
+    checkEvaluation(ArrayExcept(floatSet, floats), Seq.empty[Float])
+    checkEvaluation(ArraysOverlap(floats, floatSet), true)
+  }
+
+  test("SPARK-59602: array set operations normalize nested floating-point values") {
+    val nestedType = ArrayType(DoubleType, containsNull = false)
+    val nested = Literal.create(
+      Seq(Seq(-0.0d), Seq(0.0d), Seq(Double.NaN)), ArrayType(nestedType, false))
+    val nestedSet = Literal.create(
+      Seq(Seq(0.0d), Seq(Double.NaN)), ArrayType(nestedType, false))
+    checkEvaluation(ArrayDistinct(nested), Seq(Seq(0.0d), Seq(Double.NaN)))
+    checkEvaluation(ArrayUnion(nested, nestedSet), Seq(Seq(0.0d), Seq(Double.NaN)))
+    checkEvaluation(ArrayIntersect(nested, nestedSet), Seq(Seq(0.0d), Seq(Double.NaN)))
+    checkEvaluation(ArrayExcept(nested, nestedSet), Seq.empty[Seq[Double]])
+    checkEvaluation(ArraysOverlap(nested, nestedSet), true)
+
+    val structType = new StructType().add("d", DoubleType, nullable = false)
+    val structs = Literal.create(
+      Seq(Row(-0.0d), Row(0.0d)), ArrayType(structType, containsNull = false))
+    checkEvaluation(ArrayDistinct(structs), Seq(Row(0.0d)))
+  }
+
   test("SPARK-36740: ArrayMin/ArrayMax/SortArray should handle NaN greater than non-NaN value") {
     // ArrayMin
     checkEvaluation(ArrayMin(
@@ -3110,5 +3719,74 @@ class CollectionExpressionsSuite
     checkEvaluation(new ArrayInsert(
       a, Literal(5), Literal.create("q", StringType)), Seq("b", "a", "c", null, "q")
     )
+  }
+
+  test("SPARK-56567: Array insert with pos = Int.MinValue") {
+    val a = Literal.create(Seq(1, 2, 4), ArrayType(IntegerType))
+    checkErrorInExpression[SparkRuntimeException](
+      ArrayInsert(a, Literal(Int.MinValue), Literal(3), legacyNegativeIndex = false),
+      condition = "COLLECTION_SIZE_LIMIT_EXCEEDED.FUNCTION",
+      parameters = Map(
+        "numberOfElements" -> (-BigInt(Int.MinValue)).toString,
+        "maxRoundedArrayLength" -> ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH.toString,
+        "functionName" -> "`array_insert`"))
+    checkErrorInExpression[SparkRuntimeException](
+      ArrayInsert(a, Literal(Int.MinValue), Literal(3), legacyNegativeIndex = true),
+      condition = "COLLECTION_SIZE_LIMIT_EXCEEDED.FUNCTION",
+      parameters = Map(
+        "numberOfElements" -> (-BigInt(Int.MinValue) + 1).toString,
+        "maxRoundedArrayLength" -> ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH.toString,
+        "functionName" -> "`array_insert`"))
+  }
+
+  test("SPARK-58631: Array insert with a non-foldable pos above the max array length") {
+    val a = Literal.create(Seq(1, 2, 4), ArrayType(IntegerType))
+    // A foldable positive `pos` is handled by a separate codegen branch, so `pos` has to be
+    // non-foldable to reach the one that used to report COLLECTION_SIZE_LIMIT_EXCEEDED.PARAMETER,
+    // naming a `count` parameter that array_insert does not have.
+    checkErrorInExpression[SparkRuntimeException](
+      ArrayInsert(a, BoundReference(0, IntegerType, nullable = false), Literal(3),
+        legacyNegativeIndex = false),
+      InternalRow(Int.MaxValue),
+      condition = "COLLECTION_SIZE_LIMIT_EXCEEDED.FUNCTION",
+      parameters = Map(
+        "numberOfElements" -> Int.MaxValue.toString,
+        "maxRoundedArrayLength" -> ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH.toString,
+        "functionName" -> "`array_insert`"))
+  }
+
+  test("SPARK-57335: element_at with index = Int.MinValue") {
+    val a = Literal.create(Seq(1, 2, 3), ArrayType(IntegerType))
+    // Non-ANSI: an out-of-bounds index must return null. `Math.abs(Int.MinValue)`
+    // overflows back to a negative value, which previously bypassed the bounds check
+    // and leaked an internal IndexOutOfBoundsException.
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
+      checkEvaluation(ElementAt(a, Literal(Int.MinValue)), null)
+    }
+    // ANSI: the documented error is raised instead of an internal exception.
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+      checkExceptionInExpression[SparkArrayIndexOutOfBoundsException](
+        ElementAt(a, Literal(Int.MinValue)),
+        "INVALID_ARRAY_INDEX_IN_ELEMENT_AT")
+    }
+    // try_element_at must not throw even under ANSI, since it hardcodes
+    // failOnError = false. Without the widened bounds check this leaked
+    // an internal IndexOutOfBoundsException.
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+      checkEvaluation(ElementAt(a, Literal(Int.MinValue), None, failOnError = false), null)
+    }
+  }
+
+  test("SPARK-61552: array_insert with a foldable position that fails to evaluate") {
+    // `ConstantFolding` leaves such a position in a conditional branch. Only a row that evaluates
+    // the position should fail, also in generated code.
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+      val arr = BoundReference(0, ArrayType(IntegerType), nullable = true)
+      val pos = Cast(Divide(Literal(1.0), Literal(0.0)), IntegerType)
+      val e = ArrayInsert(arr, pos, Literal(1), legacyNegativeIndex = false)
+      val expr = If(IsNull(arr), Literal.create(null, e.dataType), e)
+      checkEvaluation(expr, null, create_row(null))
+      checkExceptionInExpression[ArithmeticException](expr, create_row(Seq(2)), "DIVIDE_BY_ZERO")
+    }
   }
 }

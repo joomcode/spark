@@ -21,7 +21,7 @@ import org.apache.spark.SparkRuntimeException
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.test.SharedSparkSession
 
-class DataFrameSubquerySuite extends QueryTest with SharedSparkSession {
+class DataFrameSubquerySuite extends SharedSparkSession {
   import testImplicits._
 
   setupTestData()
@@ -66,6 +66,15 @@ class DataFrameSubquerySuite extends QueryTest with SharedSparkSession {
         fragment = "$",
         callSitePattern = getCurrentClassCallSitePattern)
     )
+  }
+
+  test("SPARK-61295: untyped aggregates and typed columns on a lazily analyzed DataFrame") {
+    // The output of the unanalyzed plan has an unresolved attribute `x`, but these need no
+    // input deserializer.
+    val df = spark.range(1).select(($"id".outer() + 1).as("x"))
+    checkAnswer(df.agg(sum("x")), Row(1))
+    checkDataset(df.select($"x".as[Long]), 1L)
+    checkDataset(df.as[Long].groupByKey(v => v).count(), (1L, 1L))
   }
 
   test("simple uncorrelated scalar subquery") {
@@ -397,6 +406,27 @@ class DataFrameSubquerySuite extends QueryTest with SharedSparkSession {
         .table("l")
         .where($"l.a".isin(spark.table("r").select("c")) && $"l.a" > 2 && $"l.b".isNotNull),
       sql("select * from l where l.a in (select c from r) and l.a > 2 and l.b is not null"))
+  }
+
+  test("SPARK-58165: scalar subquery nested in IN subquery values") {
+    // Classic parity for a scalar subquery nested inside the IN subquery's values. Classic
+    // embeds the subquery plan directly, so it is unaffected by the Connect WithRelations bug;
+    // this guards against a future regression and keeps the two suites in sync.
+    checkAnswer(
+      spark
+        .table("l")
+        .where(spark.table("r").select(max($"c")).scalar().isin(spark.table("r").select($"c"))),
+      sql("select * from l where (select max(c) from r) in (select c from r)"))
+
+    // Correlated variant: the nested scalar subquery references the outer row via outer(), so it
+    // is recomputed per row instead of being a constant.
+    checkAnswer(
+      spark
+        .table("l")
+        .where(
+          spark.table("r").where($"c" === $"a".outer()).select(max($"d")).scalar()
+            .isin(spark.table("r").select($"c"))),
+      sql("select * from l where (select max(d) from r where c = a) in (select c from r)"))
   }
 
   test("IN predicate subquery with struct") {

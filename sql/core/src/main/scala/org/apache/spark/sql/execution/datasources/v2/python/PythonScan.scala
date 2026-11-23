@@ -31,12 +31,31 @@ class PythonScan(
     shortName: String,
     outputSchema: StructType,
     options: CaseInsensitiveStringMap,
-    supportedFilters: Array[Filter]
+    supportedFilters: Array[Filter],
+    pushedLimit: Option[Int] = None,
+    // Read info computed during filter/limit pushdown, if any. Scoped to this scan so it does not
+    // leak across scans that share the same `PythonDataSourceV2` (see `PythonScanBuilder`).
+    readInfo: Option[PythonDataSourceReadInfo] = None
 ) extends Scan with SupportsMetadata {
-  override def toBatch: Batch = new PythonBatch(ds, shortName, outputSchema, options)
+  override def toBatch: Batch = new PythonBatch(ds, shortName, outputSchema, options, readInfo)
 
-  override def toMicroBatchStream(checkpointLocation: String): MicroBatchStream =
-    new PythonMicroBatchStream(ds, shortName, outputSchema, options)
+  override def toMicroBatchStream(checkpointLocation: String): MicroBatchStream = {
+    val runner = PythonMicroBatchStream.createPythonStreamingSourceRunner(
+      ds, shortName, outputSchema, options)
+    runner.init()
+
+    val supportedFeatures = runner.checkSupportedFeatures()
+
+    if (supportedFeatures.triggerAvailableNow) {
+      new PythonMicroBatchStreamWithTriggerAvailableNow(
+        ds, shortName, outputSchema, options, runner)
+    } else if (supportedFeatures.admissionControl) {
+      new PythonMicroBatchStreamWithAdmissionControl(
+        ds, shortName, outputSchema, options, runner)
+    } else {
+      new PythonMicroBatchStream(ds, shortName, outputSchema, options, runner)
+    }
+  }
 
   override def description: String = "(Python)"
 
@@ -52,7 +71,7 @@ class PythonScan(
     Map(
       "PushedFilters" -> supportedFilters.mkString("[", ", ", "]"),
       "ReadSchema" -> outputSchema.simpleString
-    )
+    ) ++ pushedLimit.map(limit => "PushedLimit" -> s"LIMIT $limit")
   }
 }
 
@@ -60,7 +79,11 @@ class PythonBatch(
     ds: PythonDataSourceV2,
     shortName: String,
     outputSchema: StructType,
-    options: CaseInsensitiveStringMap) extends Batch {
+    options: CaseInsensitiveStringMap,
+    // Read info already computed during pushdown, if any. When empty (no pushdown), it is
+    // computed lazily below via the provider, which is safe because that path always produces
+    // the full, pushdown-free read info.
+    readInfo: Option[PythonDataSourceReadInfo] = None) extends Batch {
   private val jobArtifactUUID = JobArtifactSet.getCurrentJobArtifactState.map(_.uuid)
   private val sessionUUID = {
     SparkSession.getActiveSession.collect {
@@ -70,7 +93,8 @@ class PythonBatch(
   }
 
   private lazy val infoInPython: PythonDataSourceReadInfo = {
-    ds.getOrCreateReadInfo(shortName, options, outputSchema, isStreaming = false)
+    readInfo.getOrElse(
+      ds.getOrCreateReadInfo(shortName, options, outputSchema, isStreaming = false))
   }
 
   override def planInputPartitions(): Array[InputPartition] =

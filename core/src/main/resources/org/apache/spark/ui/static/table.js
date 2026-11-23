@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-/* global $, d3, collapseTable */
+/* global $ */
 /* eslint-disable no-unused-vars */
 /* Adds background colors to stripe table rows in the summary table (on the stage page). This is
  * necessary (instead of using css or the table striping provided by bootstrap) because the summary
@@ -26,9 +26,9 @@
 function stripeSummaryTable() {
   $("#task-summary-table").find("tr:not(:hidden)").each(function (index) {
     if (index % 2 == 1) {
-      $(this).css("background-color", "#f9f9f9");
+      $(this).css("background-color", "var(--bs-tertiary-bg)");
     } else {
-      $(this).css("background-color", "#ffffff");
+      $(this).css("background-color", "var(--bs-body-bg)");
     }
   });
 }
@@ -62,6 +62,19 @@ function expandAllThreadStackTrace(toggleButton) {
   }
 }
 /* eslint-enable no-unused-vars */
+
+// Builds the file in the browser (as the SQL plan download does) rather than linking to a data:
+// URI, which browsers truncate at the first '#'.
+function downloadThreadDump(fileName) {
+  const text = document.getElementById("thread-dump-text").textContent;
+  const url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  link.click();
+  // Release the Blob once the browser has started the download, as exportSparkProperties does.
+  setTimeout(function () { URL.revokeObjectURL(url); }, 100);
+}
 
 function collapseAllThreadStackTrace(toggleButton) {
   $('.accordion-body').each(function() {
@@ -105,15 +118,33 @@ function onSearchStringChange() {
 }
 /* eslint-enable no-unused-vars */
 
-/* eslint-disable no-unused-vars */
-function collapseTableAndButton(thisName, table) {
-  collapseTable(thisName, table);
+// Event delegation for thread dump page (CSP-compliant)
+$(function() {
+  // toggleThreadStackTrace on row click
+  $(document).on("click", "tr.accordion-heading[data-thread-id]", function() {
+    toggleThreadStackTrace($(this).data("thread-id"), false);
+  });
 
-  const t = d3.select("." + table);
-  if (t.classed("collapsed")) {
-    d3.select("." + table + "-button").style("display", "none");
-  } else {
-    d3.select("." + table + "-button").style("display", "flex");
-  }
-}
-/* eslint-enable no-unused-vars */
+  // expandAll / collapseAll
+  $(document).on("click", "[data-action=expandAllThreadStackTrace]", function() {
+    expandAllThreadStackTrace(true);
+  });
+  $(document).on("click", "[data-action=collapseAllThreadStackTrace]", function() {
+    collapseAllThreadStackTrace($(this).data("toggle-button") !== false);
+  });
+
+  // downloadThreadDump
+  $(document).on("click", "[data-action=downloadThreadDump]", function() {
+    downloadThreadDump($(this).data("filename"));
+  });
+
+  // onMouseOverAndOut
+  $(document).on("mouseenter mouseleave", "tr.accordion-heading[data-thread-id]", function() {
+    onMouseOverAndOut($(this).data("thread-id"));
+  });
+
+  // onSearchStringChange
+  $(document).on("input", "[data-search-input]", function() {
+    onSearchStringChange();
+  });
+});

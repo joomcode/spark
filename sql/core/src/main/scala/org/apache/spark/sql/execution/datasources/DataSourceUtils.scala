@@ -22,18 +22,23 @@ import java.util.Locale
 
 import scala.jdk.CollectionConverters._
 
+import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
 import org.json4s.{Formats, NoTypeHints}
 import org.json4s.jackson.Serialization
 
 import org.apache.spark.{SparkException, SparkUpgradeException}
 import org.apache.spark.sql.{sources, SPARK_LEGACY_DATETIME_METADATA_KEY, SPARK_LEGACY_INT96_METADATA_KEY, SPARK_TIMEZONE_METADATA_KEY, SPARK_VERSION_METADATA_KEY}
+import org.apache.spark.sql.catalyst.FileSourceOptions
 import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogUtils}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, AttributeSet, Expression, ExpressionSet, PredicateHelper}
-import org.apache.spark.sql.catalyst.util.{RebaseDateTime, TypeUtils}
+import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, RebaseDateTime, TypeUtils}
 import org.apache.spark.sql.catalyst.util.RebaseDateTime.RebaseSpec
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
+import org.apache.spark.sql.execution.datasources.csv.CSVFileFormat
+import org.apache.spark.sql.execution.datasources.json.JsonFileFormat
 import org.apache.spark.sql.execution.datasources.parquet.ParquetOptions
+import org.apache.spark.sql.execution.datasources.xml.XmlFileFormat
 import org.apache.spark.sql.internal.{LegacyBehaviorPolicy, SQLConf}
 import org.apache.spark.sql.sources.BaseRelation
 import org.apache.spark.sql.types._
@@ -42,6 +47,39 @@ import org.apache.spark.util.Utils
 
 
 object DataSourceUtils extends PredicateHelper {
+
+  /**
+   * Merges write options into a Hadoop configuration. Keys "path" and "paths" are excluded.
+   * This ensures per-write options are present in the conf even if they were added to the
+   * options map after the Hadoop conf was originally created.
+   */
+  def mergeWriteOptionsIntoHadoopConf(
+      options: Map[String, String], conf: Configuration): Unit = {
+    // CaseInsensitiveMap.iterator yields lowercased keys, but Hadoop Configuration is
+    // case-sensitive. Use the original map to preserve the user's key casing.
+    val rawOptions = options match {
+      case ci: CaseInsensitiveMap[String @unchecked] => ci.originalMap
+      case other => other
+    }
+    rawOptions.foreach { case (k, v) =>
+      if ((v ne null) && k != "path" && k != "paths") {
+        conf.set(k, v)
+      }
+    }
+  }
+
+  /**
+   * Sets a key in the Hadoop configuration only if it is not already present. Per-write
+   * options should be merged into the conf first (via [[mergeWriteOptionsIntoHadoopConf]]),
+   * so a non-null value means the user explicitly set a per-write option which should take
+   * precedence over the session-level SQLConf default.
+   */
+  def setConfIfAbsent(conf: Configuration, key: String, value: => String): Unit = {
+    if (conf.get(key) == null) {
+      conf.set(key, value)
+    }
+  }
+
   /**
    * The key to use for storing partitionBy columns as options.
    */
@@ -126,6 +164,38 @@ object DataSourceUtils extends PredicateHelper {
         supportedDatasources.contains(hs.toString)
       case _ => false
     }
+
+  /**
+   * Returns whether the rows this relation returns, or the values it returns for a column, depend
+   * on which columns the read was asked for. For such a relation, reading a wider set of columns is
+   * not just more work: it can return different data for the columns that were already being read.
+   *
+   * Two things put a V1 file source here. Its parser may resolve or validate a column against the
+   * set of columns it was asked for, which lets a wider read drop or rewrite rows that the narrower
+   * one returned: CSV, JSON and XML build their parser from the required schema and take `mode` and
+   * the corrupt-record column from it. Or the read is not strict: under `ignoreCorruptFiles` a
+   * failure in a column only the wider read touches is swallowed together with the rest of that
+   * file's rows, whatever the format. `ignoreMissingFiles` has no such mechanism, since a missing
+   * file is skipped whatever is projected; it is here to match
+   * `FileSourceOptions.hasStrictFileReads`, the same predicate the reader and the
+   * cache-repeatability check in `InMemoryRelation` use.
+   *
+   * Callers that widen a read need this. Subplan merging is one: top-level column pruning for a V1
+   * file source happens in physical planning, from the attributes referenced above the relation, so
+   * reusing one relation for two subqueries that project different columns widens its read to the
+   * union of the two column sets.
+   */
+  private[sql] def isProjectionSensitiveRead(relation: BaseRelation): Boolean = relation match {
+    case hs: HadoopFsRelation =>
+      !new FileSourceOptions(hs.options).hasStrictFileReads ||
+        hasProjectionSensitiveParser(hs.fileFormat)
+    case _ => false
+  }
+
+  private def hasProjectionSensitiveParser(fileFormat: FileFormat): Boolean = fileFormat match {
+    case _: CSVFileFormat | _: JsonFileFormat | _: XmlFileFormat => true
+    case _ => false
+  }
 
   private def getRebaseSpec(
       lookupFileMeta: String => String,
@@ -279,6 +349,12 @@ object DataSourceUtils extends PredicateHelper {
     }
   }
 
+  /**
+   * Splits `normalizedFilters` into partition filters and data filters by matching
+   * [[AttributeReference]] against the given `partitionSchema` by their names.
+   *
+   * This is suitable for the V1 path where partition columns have non-nested names.
+   */
   def getPartitionFiltersAndDataFilters(
       partitionSchema: StructType,
       normalizedFilters: Seq[Expression]): (Seq[Expression], Seq[Expression]) = {
@@ -288,7 +364,22 @@ object DataSourceUtils extends PredicateHelper {
           attr
       }
     }
-    val partitionSet = AttributeSet(partitionColumns)
+    getPartitionFiltersAndDataFilters(AttributeSet(partitionColumns), normalizedFilters)
+  }
+
+  /**
+   * Splits `normalizedFilters` into partition filters and data filters by matching
+   * [[AttributeReference]] against the given `partitionAttributes` by their `ExprId`s.
+   */
+  def getPartitionFiltersAndDataFilters(
+      partitionAttributes: Seq[AttributeReference],
+      normalizedFilters: Seq[Expression]): (Seq[Expression], Seq[Expression]) = {
+    getPartitionFiltersAndDataFilters(AttributeSet(partitionAttributes), normalizedFilters)
+  }
+
+  private def getPartitionFiltersAndDataFilters(
+      partitionSet: AttributeSet,
+      normalizedFilters: Seq[Expression]): (Seq[Expression], Seq[Expression]) = {
     val (partitionFilters, dataFilters) = normalizedFilters.partition(f =>
       f.references.nonEmpty && f.references.subsetOf(partitionSet)
     )

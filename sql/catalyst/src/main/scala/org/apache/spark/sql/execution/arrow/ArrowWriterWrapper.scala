@@ -69,20 +69,21 @@ object ArrowWriterWrapper {
       schema: StructType,
       timeZoneId: String,
       allocatorOwner: String,
-      errorOnDuplicatedFieldNames: Boolean,
       largeVarTypes: Boolean,
       dataOut: DataOutputStream,
       context: TaskContext): ArrowWriterWrapper = {
-    val arrowSchema =
-      ArrowUtils.toArrowSchema(schema, timeZoneId, errorOnDuplicatedFieldNames, largeVarTypes)
+    val arrowSchema = ArrowUtils.toArrowSchema(schema, timeZoneId, largeVarTypes)
     val allocator = ArrowUtils.rootAllocator.newChildAllocator(
       s"stdout writer for $allocatorOwner", 0, Long.MaxValue)
     val root = VectorSchemaRoot.create(arrowSchema, allocator)
-    val arrowWriter = SparkArrowWriter.create(root)
-
-    val streamWriter = new ArrowStreamWriter(root, null, dataOut)
-    streamWriter.start()
+    // Create the wrapper, which adds the task completion listener that closes `root` and
+    // `allocator`, before anything that can fail: allocating the vectors, or writing the schema,
+    // e.g. when the writer is interrupted.
     // Unloader will be set by the caller after creation
-    ArrowWriterWrapper(streamWriter, arrowWriter, root, allocator, null, context)
+    val wrapper = ArrowWriterWrapper(null, null, root, allocator, null, context)
+    wrapper.arrowWriter = SparkArrowWriter.create(root)
+    wrapper.streamWriter = new ArrowStreamWriter(root, null, dataOut)
+    wrapper.streamWriter.start()
+    wrapper
   }
 }

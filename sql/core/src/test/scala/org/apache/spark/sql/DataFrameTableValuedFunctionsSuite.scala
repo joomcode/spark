@@ -21,7 +21,7 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 
-class DataFrameTableValuedFunctionsSuite extends QueryTest with SharedSparkSession {
+class DataFrameTableValuedFunctionsSuite extends SharedSparkSession {
   import testImplicits._
 
   test("explode") {
@@ -526,6 +526,30 @@ class DataFrameTableValuedFunctionsSuite extends QueryTest with SharedSparkSessi
         sql("SELECT t1.id, t.* FROM variant_table AS t1, LATERAL variant_explode_outer(v) AS t")
       )
     }
+  }
+
+  test("variant_explode - recursive") {
+    val nested = parse_json(lit("""{"a": [1, {"b": 2}]}"""))
+    val actual = spark.tvf.variant_explode(nested, recursive = true)
+    val expected = spark.sql(
+      """SELECT * FROM variant_explode(parse_json('{"a": [1, {"b": 2}]}'), true)""")
+    checkAnswer(actual, expected)
+
+    val nonRecursive = spark.tvf.variant_explode(nested, recursive = false)
+    assert(nonRecursive.schema.fieldNames.toSeq == Seq("pos", "key", "value"))
+    checkAnswer(nonRecursive, spark.tvf.variant_explode(nested))
+  }
+
+  test("variant_explode_outer - recursive") {
+    val actual = spark.tvf.variant_explode_outer(parse_json(lit("[]")), recursive = true)
+    val expected = spark.sql(
+      "SELECT * FROM variant_explode_outer(parse_json('[]'), true)")
+    checkAnswer(actual, expected)
+
+    val nested = parse_json(lit("""{"a": [1, {"b": 2}]}"""))
+    val nonRecursive = spark.tvf.variant_explode_outer(nested, recursive = false)
+    assert(nonRecursive.schema.fieldNames.toSeq == Seq("pos", "key", "value"))
+    checkAnswer(nonRecursive, spark.tvf.variant_explode_outer(nested))
   }
 
   test("explode with udf") {

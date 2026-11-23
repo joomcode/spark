@@ -15,49 +15,51 @@
 # limitations under the License.
 #
 
+import functools
 import sys
 import warnings
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
-import functools
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 
-from pyspark import since, keyword_only
+from pyspark import keyword_only, since
+from pyspark.ml.common import inherit_doc
+from pyspark.ml.linalg import Matrix, Vector
 from pyspark.ml.param.shared import (
-    HasMaxIter,
-    HasFeaturesCol,
-    HasSeed,
-    HasPredictionCol,
     HasAggregationDepth,
-    HasWeightCol,
-    HasTol,
-    HasProbabilityCol,
-    HasDistanceMeasure,
     HasCheckpointInterval,
-    HasSolver,
+    HasDistanceMeasure,
+    HasFeaturesCol,
+    HasIntermediateStorageLevel,
     HasMaxBlockSizeInMB,
+    HasMaxIter,
+    HasPredictionCol,
+    HasProbabilityCol,
+    HasSeed,
+    HasSolver,
+    HasTol,
+    HasWeightCol,
     Param,
     Params,
     TypeConverters,
 )
+from pyspark.ml.stat import MultivariateGaussian
 from pyspark.ml.util import (
-    JavaMLWritable,
-    JavaMLReadable,
     GeneralJavaMLWritable,
     HasTrainingSummary,
-    try_remote_attribute_relation,
+    JavaMLReadable,
+    JavaMLWritable,
     invoke_helper_relation,
+    try_remote_attribute_relation,
 )
 from pyspark.ml.wrapper import JavaEstimator, JavaModel, JavaParams, JavaWrapper
-from pyspark.ml.common import inherit_doc
-from pyspark.ml.stat import MultivariateGaussian
 from pyspark.sql import DataFrame
-from pyspark.ml.linalg import Vector, Matrix
 from pyspark.sql.utils import is_remote
 
 if TYPE_CHECKING:
-    from pyspark.ml._typing import M
     from py4j.java_gateway import JavaObject
+
+    from pyspark.ml._typing import M
 
 
 __all__ = [
@@ -154,6 +156,7 @@ class _GaussianMixtureParams(
     HasTol,
     HasAggregationDepth,
     HasWeightCol,
+    HasIntermediateStorageLevel,
 ):
     """
     Params for :py:class:`GaussianMixture` and :py:class:`GaussianMixtureModel`.
@@ -416,11 +419,13 @@ class GaussianMixture(
         seed: Optional[int] = None,
         aggregationDepth: int = 2,
         weightCol: Optional[str] = None,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ):
         """
         __init__(self, \\*, featuresCol="features", predictionCol="prediction", k=2, \
                  probabilityCol="probability", tol=0.01, maxIter=100, seed=None, \
-                 aggregationDepth=2, weightCol=None)
+                 aggregationDepth=2, weightCol=None, \
+                 intermediateStorageLevel="MEMORY_AND_DISK")
         """
         super().__init__()
         self._java_obj = self._new_java_obj(
@@ -446,11 +451,13 @@ class GaussianMixture(
         seed: Optional[int] = None,
         aggregationDepth: int = 2,
         weightCol: Optional[str] = None,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ) -> "GaussianMixture":
         """
         setParams(self, \\*, featuresCol="features", predictionCol="prediction", k=2, \
                   probabilityCol="probability", tol=0.01, maxIter=100, seed=None, \
-                  aggregationDepth=2, weightCol=None)
+                  aggregationDepth=2, weightCol=None, \
+                  intermediateStorageLevel="MEMORY_AND_DISK")
 
         Sets params for GaussianMixture.
         """
@@ -520,6 +527,13 @@ class GaussianMixture(
         """
         return self._set(aggregationDepth=value)
 
+    @since("4.4.0")
+    def setIntermediateStorageLevel(self, value: str) -> "GaussianMixture":
+        """
+        Sets the value of :py:attr:`intermediateStorageLevel`.
+        """
+        return self._set(intermediateStorageLevel=value)
+
 
 class GaussianMixtureSummary(ClusteringSummary):
     """
@@ -582,6 +596,7 @@ class _KMeansParams(
     HasWeightCol,
     HasSolver,
     HasMaxBlockSizeInMB,
+    HasIntermediateStorageLevel,
 ):
     """
     Params for :py:class:`KMeans` and :py:class:`KMeansModel`.
@@ -793,12 +808,14 @@ class KMeans(JavaEstimator[KMeansModel], _KMeansParams, JavaMLWritable, JavaMLRe
         weightCol: Optional[str] = None,
         solver: str = "auto",
         maxBlockSizeInMB: float = 0.0,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ):
         """
         __init__(self, \\*, featuresCol="features", predictionCol="prediction", k=2, \
                  initMode="k-means||", initSteps=2, tol=1e-4, maxIter=20, seed=None, \
                  distanceMeasure="euclidean", weightCol=None, solver="auto", \
-                 maxBlockSizeInMB=0.0)
+                 maxBlockSizeInMB=0.0, \
+                 intermediateStorageLevel="MEMORY_AND_DISK")
         """
         super().__init__()
         self._java_obj = self._new_java_obj("org.apache.spark.ml.clustering.KMeans", self.uid)
@@ -825,12 +842,14 @@ class KMeans(JavaEstimator[KMeansModel], _KMeansParams, JavaMLWritable, JavaMLRe
         weightCol: Optional[str] = None,
         solver: str = "auto",
         maxBlockSizeInMB: float = 0.0,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ) -> "KMeans":
         """
         setParams(self, \\*, featuresCol="features", predictionCol="prediction", k=2, \
                   initMode="k-means||", initSteps=2, tol=1e-4, maxIter=20, seed=None, \
                   distanceMeasure="euclidean", weightCol=None, solver="auto", \
-                  maxBlockSizeInMB=0.0)
+                  maxBlockSizeInMB=0.0, \
+                  intermediateStorageLevel="MEMORY_AND_DISK")
 
         Sets params for KMeans.
         """
@@ -921,6 +940,13 @@ class KMeans(JavaEstimator[KMeansModel], _KMeansParams, JavaMLWritable, JavaMLRe
         """
         return self._set(maxBlockSizeInMB=value)
 
+    @since("4.3.0")
+    def setIntermediateStorageLevel(self, value: str) -> "KMeans":
+        """
+        Sets the value of :py:attr:`intermediateStorageLevel`.
+        """
+        return self._set(intermediateStorageLevel=value)
+
 
 @inherit_doc
 class _BisectingKMeansParams(
@@ -930,6 +956,7 @@ class _BisectingKMeansParams(
     HasPredictionCol,
     HasDistanceMeasure,
     HasWeightCol,
+    HasIntermediateStorageLevel,
 ):
     """
     Params for :py:class:`BisectingKMeans` and :py:class:`BisectingKMeansModel`.
@@ -1140,11 +1167,12 @@ class BisectingKMeans(
         minDivisibleClusterSize: float = 1.0,
         distanceMeasure: str = "euclidean",
         weightCol: Optional[str] = None,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ):
         """
         __init__(self, \\*, featuresCol="features", predictionCol="prediction", maxIter=20, \
                  seed=None, k=4, minDivisibleClusterSize=1.0, distanceMeasure="euclidean", \
-                 weightCol=None)
+                 weightCol=None, intermediateStorageLevel="MEMORY_AND_DISK")
         """
         super().__init__()
         self._java_obj = self._new_java_obj(
@@ -1166,11 +1194,12 @@ class BisectingKMeans(
         minDivisibleClusterSize: float = 1.0,
         distanceMeasure: str = "euclidean",
         weightCol: Optional[str] = None,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ) -> "BisectingKMeans":
         """
         setParams(self, \\*, featuresCol="features", predictionCol="prediction", maxIter=20, \
                   seed=None, k=4, minDivisibleClusterSize=1.0, distanceMeasure="euclidean", \
-                  weightCol=None)
+                  weightCol=None, intermediateStorageLevel="MEMORY_AND_DISK")
         Sets params for BisectingKMeans.
         """
         kwargs = self._input_kwargs
@@ -1232,6 +1261,13 @@ class BisectingKMeans(
         """
         return self._set(weightCol=value)
 
+    @since("4.5.0")
+    def setIntermediateStorageLevel(self, value: str) -> "BisectingKMeans":
+        """
+        Sets the value of :py:attr:`intermediateStorageLevel`.
+        """
+        return self._set(intermediateStorageLevel=value)
+
     def _create_model(self, java_model: "JavaObject") -> BisectingKMeansModel:
         return BisectingKMeansModel(java_model)
 
@@ -1254,7 +1290,9 @@ class BisectingKMeansSummary(ClusteringSummary):
 
 
 @inherit_doc
-class _LDAParams(HasMaxIter, HasFeaturesCol, HasSeed, HasCheckpointInterval):
+class _LDAParams(
+    HasMaxIter, HasFeaturesCol, HasSeed, HasCheckpointInterval, HasIntermediateStorageLevel
+):
     """
     Params for :py:class:`LDA` and :py:class:`LDAModel`.
 
@@ -1270,8 +1308,7 @@ class _LDAParams(HasMaxIter, HasFeaturesCol, HasSeed, HasCheckpointInterval):
     optimizer: Param[str] = Param(
         Params._dummy(),
         "optimizer",
-        "Optimizer or inference algorithm used to estimate the LDA model.  "
-        "Supported: online, em",
+        "Optimizer or inference algorithm used to estimate the LDA model.  Supported: online, em",
         typeConverter=TypeConverters.toString,
     )
     learningOffset: Param[float] = Param(
@@ -1542,9 +1579,12 @@ class DistributedLDAModel(LDAModel, JavaMLReadable["DistributedLDAModel"], JavaM
 
         .. warning:: This involves collecting a large :py:func:`topicsMatrix` to the driver.
         """
-        model = LocalLDAModel(self._call_java("toLocal"))
         if is_remote():
-            return model
+            from pyspark.ml.util import RemoteModelRef
+
+            return LocalLDAModel(RemoteModelRef(self._call_java("toLocal")))
+
+        model = LocalLDAModel(self._call_java("toLocal"))
 
         # SPARK-10931: Temporary fix to be removed once LDAModel defines Params
         model._create_params_from_java()
@@ -1702,13 +1742,15 @@ class LDA(JavaEstimator[LDAModel], _LDAParams, JavaMLReadable["LDA"], JavaMLWrit
         topicConcentration: Optional[float] = None,
         topicDistributionCol: str = "topicDistribution",
         keepLastCheckpoint: bool = True,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ):
         """
         __init__(self, \\*, featuresCol="features", maxIter=20, seed=None, checkpointInterval=10,\
-                  k=10, optimizer="online", learningOffset=1024.0, learningDecay=0.51,\
-                  subsamplingRate=0.05, optimizeDocConcentration=True,\
-                  docConcentration=None, topicConcentration=None,\
-                  topicDistributionCol="topicDistribution", keepLastCheckpoint=True)
+                 k=10, optimizer="online", learningOffset=1024.0, learningDecay=0.51,\
+                 subsamplingRate=0.05, optimizeDocConcentration=True,\
+                 docConcentration=None, topicConcentration=None,\
+                 topicDistributionCol="topicDistribution", keepLastCheckpoint=True,\
+                 intermediateStorageLevel="MEMORY_AND_DISK")
         """
         super().__init__()
         self._java_obj = self._new_java_obj("org.apache.spark.ml.clustering.LDA", self.uid)
@@ -1740,13 +1782,15 @@ class LDA(JavaEstimator[LDAModel], _LDAParams, JavaMLReadable["LDA"], JavaMLWrit
         topicConcentration: Optional[float] = None,
         topicDistributionCol: str = "topicDistribution",
         keepLastCheckpoint: bool = True,
+        intermediateStorageLevel: str = "MEMORY_AND_DISK",
     ) -> "LDA":
         """
         setParams(self, \\*, featuresCol="features", maxIter=20, seed=None, checkpointInterval=10,\
                   k=10, optimizer="online", learningOffset=1024.0, learningDecay=0.51,\
                   subsamplingRate=0.05, optimizeDocConcentration=True,\
                   docConcentration=None, topicConcentration=None,\
-                  topicDistributionCol="topicDistribution", keepLastCheckpoint=True)
+                  topicDistributionCol="topicDistribution", keepLastCheckpoint=True,\
+                  intermediateStorageLevel="MEMORY_AND_DISK")
 
         Sets params for LDA.
         """
@@ -1895,6 +1939,14 @@ class LDA(JavaEstimator[LDAModel], _LDAParams, JavaMLReadable["LDA"], JavaMLWrit
         False
         """
         return self._set(keepLastCheckpoint=value)
+
+    @since("4.5.0")
+    def setIntermediateStorageLevel(self, value: str) -> "LDA":
+        """
+        Sets the value of :py:attr:`intermediateStorageLevel`.
+        Only used with the online optimizer.
+        """
+        return self._set(intermediateStorageLevel=value)
 
     @since("2.0.0")
     def setMaxIter(self, value: int) -> "LDA":
@@ -2169,7 +2221,9 @@ class PowerIterationClustering(
 
 if __name__ == "__main__":
     import doctest
+
     import numpy
+
     import pyspark.ml.clustering
     from pyspark.sql import SparkSession
 
@@ -2190,7 +2244,7 @@ if __name__ == "__main__":
     temp_path = tempfile.mkdtemp()
     globs["temp_path"] = temp_path
     try:
-        (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+        failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
         spark.stop()
     finally:
         from shutil import rmtree

@@ -25,7 +25,7 @@ import scala.xml.Node
 
 import jakarta.servlet.DispatcherType
 import jakarta.servlet.http.{HttpServlet, HttpServletRequest}
-import org.eclipse.jetty.servlet.{FilterHolder, FilterMapping, ServletContextHandler, ServletHolder}
+import org.eclipse.jetty.ee10.servlet.{FilterHolder, FilterMapping, ServletContextHandler, ServletHolder}
 import org.json4s.JsonAST.{JNothing, JValue}
 
 import org.apache.spark.{SecurityManager, SparkConf, SSLOptions}
@@ -58,6 +58,11 @@ private[spark] abstract class WebUI(
   protected val publicHostName = Option(conf.getenv("SPARK_PUBLIC_DNS")).getOrElse(
     conf.get(DRIVER_HOST_ADDRESS))
   protected val className = Utils.getFormattedClassName(this)
+
+  // Random per-UI token embedded in the forms that hit this UI's state-changing
+  // endpoints. A cross-site page can neither read it (same-origin policy) nor guess it, so
+  // forged requests fail the check in JettyUtils.createRedirectHandler.
+  private[spark] val csrfToken: String = newCsrfToken()
 
   def getBasePath: String = basePath
   def getTabs: Seq[WebUITab] = tabs.toSeq

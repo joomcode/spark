@@ -85,7 +85,7 @@ trait TruncateTableSuiteBase extends command.TruncateTableSuiteBase {
           }
           val aclEntries = fs.getAclStatus(tablePath).getEntries()
           if (ignore) {
-            assert(aclEntries.size() == 0)
+            assert(aclEntries.isEmpty)
           } else {
             assert(aclEntries.size() == 4)
             assert(aclEntries.get(0) == customAcl.get(0))
@@ -201,8 +201,8 @@ class TruncateTableSuite extends TruncateTableSuiteBase with CommandSuiteBase {
           exception = intercept[AnalysisException] {
             sql(s"TRUNCATE TABLE $t")
           },
-          condition = "_LEGACY_ERROR_TEMP_1266",
-          parameters = Map("tableIdentWithDB" -> "`spark_catalog`.`ns`.`tbl`")
+          condition = "CANNOT_TRUNCATE_EXTERNAL_TABLE",
+          parameters = Map("tableName" -> "`spark_catalog`.`ns`.`tbl`")
         )
       }
     }

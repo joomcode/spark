@@ -21,28 +21,30 @@ import java.util.Locale
 
 import scala.collection.mutable.{HashMap, HashSet}
 import scala.jdk.CollectionConverters._
+import scala.util.control.NonFatal
 
-import org.apache.spark.SparkUnsupportedOperationException
+import org.apache.spark.{SparkException, SparkUnsupportedOperationException}
 import org.apache.spark.sql.{AnalysisException, SaveMode}
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.catalog._
-import org.apache.spark.sql.catalyst.expressions.{Expression, InputFileBlockLength, InputFileBlockStart, InputFileName, RowOrdering}
+import org.apache.spark.sql.catalyst.expressions.{Expression, InputFileBlockLength, InputFileBlockStart, InputFileName}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
+import org.apache.spark.sql.catalyst.util.FileTypeColumnUsage
 import org.apache.spark.sql.catalyst.util.TypeUtils._
 import org.apache.spark.sql.classic.SparkSession
-import org.apache.spark.sql.connector.expressions.{FieldReference, RewritableTransform}
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.command.DDLUtils
 import org.apache.spark.sql.execution.datasources.{CreateTable => CreateTableV1}
 import org.apache.spark.sql.execution.datasources.v2.FileDataSourceV2
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources.InsertableRelation
-import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructField, StructType}
 import org.apache.spark.sql.util.PartitioningUtils.normalizePartitionSpec
 import org.apache.spark.sql.util.SchemaUtils
 import org.apache.spark.util.ArrayImplicits._
+import org.apache.spark.util.SparkStringUtils
 
 /**
  * Replaces [[UnresolvedRelation]]s if the plan is for direct query on files.
@@ -105,7 +107,7 @@ class ResolveSQLOnFile(sparkSession: SparkSession) extends Rule[LogicalPlan] {
         errorClass = "UNSUPPORTED_DATASOURCE_FOR_DIRECT_QUERY",
         messageParameters = Map("dataSourceType" -> ident.head))
     }
-    if (isFileFormat && ident.last.isEmpty) {
+    if (isFileFormat && SparkStringUtils.isBlank(ident.last)) {
       unresolved.failAnalysis(
         errorClass = "INVALID_EMPTY_LOCATION",
         messageParameters = Map("location" -> ident.last))
@@ -114,7 +116,15 @@ class ResolveSQLOnFile(sparkSession: SparkSession) extends Rule[LogicalPlan] {
     dataSource
   }
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
+  def apply(plan: LogicalPlan): LogicalPlan = plan match {
+    // Like the other ALTER TABLE commands, which take an `UnresolvedTable`, ADD CONSTRAINT with a
+    // CHECK constraint does not run on a file. Its target is an `UnresolvedRelation` only to
+    // validate the existing rows, so leave it unresolved to be reported as not found.
+    case _: AddCheckConstraint => plan
+    case _ => resolveRelations(plan)
+  }
+
+  private def resolveRelations(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
     case r @ RelationTimeTravel(u: UnresolvedRelation, timestamp, _)
         if maybeSQLFile(u) && timestamp.forall(_.resolved) =>
       // If we successfully look up the data source, then this is a path-based table, so we should
@@ -142,18 +152,7 @@ case class PreprocessTableCreation(catalog: SessionCatalog) extends Rule[Logical
     // Since the runtime inferred partition columns could be different from what user specified,
     // we fail the query if the partitioning information is specified.
     case c @ CreateTableV1(tableDesc, _, None) if tableDesc.schema.isEmpty =>
-      if (tableDesc.bucketSpec.isDefined) {
-        throw new AnalysisException(
-          errorClass = "SPECIFY_BUCKETING_IS_NOT_ALLOWED",
-          messageParameters = Map.empty
-        )
-      }
-      if (tableDesc.partitionColumnNames.nonEmpty) {
-        throw new AnalysisException(
-          errorClass = "SPECIFY_PARTITION_IS_NOT_ALLOWED",
-          messageParameters = Map.empty)
-      }
-      c
+      CreateTableHelper.checkCreateTableWithoutSchema(c)
 
     // When we append data to an existing table, check if the given provider, partition columns,
     // bucket spec, etc. match the existing table, and adjust the columns order of the given query
@@ -168,7 +167,7 @@ case class PreprocessTableCreation(catalog: SessionCatalog) extends Rule[Logical
       val tableName = tableIdentWithDB.unquotedString
       val existingTable = catalog.getTableMetadata(tableIdentWithDB)
 
-      if (existingTable.tableType == CatalogTableType.VIEW) {
+      if (existingTable.isViewLike) {
         throw QueryCompilationErrors.saveDataIntoViewNotAllowedError()
       }
 
@@ -269,7 +268,10 @@ case class PreprocessTableCreation(catalog: SessionCatalog) extends Rule[Logical
           "Schema may not be specified in a Create Table As Select (CTAS) statement")
 
         val analyzedQuery = query.get
-        val normalizedTable = normalizeCatalogTable(analyzedQuery.schema, tableDesc)
+        checkNoUnknownFileTypeWrite(analyzedQuery.schema)
+        checkNoFileTypeInComparableColumns(analyzedQuery.schema, tableDesc)
+        val normalizedTable =
+          CreateTableHelper.normalizeCatalogTable(analyzedQuery.schema, tableDesc)
 
         DDLUtils.checkTableColumns(tableDesc.copy(schema = analyzedQuery.schema))
         SchemaUtils.checkIndeterminateCollationInSchema(analyzedQuery.schema)
@@ -291,59 +293,13 @@ case class PreprocessTableCreation(catalog: SessionCatalog) extends Rule[Logical
 
         c.copy(tableDesc = normalizedTable, query = Some(reorderedQuery))
       } else {
-        DDLUtils.checkTableColumns(tableDesc)
-
-        val normalizedTable = normalizeCatalogTable(tableDesc.schema, tableDesc)
-
-        val normalizedSchemaByName = HashMap(normalizedTable.schema.map(s => s.name -> s): _*)
-        val partitionSchema = normalizedTable.partitionColumnNames.map { partCol =>
-          normalizedSchemaByName(partCol)
-        }
-        val partitionSchemaSet = HashSet(partitionSchema: _*)
-        val reorderedSchema = StructType(
-          normalizedTable.schema.filterNot(partitionSchemaSet.contains) ++ partitionSchema
-        )
-
-        c.copy(tableDesc = normalizedTable.copy(schema = reorderedSchema))
+        checkFileTypeHasQualifier(tableDesc.schema)
+        checkNoFileTypeInComparableColumns(tableDesc.schema, tableDesc)
+        CreateTableHelper.normalizeCreateTableWithoutQuery(c)
       }
 
     case create: V2CreateTablePlan if create.childrenResolved =>
-      val schema = create.tableSchema
-      val partitioning = create.partitioning
-      val isCaseSensitive = conf.caseSensitiveAnalysis
-      // Check that columns are not duplicated in the schema
-      val flattenedSchema = SchemaUtils.explodeNestedFieldNames(schema)
-      SchemaUtils.checkColumnNameDuplication(
-        flattenedSchema,
-        isCaseSensitive)
-
-      // Check that columns are not duplicated in the partitioning statement
-      SchemaUtils.checkTransformDuplication(
-        partitioning, "in the partitioning", isCaseSensitive)
-
-      if (schema.isEmpty) {
-        if (partitioning.nonEmpty) {
-          throw QueryCompilationErrors.specifyPartitionNotAllowedWhenTableSchemaNotDefinedError()
-        }
-
-        create
-      } else {
-        // Resolve and normalize partition columns as necessary
-        val resolver = conf.resolver
-        val normalizedPartitions = partitioning.map {
-          case transform: RewritableTransform =>
-            val rewritten = transform.references().map { ref =>
-              // Throws an exception if the reference cannot be resolved
-              val position = SchemaUtils
-                .findColumnPosition(ref.fieldNames().toImmutableArraySeq, schema, resolver)
-              FieldReference(SchemaUtils.getColumnName(position, schema))
-            }
-            transform.withReferences(rewritten.toImmutableArraySeq)
-          case other => other
-        }
-
-        create.withPartitioning(normalizedPartitions)
-      }
+      CreateTableHelper.preprocessV2CreateTablePlan(create)
   }
 
   private def fallBackV2ToV1(cls: Class[_]): Class[_] =
@@ -352,100 +308,21 @@ case class PreprocessTableCreation(catalog: SessionCatalog) extends Rule[Logical
       case _ => cls
     }
 
-  private def normalizeCatalogTable(schema: StructType, table: CatalogTable): CatalogTable = {
-    SchemaUtils.checkSchemaColumnNameDuplication(
-      schema,
-      conf.caseSensitiveAnalysis)
-    if (!conf.allowCollationsInMapKeys) {
-      SchemaUtils.checkNoCollationsInMapKeys(schema)
-    }
-
-    val normalizedPartCols = normalizePartitionColumns(schema, table)
-    val normalizedBucketSpec = normalizeBucketSpec(schema, table)
-
-    normalizedBucketSpec.foreach { spec =>
-      for (bucketCol <- spec.bucketColumnNames if normalizedPartCols.contains(bucketCol)) {
-        throw QueryCompilationErrors.bucketingColumnCannotBePartOfPartitionColumnsError(
-          bucketCol, normalizedPartCols)
-      }
-      for (sortCol <- spec.sortColumnNames if normalizedPartCols.contains(sortCol)) {
-        throw QueryCompilationErrors.bucketSortingColumnCannotBePartOfPartitionColumnsError(
-          sortCol, normalizedPartCols)
+  // FILE is not comparable, so it cannot be a partition, bucket, bucket sort or clustering column.
+  private def checkNoFileTypeInComparableColumns(
+      schema: StructType,
+      table: CatalogTable): Unit = {
+    def check(names: Seq[String], usage: FileTypeColumnUsage): Unit = names.foreach { name =>
+      schema.find(f => conf.resolver(f.name, name)).foreach { field =>
+        checkNoFileTypeInColumnUsage(Seq(field.name), field.dataType, usage)
       }
     }
-
-    val normalizedProperties = table.properties ++ table.clusterBySpec.map { spec =>
-      ClusterBySpec.toProperty(schema, spec, conf.resolver)
+    check(table.partitionColumnNames, FileTypeColumnUsage.PartitionColumn)
+    table.bucketSpec.foreach { bucketSpec =>
+      check(bucketSpec.bucketColumnNames, FileTypeColumnUsage.BucketColumn)
+      check(bucketSpec.sortColumnNames, FileTypeColumnUsage.BucketSortColumn)
     }
-
-    table.copy(partitionColumnNames = normalizedPartCols, bucketSpec = normalizedBucketSpec,
-      properties = normalizedProperties)
-  }
-
-  private def normalizePartitionColumns(schema: StructType, table: CatalogTable): Seq[String] = {
-    val normalizedPartitionCols = CatalogUtils.normalizePartCols(
-      tableName = table.identifier.unquotedString,
-      tableCols = schema.map(_.name),
-      partCols = table.partitionColumnNames,
-      resolver = conf.resolver)
-
-    SchemaUtils.checkColumnNameDuplication(normalizedPartitionCols, conf.resolver)
-
-    if (schema.nonEmpty && normalizedPartitionCols.length == schema.length) {
-      throw new AnalysisException(
-        errorClass = "ALL_PARTITION_COLUMNS_NOT_ALLOWED",
-        messageParameters = Map.empty)
-    }
-
-    val normalizedPartitionColsSet = HashSet(normalizedPartitionCols: _*)
-    schema
-      .filter(f => normalizedPartitionColsSet.contains(f.name))
-      .foreach { field =>
-        if (!PartitioningUtils.canPartitionOn(field.dataType)) {
-          throw QueryCompilationErrors.invalidPartitionColumnDataTypeError(field)
-        }
-      }
-
-    normalizedPartitionCols
-  }
-
-  private def normalizeBucketSpec(schema: StructType, table: CatalogTable): Option[BucketSpec] = {
-    table.bucketSpec match {
-      case Some(bucketSpec) =>
-        val normalizedBucketSpec = CatalogUtils.normalizeBucketSpec(
-          tableName = table.identifier.unquotedString,
-          tableCols = schema.map(_.name),
-          bucketSpec = bucketSpec,
-          resolver = conf.resolver)
-
-        SchemaUtils.checkColumnNameDuplication(
-          normalizedBucketSpec.bucketColumnNames,
-          conf.resolver)
-        SchemaUtils.checkColumnNameDuplication(
-          normalizedBucketSpec.sortColumnNames,
-          conf.resolver)
-
-        normalizedBucketSpec.sortColumnNames.map(schema(_)).map(_.dataType).foreach {
-          case dt if RowOrdering.isOrderable(dt) => // OK
-          case other => failAnalysis(s"Cannot use ${other.catalogString} for sorting column")
-        }
-
-        schema.filter(f => normalizedBucketSpec.bucketColumnNames.contains(f.name))
-          .foreach { field =>
-            if (!BucketingUtils.canBucketOn(field.dataType)) {
-              throw QueryCompilationErrors.invalidBucketColumnDataTypeError(field.dataType)
-            }
-          }
-
-        Some(normalizedBucketSpec)
-
-      case None => None
-    }
-  }
-
-  private def failAnalysis(msg: String) = {
-    throw new AnalysisException(
-      errorClass = "_LEGACY_ERROR_TEMP_3072", messageParameters = Map("msg" -> msg))
+    table.clusterBySpec.foreach(checkNoFileTypeClusteringColumn(schema, _, conf.resolver))
   }
 }
 
@@ -462,11 +339,45 @@ object PreprocessTableInsertion extends ResolveInsertionBase {
       partColNames: StructType,
       catalogTable: Option[CatalogTable]): InsertIntoStatement = {
 
+    if (insert.withSchemaEvolution) {
+      throw QueryCompilationErrors.unsupportedInsertWithSchemaEvolution()
+    }
+
+    insert.replaceCriteriaOpt match {
+      case Some(_: InsertReplaceWhere) =>
+        throw QueryCompilationErrors.unsupportedInsertReplaceWhere(tblName)
+      case Some(_) =>
+        throw QueryCompilationErrors.unsupportedInsertReplaceOnOrUsing(tblName)
+      case None =>
+    }
+
     val normalizedPartSpec = normalizePartitionSpec(
       insert.partitionSpec, partColNames, tblName, conf.resolver)
 
     val staticPartCols = normalizedPartSpec.filter(_._2.isDefined).keySet
-    val expectedColumns = insert.table.output.filterNot(a => staticPartCols.contains(a.name))
+    val expectedColumns = {
+      val cols = insert.table.output.filterNot(a => staticPartCols.contains(a.name))
+      // When the legacy config is disabled, restore the original nullability from the
+      // catalog table schema. HadoopFsRelation forces dataSchema.asNullable for safe reads,
+      // which strips NOT NULL constraints (both top-level and nested) from the
+      // LogicalRelation output. We restore nullability so that AssertNotNull checks are
+      // properly injected.
+      if (conf.getConf(SQLConf.FILE_SOURCE_INSERT_ENFORCE_NOT_NULL)) {
+        catalogTable.map { ct =>
+          val catalogFields = ct.schema.fields.map(f => f.name -> f).toMap
+          cols.map { col =>
+            catalogFields.get(col.name) match {
+              case Some(field) =>
+                col.withNullability(field.nullable)
+                  .withDataType(restoreDataTypeNullability(col.dataType, field.dataType))
+              case None => col
+            }
+          }
+        }.getOrElse(cols)
+      } else {
+        cols
+      }
+    }
 
     val partitionsTrackedByCatalog = catalogTable.isDefined &&
       catalogTable.get.partitionColumnNames.nonEmpty &&
@@ -497,7 +408,7 @@ object PreprocessTableInsertion extends ResolveInsertionBase {
         query,
         byName,
         conf,
-        supportColDefaultValue = true)
+        TableOutputResolver.DefaultValueFillMode.FILL)
     } catch {
       case e: AnalysisException if staticPartCols.nonEmpty &&
         (e.getCondition == "INSERT_COLUMN_ARITY_MISMATCH.NOT_ENOUGH_DATA_COLUMNS" ||
@@ -526,7 +437,8 @@ object PreprocessTableInsertion extends ResolveInsertionBase {
   }
 
   def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
-    case i @ InsertIntoStatement(table, _, _, query, _, _, _) if table.resolved && query.resolved =>
+    case i @ InsertIntoStatement(table, _, _, query, _, _, _, _, _)
+      if table.resolved && query.resolved =>
       table match {
         case relation: HiveTableRelation =>
           val metadata = relation.tableMeta
@@ -540,6 +452,34 @@ object PreprocessTableInsertion extends ResolveInsertionBase {
           preprocess(i, tblName, new StructType(), catalogTable)
         case _ => i
       }
+  }
+
+  /**
+   * Recursively restores nullability flags from the original data type into the resolved
+   * data type, keeping the resolved type structure intact.
+   */
+  private def restoreDataTypeNullability(resolved: DataType, original: DataType): DataType = {
+    (resolved, original) match {
+      case (r: StructType, o: StructType) =>
+        val origFields = o.fields.map(f => f.name -> f).toMap
+        StructType(r.fields.map { rf =>
+          origFields.get(rf.name) match {
+            case Some(of) =>
+              rf.copy(
+                nullable = of.nullable,
+                dataType = restoreDataTypeNullability(rf.dataType, of.dataType))
+            case None => rf
+          }
+        })
+      case (ArrayType(rElem, _), ArrayType(oElem, oNull)) =>
+        ArrayType(restoreDataTypeNullability(rElem, oElem), oNull)
+      case (MapType(rKey, rVal, _), MapType(oKey, oVal, oValNull)) =>
+        MapType(
+          restoreDataTypeNullability(rKey, oKey),
+          restoreDataTypeNullability(rVal, oVal),
+          oValNull)
+      case _ => resolved
+    }
   }
 }
 
@@ -606,7 +546,7 @@ object PreWriteCheck extends (LogicalPlan => Unit) {
   def apply(plan: LogicalPlan): Unit = {
     plan.foreach {
       case InsertIntoStatement(LogicalRelationWithTable(relation, _), partition,
-          _, query, _, _, _) =>
+          _, query, _, _, _, _, _) =>
         // Get all input data source relations of the query.
         val srcRelations = query.collect {
           case l: LogicalRelation => l.relation
@@ -635,7 +575,7 @@ object PreWriteCheck extends (LogicalPlan => Unit) {
               messageParameters = Map("relationId" -> toSQLId(relation.toString)))
         }
 
-      case InsertIntoStatement(t, _, _, _, _, _, _)
+      case InsertIntoStatement(t, _, _, _, _, _, _, _, _)
         if !t.isInstanceOf[LeafNode] ||
           t.isInstanceOf[Range] ||
           t.isInstanceOf[OneRowRelation] ||
@@ -713,7 +653,19 @@ object ViewSyncSchemaToMetaStore extends (LogicalPlan => Unit) {
           SchemaUtils.checkColumnNameDuplication(fieldNames.toImmutableArraySeq,
             session.sessionState.conf.resolver)
           val updatedViewMeta = metaData.copy(schema = newSchema)
-          session.sessionState.catalog.alterTable(updatedViewMeta)
+          try {
+            session.sessionState.catalog.alterTable(updatedViewMeta)
+          } catch {
+            case NonFatal(e) =>
+              throw new SparkException(
+                errorClass = "FAILED_UPDATE_VIEW_SCHEMA",
+                messageParameters = Map(
+                  "viewName" -> metaData.qualifiedName,
+                  "schemaMode" -> s"WITH SCHEMA ${viewSchemaMode.toString}",
+                  "newSchema" -> newSchema.treeString,
+                  "existingSchema" -> metaData.schema.treeString),
+                cause = e)
+          }
         }
       case _ => // OK
     }

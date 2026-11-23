@@ -19,6 +19,7 @@ package org.apache.spark.sql.connect.planner
 import java.io.SequenceInputStream
 import java.util.UUID
 import java.util.concurrent.Semaphore
+import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
@@ -42,6 +43,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent}
 import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeProjection}
 import org.apache.spark.sql.connect.SparkConnectTestUtils
+import org.apache.spark.sql.connect.client.SparkConnectClient
 import org.apache.spark.sql.connect.common.DataTypeProtoConverter
 import org.apache.spark.sql.connect.config.Connect
 import org.apache.spark.sql.connect.dsl.MockRemoteSession
@@ -65,8 +67,26 @@ class SparkConnectServiceSuite
     with Logging
     with SparkConnectPlanTest {
 
+  override def beforeEach(): Unit = {
+    super.beforeEach()
+    SparkConnectService.sessionManager.invalidateAllSessions()
+    SparkConnectService.sessionManager.initializeBaseSession(() => spark.newSession())
+  }
+
   private def sparkSessionHolder = SparkConnectTestUtils.createDummySessionHolder(spark)
   private def DEFAULT_UUID = UUID.fromString("89ea6117-1f45-4c03-ae27-f47c6aded093")
+
+  test("Spark version advertises server-side Maven resolution") {
+    val request = proto.AnalyzePlanRequest
+      .newBuilder()
+      .setSparkVersion(proto.AnalyzePlanRequest.SparkVersion.newBuilder())
+      .build()
+    val response = new SparkConnectAnalyzeHandler(null).process(request, sparkSessionHolder)
+
+    assert(
+      response.getSparkVersion.getCapabilitiesList.asScala
+        .contains(SparkConnectClient.SERVER_SIDE_MAVEN_ARTIFACTS_CAPABILITY))
+  }
 
   test("Test schema in analyze response") {
     withTable("test") {
@@ -489,7 +509,7 @@ class SparkConnectServiceSuite
                 assert(chunk.getArrowBatch.getRowCount == rowCount)
                 assert(chunk.getArrowBatch.getStartOffset == rowStartOffset)
                 assert(chunk.getArrowBatch.getData != null)
-                assert(chunk.getArrowBatch.getData.size() > 0)
+                assert(!chunk.getArrowBatch.getData.isEmpty)
                 assert(
                   chunk.getArrowBatch.getData.size() <= preferredChunkSizeOption.getOrElse(
                     maxChunkSizeOption.get))
@@ -874,6 +894,42 @@ class SparkConnectServiceSuite
     }
   }
 
+  test("SPARK-59689: AnalyzePlanRequest does not execute an EXECUTE IMMEDIATE command payload") {
+    withTable("ei_analyze") {
+      spark.sql("CREATE TABLE ei_analyze (col1 INT, col2 STRING)")
+      // The command payload is deferred to the execution level, so analyzing the EXECUTE IMMEDIATE
+      // via the Connect analyze path (CommandExecutionMode.SKIP) must not run the DROP.
+      val sqlString = "EXECUTE IMMEDIATE 'DROP TABLE ei_analyze'"
+      val plan = proto.Plan
+        .newBuilder()
+        .setRoot(
+          proto.Relation
+            .newBuilder()
+            .setCommon(proto.RelationCommon.newBuilder().setPlanId(1))
+            .setSql(proto.SQL.newBuilder().setQuery(sqlString).build())
+            .build())
+        .build()
+
+      val handler = new SparkConnectAnalyzeHandler(null)
+
+      val request = proto.AnalyzePlanRequest
+        .newBuilder()
+        .setExplain(
+          proto.AnalyzePlanRequest.Explain
+            .newBuilder()
+            .setPlan(plan)
+            .setExplainMode(proto.AnalyzePlanRequest.Explain.ExplainMode.EXPLAIN_MODE_EXTENDED)
+            .build())
+        .build()
+
+      handler.process(request, sparkSessionHolder)
+
+      assert(
+        spark.catalog.tableExists("ei_analyze"),
+        "EXECUTE IMMEDIATE command payload must not run during a Connect analyze request")
+    }
+  }
+
   test("Test explain mode in analyze response") {
     withTable("test") {
       spark.sql("""
@@ -997,6 +1053,171 @@ class SparkConnectServiceSuite
       val valuesList = observedMetric.getValuesList.asScala
       assert(valuesList.head.hasLong && valuesList.head.getLong == 0)
       assert(valuesList.last.hasLong && valuesList.last.getLong == 99)
+    }
+  }
+
+  test("SPARK-55887: Use executeCollect for limit to avoid full scan") {
+    // Create a range with 100 partitions
+    val numPartitions = 100
+    val plan = proto.Plan
+      .newBuilder()
+      .setRoot(
+        proto.Relation
+          .newBuilder()
+          .setRange(
+            proto.Range
+              .newBuilder()
+              .setStart(0L)
+              .setEnd(10000L)
+              .setStep(1L)
+              .setNumPartitions(numPartitions)))
+      .build()
+
+    // Apply limit(1) - this corresponds to head(1)
+    val limitRelation = proto.Relation
+      .newBuilder()
+      .setLimit(
+        proto.Limit
+          .newBuilder()
+          .setInput(plan.getRoot)
+          .setLimit(1))
+      .build()
+    val limitPlan = proto.Plan.newBuilder().setRoot(limitRelation).build()
+
+    val sessionId = UUID.randomUUID.toString
+    val context = proto.UserContext.newBuilder().setUserId("c1").build()
+    val request = proto.ExecutePlanRequest
+      .newBuilder()
+      .setPlan(limitPlan)
+      .setUserContext(context)
+      .setSessionId(sessionId)
+      .build()
+
+    // Capture job execution metrics
+    val numTasks = new AtomicInteger(0)
+    val listener = new SparkListener {
+      override def onTaskEnd(taskEnd: org.apache.spark.scheduler.SparkListenerTaskEnd): Unit = {
+        numTasks.incrementAndGet()
+      }
+    }
+    spark.sparkContext.addSparkListener(listener)
+
+    try {
+      val instance = new SparkConnectService(false)
+      val responses = mutable.Buffer.empty[proto.ExecutePlanResponse]
+      @volatile var done = false
+      instance.executePlan(
+        request,
+        new StreamObserver[proto.ExecutePlanResponse] {
+          override def onNext(v: proto.ExecutePlanResponse): Unit = responses += v
+          override def onError(t: Throwable): Unit = throw t
+          override def onCompleted(): Unit = { done = true }
+        })
+
+      // Wait for completion
+      Eventually.eventually(timeout(10.seconds)) {
+        assert(done)
+      }
+
+      // Verify result
+      assert(responses.exists(_.hasArrowBatch))
+
+      // Wait for listener bus to process all events
+      spark.sparkContext.listenerBus.waitUntilEmpty()
+
+      // Verify optimization:
+      // If executeCollect/executeTake is used, it should only scan the first partition (1 task).
+      // If execute() is used, it might scan all partitions (100 tasks) for LocalLimit
+      // or trigger Shuffle.
+      // We expect significantly fewer tasks than numPartitions.
+      assert(
+        numTasks.get() < numPartitions,
+        s"Expected fewer tasks than partitions ($numPartitions), but got ${numTasks.get()}")
+      assert(numTasks.get() >= 1)
+    } finally {
+      spark.sparkContext.removeSparkListener(listener)
+    }
+  }
+
+  test("SPARK-55887: Use executeCollect for tail to avoid full scan") {
+    // Create a range with 100 partitions
+    val numPartitions = 100
+    val plan = proto.Plan
+      .newBuilder()
+      .setRoot(
+        proto.Relation
+          .newBuilder()
+          .setRange(
+            proto.Range
+              .newBuilder()
+              .setStart(0L)
+              .setEnd(10000L)
+              .setStep(1L)
+              .setNumPartitions(numPartitions)))
+      .build()
+
+    // Apply tail(1)
+    val tailRelation = proto.Relation
+      .newBuilder()
+      .setTail(
+        proto.Tail
+          .newBuilder()
+          .setInput(plan.getRoot)
+          .setLimit(1))
+      .build()
+    val tailPlan = proto.Plan.newBuilder().setRoot(tailRelation).build()
+
+    val sessionId = UUID.randomUUID.toString
+    val context = proto.UserContext.newBuilder().setUserId("c1").build()
+    val request = proto.ExecutePlanRequest
+      .newBuilder()
+      .setPlan(tailPlan)
+      .setUserContext(context)
+      .setSessionId(sessionId)
+      .build()
+
+    // Capture job execution metrics
+    val numTasks = new AtomicInteger(0)
+    val listener = new SparkListener {
+      override def onTaskEnd(taskEnd: org.apache.spark.scheduler.SparkListenerTaskEnd): Unit = {
+        numTasks.incrementAndGet()
+      }
+    }
+    spark.sparkContext.addSparkListener(listener)
+
+    try {
+      val instance = new SparkConnectService(false)
+      val responses = mutable.Buffer.empty[proto.ExecutePlanResponse]
+      @volatile var done = false
+      instance.executePlan(
+        request,
+        new StreamObserver[proto.ExecutePlanResponse] {
+          override def onNext(v: proto.ExecutePlanResponse): Unit = responses += v
+          override def onError(t: Throwable): Unit = throw t
+          override def onCompleted(): Unit = { done = true }
+        })
+
+      // Wait for completion
+      Eventually.eventually(timeout(10.seconds)) {
+        assert(done)
+      }
+
+      // Verify result
+      assert(responses.exists(_.hasArrowBatch))
+
+      // Wait for listener bus to process all events
+      spark.sparkContext.listenerBus.waitUntilEmpty()
+
+      // Verify optimization:
+      // If executeCollect/executeTail is used, it should only scan the last partition (1 task).
+      // If execute() is used, it might scan all partitions (100 tasks) or trigger Shuffle.
+      // We expect significantly fewer tasks than numPartitions.
+      assert(
+        numTasks.get() < numPartitions,
+        s"Expected fewer tasks than partitions ($numPartitions), but got ${numTasks.get()}")
+      assert(numTasks.get() >= 1)
+    } finally {
+      spark.sparkContext.removeSparkListener(listener)
     }
   }
 

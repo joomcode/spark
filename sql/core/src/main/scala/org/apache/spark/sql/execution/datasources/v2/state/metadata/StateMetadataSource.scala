@@ -16,6 +16,7 @@
  */
 package org.apache.spark.sql.execution.datasources.v2.state.metadata
 
+import java.io.FileNotFoundException
 import java.util
 
 import scala.jdk.CollectionConverters._
@@ -222,7 +223,8 @@ class StateMetadataPartitionReader(
           1
         }
         OperatorStateMetadataReader.createReader(
-          operatorIdPath, hadoopConf, operatorStateMetadataVersion, batchId).read() match {
+          operatorIdPath, hadoopConf, operatorStateMetadataVersion, batchId,
+          createMetadataDir = false).read() match {
           case Some(metadata) => metadata
           case None => throw StateDataSourceErrors.failedToReadOperatorMetadata(checkpointLocation,
             batchId)
@@ -231,11 +233,25 @@ class StateMetadataPartitionReader(
     } catch {
       // if the operator metadata is not present, catch the exception
       // and return an empty array
-      case ex: Exception =>
+      case ex: FileNotFoundException =>
         logWarning(log"Failed to find operator metadata for " +
           log"path=${MDC(LogKeys.CHECKPOINT_LOCATION, checkpointLocation)} " +
           log"with exception=${MDC(LogKeys.EXCEPTION, ex)}")
         Array.empty
+    }
+  }
+
+  private[sql] def stateStoreNumPartitions: Option[Int] = {
+    allOperatorStateMetadata
+      .flatMap(_.stateStoresMetadata.map(_.numPartitions))
+      .distinct
+      .toSeq match {
+      case Seq() => None
+      case Seq(numPartitions) => Some(numPartitions)
+      case values =>
+        throw new IllegalStateException(
+          s"Found conflicting state-store partition counts in checkpoint: " +
+            values.mkString("[", ", ", "]"))
     }
   }
 

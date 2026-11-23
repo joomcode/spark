@@ -26,10 +26,10 @@ import scala.collection.mutable
 import scala.io.{Codec, Source}
 import scala.jdk.CollectionConverters._
 
-import io.fabric8.kubernetes.api.model.{ConfigMap, ConfigMapBuilder, KeyToPath}
+import io.fabric8.kubernetes.api.model.{ConfigMap, ConfigMapBuilder, KeyToPath, KeyToPathBuilder}
 
 import org.apache.spark.SparkConf
-import org.apache.spark.annotation.{DeveloperApi, Since, Unstable}
+import org.apache.spark.annotation.{DeveloperApi, Since, Stable}
 import org.apache.spark.deploy.k8s.{Config, Constants, KubernetesUtils}
 import org.apache.spark.deploy.k8s.Config.{KUBERNETES_DNS_SUBDOMAIN_NAME_MAX_LENGTH, KUBERNETES_NAMESPACE}
 import org.apache.spark.deploy.k8s.Constants.ENV_SPARK_CONF_DIR
@@ -42,8 +42,9 @@ import org.apache.spark.util.ArrayImplicits._
  *
  * A utility class used for K8s operations internally and Spark K8s operator.
  */
-@Unstable
+@Stable
 @DeveloperApi
+@Since("3.1.0")
 object KubernetesClientUtils extends Logging {
 
   // Config map name can be KUBERNETES_DNS_SUBDOMAIN_NAME_MAX_LENGTH chars at max.
@@ -112,7 +113,11 @@ object KubernetesClientUtils extends Logging {
     confFilesMap.map {
       case (fileName: String, _: String) =>
         val filePermissionMode = 420  // 420 is decimal for octal literal 0644.
-        new KeyToPath(fileName, filePermissionMode, fileName)
+        new KeyToPathBuilder()
+          .withKey(fileName)
+          .withMode(filePermissionMode)
+          .withPath(fileName)
+          .build()
     }.toList.sortBy(x => x.getKey) // List is sorted to make mocking based tests work
   }
 

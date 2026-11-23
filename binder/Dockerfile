@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-FROM python:3.10-slim
+FROM python:3.11-slim
 # install the notebook package
 RUN  pip install --no-cache notebook jupyterlab
 
@@ -36,7 +36,7 @@ USER ${USER}
 COPY . ${HOME}
 USER root
 RUN chown -R ${NB_UID} ${HOME}
-RUN apt-get update && apt-get install -y openjdk-17-jre git coreutils
+RUN apt-get update && apt-get install -y openjdk-21-jre git coreutils
 USER ${NB_USER}
 
 RUN binder/postBuild
