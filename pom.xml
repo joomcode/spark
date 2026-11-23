@@ -131,7 +131,7 @@
     <!-- make sure to update IsolatedClientLoader whenever this version is changed -->
     <hadoop.version>3.5.0</hadoop.version>
     <!-- SPARK-41247: When updating `protobuf.version`, also need to update `protoVersion` in `SparkBuild.scala` -->
-    <protobuf.version>4.33.5</protobuf.version>
+    <protobuf.version>4.33.6</protobuf.version>
     <protoc-jar-maven-plugin.version>3.11.4</protoc-jar-maven-plugin.version>
     <zookeeper.version>3.9.5</zookeeper.version>
     <curator.version>5.9.0</curator.version>
@@ -358,6 +358,11 @@
     <maven-jar-plugin.version>3.5.0</maven-jar-plugin.version>
   </properties>
   <repositories>
+    <repository>
+      <id>joom-maven</id>
+      <name>JFrog</name>
+      <url>https://jfrog.joom.it/artifactory/joom-maven</url>
+    </repository>
     <repository>
       <id>gcs-maven-central-mirror</id>
       <!--
@@ -3756,4 +3761,11 @@
       </build>
     </profile>
   </profiles>
+  <distributionManagement>
+    <repository>
+      <id>joom-maven</id>
+      <name>JFrog</name>
+      <url>https://jfrog.joom.it/artifactory/joom-maven</url>
+    </repository>
+  </distributionManagement>
 </project>
